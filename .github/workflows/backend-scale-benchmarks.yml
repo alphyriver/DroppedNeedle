@@ -1,0 +1,38 @@
+name: Backend Scale Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  review-projection:
+    name: 115k Review Projection
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Run large review projection proof
+        run: >-
+          python -m pytest
+          -o addopts=
+          -m scale
+          tests/benchmarks/test_feedback_fixes_review_projection.py
+          --durations=10
