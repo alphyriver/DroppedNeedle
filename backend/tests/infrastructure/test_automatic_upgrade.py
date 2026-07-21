@@ -886,8 +886,13 @@ async def test_target_startup_progress_heartbeat_advances_while_stage_is_active(
     async with automatic_upgrade.target_startup_progress(
         settings, "catalog_validation"
     ):
-        await asyncio.sleep(0.035)
-        progress = automatic_upgrade._target_progress(progress_path, token)
+        for _ in range(100):
+            progress = automatic_upgrade._target_progress(progress_path, token)
+            if progress is not None and progress["sequence"] >= 3:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("startup progress heartbeat did not reach sequence 3")
 
     assert progress is not None
     assert progress["stage"] == "catalog_validation"
