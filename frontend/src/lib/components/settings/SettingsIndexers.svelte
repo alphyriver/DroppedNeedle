@@ -180,9 +180,9 @@
 	<header class="space-y-1">
 		<h2 class="text-lg font-semibold">Indexers</h2>
 		<p class="max-w-prose text-sm text-base-content/70">
-			Newznab (Usenet) and Torznab (torrent) search sources. DroppedNeedle ships none - add
-			your own. A Prowlarr
-			"Generic Newznab" endpoint works here too. Higher in the list is searched first.
+			Newznab (Usenet) and Torznab (torrent) search sources. DroppedNeedle ships none - add your
+			own. A Prowlarr "Generic Newznab" endpoint works here too. Higher in the list is searched
+			first.
 		</p>
 	</header>
 
@@ -195,8 +195,9 @@
 			</div>
 			<p class="mt-4 font-semibold">No indexers yet</p>
 			<p class="mx-auto mt-1 max-w-md text-sm text-base-content/70">
-				Add a Newznab indexer (its URL + your API key) to search Usenet. DroppedNeedle bundles none
-				- bring your own. A Prowlarr "Generic Newznab" endpoint works here too.
+				Add an indexer (its URL + your API key) to search: Newznab for Usenet, Torznab for torrents.
+				DroppedNeedle bundles none - bring your own. A Prowlarr "Generic Newznab" endpoint works
+				here too.
 			</p>
 			<button type="button" class="btn btn-primary btn-sm mt-5" onclick={startAdd}>
 				<Plus class="size-4" aria-hidden="true" /> Add indexer
@@ -334,8 +335,8 @@
 				<option value="torznab">Torznab (Torrent)</option>
 			</select>
 			<span class="label-text-alt mt-1 opacity-70">
-				Newznab returns NZBs and is fetched by SABnzbd; Torznab returns torrents and magnets
-				and is fetched by qBittorrent.
+				Newznab returns NZBs and is fetched by SABnzbd; Torznab returns torrents and magnets and is
+				fetched by qBittorrent.
 			</span>
 		</div>
 		<div class="form-control">
