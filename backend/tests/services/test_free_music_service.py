@@ -79,11 +79,15 @@ def _build(
 
 
 async def _settle(service, store, task_id):
-    for _ in range(2000):
+    deadline = asyncio.get_running_loop().time() + 10
+    while asyncio.get_running_loop().time() < deadline:
         task = await store.get(task_id)
         if task and task.status in FreeMusicStatus.TERMINAL:
             return task
-        await asyncio.sleep(0)
+        # The service uses worker threads for SQLite and filesystem operations.
+        # Yielding with sleep(0) only counts event-loop turns and can exhaust a
+        # fixed iteration budget before a worker gets scheduled on a busy CI host.
+        await asyncio.sleep(0.001)
     raise AssertionError(f"task never settled: {(await store.get(task_id)).status}")
 
 

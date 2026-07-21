@@ -73,4 +73,9 @@ jobs:
           touch .ci-dirty-worktree-marker
 
       - name: Run tests
-        run: python -m pytest
+        # Native Engine CI owns these focused gates; do not run them three times.
+        run: >-
+          python -m pytest
+          --ignore=tests/e2e
+          --ignore=tests/security
+          --ignore=tests/infrastructure/test_e2e_download.py
