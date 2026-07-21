@@ -40,10 +40,12 @@ def _clear_indexer_cache() -> None:
         get_newznab_release_scorer,
         get_target_download_orchestrator,
         get_target_download_service,
+        get_torznab_indexer,
     )
 
     for provider in (
         get_newznab_indexer,
+        get_torznab_indexer,
         get_newznab_release_scorer,
         get_download_orchestrator,
         get_download_service,

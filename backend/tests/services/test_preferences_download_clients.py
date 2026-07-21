@@ -69,6 +69,19 @@ def test_usenet_ready_requires_sabnzbd_and_an_enabled_indexer(prefs):
     assert prefs.is_download_source_ready() is True
 
 
+def test_torznab_indexer_does_not_make_usenet_ready(prefs):
+    prefs.save_sabnzbd_connection(
+        SabnzbdConnectionSettings(enabled=True, url="http://sab:8080", api_key="k")
+    )
+    prefs.save_indexer(
+        NewznabIndexerSettings(
+            type="torznab", name="Tracker", url="https://tracker.test/api", api_key="k"
+        )
+    )
+
+    assert prefs.is_usenet_ready() is False
+
+
 def test_usenet_only_is_ready_even_with_slskd_disabled(prefs):
     prefs.save_sabnzbd_connection(
         SabnzbdConnectionSettings(enabled=True, url="http://sab:8080", api_key="k")
@@ -209,3 +222,19 @@ def test_torrent_ready_requires_key_selected_client_and_prowlarr(prefs):
         )
     )
     assert prefs.is_torrent_ready() is True
+
+
+def test_torrent_ready_accepts_torznab_without_prowlarr(prefs):
+    prefs.save_indexer(
+        NewznabIndexerSettings(
+            type="torznab", name="Tracker", url="https://tracker.test/api", api_key="t"
+        )
+    )
+    prefs.save_qbittorrent_connection(
+        QbittorrentConnectionSettings(
+            enabled=True, url="http://qbt:8080", api_key="q"
+        )
+    )
+
+    assert prefs.is_torrent_ready() is True
+    assert prefs.is_builtin_download_ready() is True

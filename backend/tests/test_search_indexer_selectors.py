@@ -16,6 +16,7 @@ from core.dependencies import (
     get_newznab_indexer,
     get_prowlarr_indexer,
     get_torrent_search_indexer,
+    get_torznab_indexer,
     get_usenet_search_indexer,
 )
 
@@ -34,24 +35,41 @@ def _preferences(*, prowlarr_configured: bool):
     return patcher
 
 
-def test_torrent_selector_resolves_to_prowlarr():
-    """Prowlarr is currently the only torrent-capable indexer, so the selector
-    resolves to it. The point is that callers bind to the selector, not that the
-    mapping is interesting today."""
-    assert get_torrent_search_indexer() is get_prowlarr_indexer()
-
-
-def test_torrent_selector_resolves_even_when_prowlarr_is_unconfigured():
-    """get_prowlarr_indexer returns a disabled indexer rather than None when the
-    connection is unset, so the selector never has to signal absence."""
-    patcher = _preferences(prowlarr_configured=False)
+def test_torrent_selector_prefers_prowlarr_when_configured():
+    """A configured Prowlarr already aggregates the user's trackers, so fanning
+    out over separate Torznab rows as well would double-search them."""
+    patcher = _preferences(prowlarr_configured=True)
     try:
-        indexer = get_torrent_search_indexer()
+        assert get_torrent_search_indexer() is get_prowlarr_indexer()
     finally:
         patcher.stop()
 
-    assert indexer is not None
-    assert hasattr(indexer, "is_configured")
+
+def test_torrent_selector_falls_back_to_torznab_fan_out():
+    patcher = _preferences(prowlarr_configured=False)
+    try:
+        assert get_torrent_search_indexer() is get_torznab_indexer()
+    finally:
+        patcher.stop()
+
+
+def test_both_protocols_use_the_same_either_or_shape():
+    """Usenet and torrent resolve identically: Prowlarr when configured, else the
+    per-indexer fan-out. The asymmetry this replaced made Prowlarr the only
+    torrent source that could exist."""
+    configured = _preferences(prowlarr_configured=True)
+    try:
+        assert get_usenet_search_indexer() is get_prowlarr_indexer()
+        assert get_torrent_search_indexer() is get_prowlarr_indexer()
+    finally:
+        configured.stop()
+
+    unconfigured = _preferences(prowlarr_configured=False)
+    try:
+        assert get_usenet_search_indexer() is get_newznab_indexer()
+        assert get_torrent_search_indexer() is get_torznab_indexer()
+    finally:
+        unconfigured.stop()
 
 
 def test_usenet_selector_prefers_prowlarr_when_configured():

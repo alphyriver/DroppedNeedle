@@ -648,6 +648,10 @@ def get_newznab_indexer() -> "NewznabIndexer":
             priority=s.priority,
         )
         for s in raw
+        # Torznab rows live in the same list but speak the torrent arm; they are
+        # built by get_torznab_indexer. An unfiltered list would send NZB parsing
+        # at a tracker and log every item as unparseable.
+        if s.type == "newznab"
     ]
     # Keep the search cache TTL BELOW the auto-retry interval (02-… §Rate-limiting) so a
     # delayed re-search actually re-hits the indexer instead of serving a stale result -
@@ -773,18 +777,50 @@ def get_usenet_search_indexer() -> "IndexerProtocol":
     return get_newznab_indexer()
 
 
-def get_torrent_search_indexer() -> "IndexerProtocol":
-    """The indexer the TORRENT strategy searches with.
+@singleton
+def get_torznab_indexer() -> "TorznabIndexer":
+    """The aggregate Torznab indexer: one ``IndexerProtocol`` fanning out across
+    every enabled ``type="torznab"`` row. Empty until the user adds their own."""
+    from repositories.torznab.torznab_client import TorznabClient
+    from repositories.torznab.torznab_indexer import TorznabIndexer, TorznabIndexerEntry
 
-    Prowlarr is currently the only torrent-capable indexer, so this resolves to
-    it unconditionally - ``get_prowlarr_indexer`` already returns a disabled
-    indexer when the connection is unconfigured. It exists as a *role*-level
-    selector so it mirrors ``get_usenet_search_indexer``: the strategies bind to
-    "the torrent indexer", not to a named vendor. Adding a second torrent source
-    (Torznab, Jackett) then means changing this function alone rather than every
-    orchestrator construction site.
+    prefs = get_preferences_service()
+    raw = prefs.get_indexers_raw()
+    http = HttpClientFactory.get_client(
+        name="torznab", timeout=30.0, connect_timeout=5.0
+    )
+    entries = [
+        TorznabIndexerEntry(
+            TorznabClient(
+                http, s.url, s.api_key, indexer_id=s.id, indexer_name=s.name or s.url
+            ),
+            indexer_id=s.id,
+            name=s.name or s.url,
+            categories=s.categories,
+            enabled=s.enabled,
+            priority=s.priority,
+        )
+        for s in raw
+        if s.type == "torznab"
+    ]
+    retry_interval_s = (
+        prefs.get_download_policy().auto_retry_base_interval_minutes * 60.0
+    )
+    search_cache_ttl = max(30.0, min(300.0, retry_interval_s * 0.5))
+    return TorznabIndexer(entries, search_cache_ttl=search_cache_ttl)
+
+
+def get_torrent_search_indexer() -> "IndexerProtocol":
+    """The indexer the TORRENT strategy searches with: Prowlarr when configured
+    (one connection, all indexers), else the per-indexer Torznab fan-out.
+
+    Deliberately the same either/or shape as ``get_usenet_search_indexer`` - a
+    configured Prowlarr already aggregates the user's trackers, so fanning out
+    over separate Torznab rows as well would double-search them.
     """
-    return get_prowlarr_indexer()
+    if get_preferences_service().is_prowlarr_configured():
+        return get_prowlarr_indexer()
+    return get_torznab_indexer()
 
 
 def build_prowlarr_client(url: str, api_key: str) -> "ProwlarrClient":

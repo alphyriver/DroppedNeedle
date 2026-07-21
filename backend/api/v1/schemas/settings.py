@@ -314,10 +314,26 @@ class QbittorrentConnectionSettings(AppStruct):
         self.url = self.url.rstrip("/")
 
 
+INDEXER_TYPES = frozenset({"newznab", "torznab"})
+
+
 class NewznabIndexerSettings(AppStruct):
-    """One configured Newznab indexer (D6). ``api_key`` is a Fernet-encrypted
-    secret, masked on read and preserved on a masked save - **per array element**.
-    DroppedNeedle ships no indexers; the user adds their own (guardrail 1)."""
+    """One configured indexer (D6). ``api_key`` is a Fernet-encrypted secret,
+    masked on read and preserved on a masked save - **per array element**.
+    DroppedNeedle ships no indexers; the user adds their own (guardrail 1).
+
+    ``type`` is the wire format, which also determines the protocol the indexer
+    searches: ``newznab`` -> usenet (``UsenetRelease``), ``torznab`` -> torrent
+    (``TorrentRelease``). Torznab is Newznab's torrent variant - same transport
+    and caps document, different extended-attribute namespace - so both share
+    this shape. Prowlarr is deliberately NOT a value here: it is a single
+    connection that returns *both* protocol arms, so it has no single type, and
+    it keeps its own ``ProwlarrConnectionSettings``.
+
+    The class name is retained (rather than ``IndexerSettings``) because it is
+    the persisted config key and part of the upstream schema; renaming it would
+    break saved settings and conflict on every upstream sync.
+    """
 
     id: str = ""
     type: str = "newznab"
@@ -329,10 +345,22 @@ class NewznabIndexerSettings(AppStruct):
     priority: int = 1
 
     def __post_init__(self) -> None:
+        self.type = (self.type or "newznab").strip().lower()
+        if self.type not in INDEXER_TYPES:
+            raise ValueError(
+                f"Unknown indexer type {self.type!r}; expected one of "
+                f"{', '.join(sorted(INDEXER_TYPES))}"
+            )
         self.url = self.url.strip()
         if self.url and not self.url.startswith(("http://", "https://")):
             self.url = f"https://{self.url}"
         self.url = self.url.rstrip("/")
+
+    @property
+    def protocol(self) -> str:
+        """The acquisition protocol this indexer searches - the ``IndexerResult``
+        arm its releases land in."""
+        return "torrent" if self.type == "torznab" else "usenet"
 
 
 class LidarrImportConnectionSettings(AppStruct):
