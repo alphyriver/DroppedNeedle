@@ -23,15 +23,32 @@ vi.mock('$lib/queries/downloads/IndexerQueries.svelte', () => ({
 
 vi.mock('$lib/stores/toast', () => ({ toastStore: { show: vi.fn() } }));
 
+vi.mock('$lib/queries/downloads/ProwlarrTorrentQueries.svelte', () => ({
+	getProwlarrConfigQuery: () => ({
+		data: { enabled: false, url: '', api_key: '', categories: [3000] },
+		isLoading: false,
+		isError: false
+	}),
+	saveProwlarrConfig: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	testProwlarr: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
+
 import SettingsIndexers from './SettingsIndexers.svelte';
 
 describe('SettingsIndexers.svelte', () => {
 	it('shows the empty state teaching bring-your-own when no indexers exist', async () => {
 		indexersData = [];
 		render(SettingsIndexers);
-		await expect.element(page.getByText('No indexers yet')).toBeInTheDocument();
-		// "bring your own" only appears in the empty state (the header says "add your own").
-		await expect.element(page.getByText(/bring your own/)).toBeInTheDocument();
+		await expect.element(page.getByText('No direct indexers yet')).toBeInTheDocument();
+		await expect.element(page.getByText(/Prowlarr can provide all/)).toBeInTheDocument();
+	});
+
+	it('groups Prowlarr inside the Indexers section', async () => {
+		indexersData = [];
+		render(SettingsIndexers);
+		const section = page.getByRole('region', { name: 'Indexers' });
+		await expect.element(section.getByText('Prowlarr', { exact: true })).toBeInTheDocument();
+		await expect.element(section.getByText('No direct indexers yet')).toBeInTheDocument();
 	});
 
 	it('opens an add form and saves a new indexer', async () => {
@@ -61,7 +78,7 @@ describe('SettingsIndexers.svelte', () => {
 		render(SettingsIndexers);
 		await expect.element(page.getByText('DrunkenSlug', { exact: true })).toBeInTheDocument();
 		// Expand and run Test - the result line reports the text-search fallback.
-		await page.getByRole('button', { name: 'Expand' }).click();
+		await page.getByRole('listitem').getByRole('button', { name: 'Expand' }).click();
 		await page.getByRole('button', { name: 'Test' }).click();
 		// The result line reports the caps verdict (text-search fallback for DrunkenSlug).
 		await expect.element(page.getByText(/DS OK - text search/)).toBeInTheDocument();
