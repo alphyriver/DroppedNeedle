@@ -773,6 +773,20 @@ def get_usenet_search_indexer() -> "IndexerProtocol":
     return get_newznab_indexer()
 
 
+def get_torrent_search_indexer() -> "IndexerProtocol":
+    """The indexer the TORRENT strategy searches with.
+
+    Prowlarr is currently the only torrent-capable indexer, so this resolves to
+    it unconditionally - ``get_prowlarr_indexer`` already returns a disabled
+    indexer when the connection is unconfigured. It exists as a *role*-level
+    selector so it mirrors ``get_usenet_search_indexer``: the strategies bind to
+    "the torrent indexer", not to a named vendor. Adding a second torrent source
+    (Torznab, Jackett) then means changing this function alone rather than every
+    orchestrator construction site.
+    """
+    return get_prowlarr_indexer()
+
+
 def build_prowlarr_client(url: str, api_key: str) -> "ProwlarrClient":
     """Transient (not cached) client from caller-supplied credentials, for the
     Prowlarr Test-connection route."""

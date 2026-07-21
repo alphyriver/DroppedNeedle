@@ -301,11 +301,11 @@
 						<SettingsSourcePriority />
 						<SettingsDownloadClient />
 						<SettingsSabnzbd />
-						<SettingsProwlarr />
 						<SettingsQbittorrent />
 						<SettingsOnboardingChecklist />
 					</div>
 				{:else if activeTab === 'indexers' && authStore.isAdmin}
+					<SettingsProwlarr />
 					<SettingsIndexers />
 				{:else if activeTab === 'lidarr-import' && authStore.isAdmin}
 					<SettingsLidarrImport />
