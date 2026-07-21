@@ -651,19 +651,22 @@ class PreferencesService:
             sab.enabled
             and bool(sab.url)
             and (
-                any(i.enabled for i in self.get_indexers())
+                any(i.enabled and i.type == "newznab" for i in self.get_indexers())
                 or self.is_prowlarr_configured()
             )
         )
 
     def is_torrent_ready(self) -> bool:
-        """qBittorrent (torrent) is enabled with a URL AND Prowlarr is configured -
-        Prowlarr is the torrent source's only search path (no per-tracker config)."""
+        """qBittorrent is configured and has a torrent search source: Prowlarr or
+        at least one enabled Torznab indexer."""
         qbt = self.get_qbittorrent_connection_raw()
         return (
             qbt.enabled
             and bool(qbt.client_type and qbt.url and qbt.api_key)
-            and self.is_prowlarr_configured()
+            and (
+                self.is_prowlarr_configured()
+                or any(i.enabled and i.type == "torznab" for i in self.get_indexers())
+            )
         )
 
     def is_builtin_download_ready(self) -> bool:

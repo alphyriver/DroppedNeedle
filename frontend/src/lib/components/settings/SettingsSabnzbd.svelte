@@ -17,8 +17,10 @@
 	const save = saveSabnzbdConfig();
 	const test = testSabnzbd();
 
-	// SABnzbd only downloads what an indexer finds - a Usenet source with no indexer is inert.
-	const hasIndexer = $derived((indexersQuery.data?.length ?? 0) > 0);
+	// Torznab rows cannot supply an NZB, so only Newznab counts for this client.
+	const hasNewznabIndexer = $derived(
+		indexersQuery.data?.some((indexer) => indexer.enabled && indexer.type === 'newznab') ?? false
+	);
 
 	let enabled = $state(false);
 	let url = $state('');
@@ -122,13 +124,14 @@
 		{onToggle}
 		enableAriaLabel="Enable SABnzbd download client"
 	>
-		{#if enabled && !indexersQuery.isLoading && !hasIndexer}
+		{#if enabled && !indexersQuery.isLoading && !hasNewznabIndexer}
 			<div class="alert alert-warning items-start text-sm">
 				<TriangleAlert class="size-5 shrink-0" aria-hidden="true" />
 				<div class="space-y-1">
 					<p>
-						<span class="font-semibold">No indexers configured.</span> SABnzbd downloads the NZBs your
-						indexers find - with none set up, Usenet search returns nothing and this client stays idle.
+						<span class="font-semibold">No Newznab indexers configured.</span> SABnzbd downloads the NZBs
+						your Newznab indexers find - with none enabled, Usenet search returns nothing and this client
+						stays idle.
 					</p>
 					<a class="link link-warning font-medium" href="/settings?tab=indexers">
 						Add an indexer →

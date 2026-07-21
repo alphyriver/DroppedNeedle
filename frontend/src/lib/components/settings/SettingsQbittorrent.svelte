@@ -7,6 +7,7 @@
 		saveQbittorrentConfig,
 		testQbittorrent
 	} from '$lib/queries/downloads/ProwlarrTorrentQueries.svelte';
+	import { getIndexersQuery } from '$lib/queries/downloads/IndexerQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import type { QbittorrentConnectionSettings, QbittorrentTestResult } from '$lib/types';
 
@@ -14,11 +15,15 @@
 
 	const configQuery = getQbittorrentConfigQuery();
 	const prowlarrQuery = getProwlarrConfigQuery();
+	const indexersQuery = getIndexersQuery();
 	const save = saveQbittorrentConfig();
 	const test = testQbittorrent();
 
-	// The torrent source searches ONLY through Prowlarr - qBittorrent without it is inert.
+	// Torrent search can come from Prowlarr or a directly configured Torznab endpoint.
 	const hasProwlarr = $derived(prowlarrQuery.data?.enabled === true);
+	const hasTorznabIndexer = $derived(
+		indexersQuery.data?.some((indexer) => indexer.enabled && indexer.type === 'torznab') ?? false
+	);
 
 	let enabled = $state(false);
 	let url = $state('');
@@ -112,13 +117,13 @@
 		{onToggle}
 		enableAriaLabel="Enable qBittorrent download client"
 	>
-		{#if enabled && !prowlarrQuery.isLoading && !hasProwlarr}
+		{#if enabled && !prowlarrQuery.isLoading && !indexersQuery.isLoading && !hasProwlarr && !hasTorznabIndexer}
 			<div class="alert alert-warning items-start text-sm">
 				<TriangleAlert class="size-5 shrink-0" aria-hidden="true" />
 				<div class="space-y-1">
 					<p>
-						<span class="font-semibold">Prowlarr is not enabled.</span> Torrent search goes through your
-						Prowlarr indexers - without it, this client stays idle.
+						<span class="font-semibold">No torrent indexers configured.</span> Enable Prowlarr or add
+						a Torznab indexer; without either, this client stays idle.
 					</p>
 				</div>
 			</div>
