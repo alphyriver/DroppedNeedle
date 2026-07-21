@@ -77,6 +77,7 @@ from .repo_providers import (  # noqa: F401
     get_prowlarr_client,
     get_prowlarr_indexer,
     get_torrent_search_indexer,
+    get_torznab_indexer,
     get_usenet_search_indexer,
     build_prowlarr_client,
     get_qbittorrent_client,

@@ -180,7 +180,8 @@
 	<header class="space-y-1">
 		<h2 class="text-lg font-semibold">Indexers</h2>
 		<p class="max-w-prose text-sm text-base-content/70">
-			Newznab search sources for Usenet. DroppedNeedle ships none - add your own. A Prowlarr
+			Newznab (Usenet) and Torznab (torrent) search sources. DroppedNeedle ships none - add
+			your own. A Prowlarr
 			"Generic Newznab" endpoint works here too. Higher in the list is searched first.
 		</p>
 	</header>
@@ -322,6 +323,21 @@
 {#snippet editForm()}
 	{@const result = testResults[editingId ?? NEW]}
 	<div class="space-y-3">
+		<div class="form-control">
+			<label class="label" for="indexer-type"><span class="label-text">Type</span></label>
+			<select
+				id="indexer-type"
+				class="select select-bordered select-sm w-full"
+				bind:value={draft!.type}
+			>
+				<option value="newznab">Newznab (Usenet)</option>
+				<option value="torznab">Torznab (Torrent)</option>
+			</select>
+			<span class="label-text-alt mt-1 opacity-70">
+				Newznab returns NZBs and is fetched by SABnzbd; Torznab returns torrents and magnets
+				and is fetched by qBittorrent.
+			</span>
+		</div>
 		<div class="form-control">
 			<label class="label" for="indexer-name"><span class="label-text">Name</span></label>
 			<input
