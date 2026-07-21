@@ -969,17 +969,21 @@ def test_target_startup_heartbeat_extends_idle_deadline_until_validation(
                 )
                 time.sleep(0.02)
             automatic_upgrade._write_state(validated, {"token": token})
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not admitted.exists():
+            while process.returncode is None and not admitted.exists():
                 time.sleep(0.005)
-            process.returncode = 0
+            while process.returncode is None:
+                time.sleep(0.005)
 
         process.thread = threading.Thread(target=child, daemon=True)
         process.thread.start()
         return process
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    def target_ready(_port: int) -> bool:
+        process.returncode = 0
+        return True
+
+    monkeypatch.setattr(automatic_upgrade, "_target_ready", target_ready)
 
     assert (
         run_target_supervisor(
