@@ -22,7 +22,6 @@
 	import SettingsUsers from '$lib/components/settings/SettingsUsers.svelte';
 	import SettingsSecurity from '$lib/components/settings/SettingsSecurity.svelte';
 	import SettingsDownloadClient from '$lib/components/settings/SettingsDownloadClient.svelte';
-	import SettingsProwlarr from '$lib/components/settings/SettingsProwlarr.svelte';
 	import SettingsQbittorrent from '$lib/components/settings/SettingsQbittorrent.svelte';
 	import SettingsSabnzbd from '$lib/components/settings/SettingsSabnzbd.svelte';
 	import SettingsSourcePriority from '$lib/components/settings/SettingsSourcePriority.svelte';
@@ -305,7 +304,6 @@
 						<SettingsOnboardingChecklist />
 					</div>
 				{:else if activeTab === 'indexers' && authStore.isAdmin}
-					<SettingsProwlarr />
 					<SettingsIndexers />
 				{:else if activeTab === 'lidarr-import' && authStore.isAdmin}
 					<SettingsLidarrImport />

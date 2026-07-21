@@ -19,6 +19,8 @@
 	import { toastStore } from '$lib/stores/toast';
 	import type { IndexerSettings, IndexerTestResult } from '$lib/types';
 
+	import SettingsProwlarr from './SettingsProwlarr.svelte';
+
 	const INDEXER_KEY_MASK = 'indexer****';
 	// The common audio categories; 3000 (Audio) expands to all subcats on most indexers.
 	const AUDIO_CATEGORIES = [
@@ -176,15 +178,17 @@
 	}
 </script>
 
-<section class="space-y-4">
+<section class="space-y-4" aria-labelledby="indexers-heading">
 	<header class="space-y-1">
-		<h2 class="text-lg font-semibold">Indexers</h2>
+		<h2 id="indexers-heading" class="text-lg font-semibold">Indexers</h2>
 		<p class="max-w-prose text-sm text-base-content/70">
-			Newznab (Usenet) and Torznab (torrent) search sources. DroppedNeedle ships none - add your
-			own. A Prowlarr "Generic Newznab" endpoint works here too. Higher in the list is searched
-			first.
+			Connect Prowlarr to use the indexers managed there, or add Newznab (Usenet) and Torznab
+			(torrent) search sources directly. DroppedNeedle ships none - add your own. Higher in the
+			direct-indexer list is searched first.
 		</p>
 	</header>
+
+	<SettingsProwlarr />
 
 	{#if indexers.length === 0 && editingId !== NEW}
 		<div
@@ -193,11 +197,10 @@
 			<div class="grid size-14 place-items-center rounded-2xl bg-base-300/60">
 				<Rss class="size-7 text-accent" aria-hidden="true" />
 			</div>
-			<p class="mt-4 font-semibold">No indexers yet</p>
+			<p class="mt-4 font-semibold">No direct indexers yet</p>
 			<p class="mx-auto mt-1 max-w-md text-sm text-base-content/70">
-				Add an indexer (its URL + your API key) to search: Newznab for Usenet, Torznab for torrents.
-				DroppedNeedle bundles none - bring your own. A Prowlarr "Generic Newznab" endpoint works
-				here too.
+				Prowlarr can provide all of your managed sources. Alternatively, add an indexer directly
+				using its URL and API key: Newznab for Usenet or Torznab for torrents.
 			</p>
 			<button type="button" class="btn btn-primary btn-sm mt-5" onclick={startAdd}>
 				<Plus class="size-4" aria-hidden="true" /> Add indexer
