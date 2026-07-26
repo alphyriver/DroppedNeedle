@@ -502,7 +502,7 @@
 												class="input input-sm input-bordered w-full"
 												value={medium.format.value ?? ''}
 												disabled={!canEdit}
-												placeholder='For example, CD or 12" Vinyl'
+												placeholder="For example, CD or 12in Vinyl"
 												oninput={(event) => changeField(medium.format, event.currentTarget.value)}
 											/>
 										</label>

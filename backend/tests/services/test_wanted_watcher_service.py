@@ -35,6 +35,12 @@ from services.native.wanted_watcher_service import (
 
 _DAY = 86400.0
 
+# Kept 13 days behind "now" (age curve: <30d -> 2d interval) so this fixture
+# doesn't bit-rot into the next age bucket as real time passes.
+_FIXTURE_RELEASE_DATE = (
+    (datetime.now(timezone.utc) - timedelta(days=13)).date().isoformat()
+)
+
 
 def _record(
     mbid: str = "rg-1",
@@ -124,7 +130,9 @@ def env(tmp_path) -> _Env:
     album_service = AsyncMock()
     album_service.get_album_tracks_info.side_effect = ResourceNotFoundError("MB down")
     mb = AsyncMock()
-    mb.get_release_group_by_id.return_value = {"first-release-date": "2026-06-23"}
+    mb.get_release_group_by_id.return_value = {
+        "first-release-date": _FIXTURE_RELEASE_DATE
+    }
     sse = AsyncMock()
     prefs = Mock()
     prefs.get_wanted_settings.return_value = WantedWatcherSettings()
@@ -249,7 +257,7 @@ async def test_availability_failures_enrol_as_missing(env, message):
     assert watch is not None
     assert watch.kind == "missing"
     assert watch.user_id == "user-a"
-    assert watch.first_release_date == "2026-06-23"
+    assert watch.first_release_date == _FIXTURE_RELEASE_DATE
     # first check lands one age-curve interval out (13-day-old release -> 2 d ± 20 %)
     delta = watch.next_check_at - time.time()
     assert 0.8 * 2 * _DAY * 0.95 <= delta <= 1.2 * 2 * _DAY
@@ -742,7 +750,7 @@ async def test_dismiss_review_cancels_watches_and_records_seen(env):
     assert watch.state == "watching"
     assert watch.kind == "missing"
     assert watch.user_id == "user-a"
-    assert watch.first_release_date == "2026-06-23"
+    assert watch.first_release_date == _FIXTURE_RELEASE_DATE
     # every rejected candidate is seen: the watcher never badges those copies again
     assert len(await env.store.seen_identities("rg-1")) == 2
 
