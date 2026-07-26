@@ -69,6 +69,12 @@ def test_candidate_identity_lookups_use_normalized_indexes(db_path: Path) -> Non
             "WHERE lower(release_group_mbid) IN (?)",
             ("album-1",),
         ).fetchall()
+        release_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT release_mbid "
+            "FROM local_album_external_identities "
+            "WHERE lower(release_mbid) = lower(?)",
+            ("release-1",),
+        ).fetchall()
         artist_plan = connection.execute(
             "EXPLAIN QUERY PLAN SELECT provider_artist_id "
             "FROM local_artist_external_identities "
@@ -77,7 +83,12 @@ def test_candidate_identity_lookups_use_normalized_indexes(db_path: Path) -> Non
         ).fetchall()
 
     assert any("idx_local_album_identity_rg_lower" in row[3] for row in album_plan)
-    assert any("idx_local_artist_identity_provider_lower" in row[3] for row in artist_plan)
+    assert any(
+        "idx_local_album_identity_release_lower" in row[3] for row in release_plan
+    )
+    assert any(
+        "idx_local_artist_identity_provider_lower" in row[3] for row in artist_plan
+    )
 
 
 @pytest.fixture
@@ -290,6 +301,51 @@ async def test_schema_is_idempotent_and_contains_complete_target_surface(
     assert await first.get_catalog_revision() == 0
     assert await first.get_stream_revision("scan") == 0
     assert _scalar(db_path, "SELECT COUNT(*) FROM local_artists") == 2
+
+
+def test_bulk_preview_staging_columns_upgrade_idempotently(db_path: Path) -> None:
+    lock = threading.Lock()
+    NativeLibraryStore(db_path, lock)
+    with sqlite3.connect(db_path) as connection:
+        for column in (
+            "subject_count",
+            "cursor_review_id",
+            "cursor_updated_at",
+            "summary_json",
+            "state",
+        ):
+            connection.execute(
+                f"ALTER TABLE library_bulk_review_previews DROP COLUMN {column}"
+            )
+        for column in ("staging_cursor", "staging_state"):
+            connection.execute(
+                f"ALTER TABLE library_bulk_review_snapshots DROP COLUMN {column}"
+            )
+
+    NativeLibraryStore(db_path, lock)
+    NativeLibraryStore(db_path, lock)
+
+    with sqlite3.connect(db_path) as connection:
+        preview_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info('library_bulk_review_previews')"
+            )
+        }
+        snapshot_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info('library_bulk_review_snapshots')"
+            )
+        }
+    assert {
+        "state",
+        "summary_json",
+        "cursor_updated_at",
+        "cursor_review_id",
+        "subject_count",
+    } <= preview_columns
+    assert {"staging_state", "staging_cursor"} <= snapshot_columns
 
 
 @pytest.mark.asyncio
@@ -1219,9 +1275,12 @@ async def test_discovery_generation_ignores_and_boundedly_cleans_old_rows(
 
     await store.prepare_scan_discovery_resume("scan-generation")
 
-    assert await store.get_scan_inventory_batch(
-        "scan-generation", processing_state="pending", limit=10
-    ) == []
+    assert (
+        await store.get_scan_inventory_batch(
+            "scan-generation", processing_state="pending", limit=10
+        )
+        == []
+    )
     assert await store.cleanup_stale_scan_inventory("scan-generation", limit=1) == 1
     assert _scalar(db_path, "SELECT COUNT(*) FROM library_scan_inventory") == 1
     assert await store.cleanup_stale_scan_inventory("scan-generation", limit=1) == 1
@@ -1235,7 +1294,9 @@ async def test_schema_backfills_inventory_scope_for_persisted_subdirectory_scan(
     lock = threading.Lock()
     store = NativeLibraryStore(db_path, lock)
     await store.create_scan_run(
-        ScanRun(id="scan-subdirectory", kind="incremental", trigger="manual", queued_at=1)
+        ScanRun(
+            id="scan-subdirectory", kind="incremental", trigger="manual", queued_at=1
+        )
     )
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -1656,6 +1717,79 @@ async def test_policy_scope_wildcards_are_matched_literally(
         ("scope%_literal/track.flac", "policy-2"),
         ("scopeXXliteral/track.flac", ""),
     ]
+
+
+@pytest.mark.asyncio
+async def test_policy_scope_aggregates_collapse_overlaps_and_count_availability_exactly(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    root_track = _membership("root")
+    root_track.tracks[0].relative_path = "Artist/root.flac"
+    root_track.tracks[0].file_path = "/music/Artist/root.flac"
+    excluded_track = _membership("excluded")
+    excluded_track.tracks[0].relative_path = "Artist/Live/excluded.flac"
+    excluded_track.tracks[0].file_path = "/music/Artist/Live/excluded.flac"
+    missing_track = _membership("missing")
+    missing_track.tracks[0].relative_path = "Artist/Live/missing.flac"
+    missing_track.tracks[0].file_path = "/music/Artist/Live/missing.flac"
+    removed_root_track = _membership("removed")
+    removed_root_track.album.root_id = "removed-root"
+    removed_root_track.tracks[0].root_id = "removed-root"
+    removed_root_track.tracks[0].relative_path = "gone.flac"
+    removed_root_track.tracks[0].file_path = "/old/gone.flac"
+    for membership in (
+        root_track,
+        excluded_track,
+        missing_track,
+        removed_root_track,
+    ):
+        await store.create_catalog_membership(membership)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET availability = 'excluded' WHERE id = 'track-excluded'"
+        )
+        connection.execute(
+            "UPDATE local_tracks SET availability = 'missing' WHERE id = 'track-missing'"
+        )
+
+    counts = await store.get_policy_scope_counts(
+        [
+            ("root-1", "."),
+            ("root-1", "Artist"),
+            ("root-1", "Artist/Live"),
+            ("removed-root", "."),
+        ]
+    )
+    assert counts == {
+        ("root-1", "."): (1, 2),
+        ("root-1", "Artist"): (1, 2),
+        ("root-1", "Artist/Live"): (0, 1),
+        ("removed-root", "."): (1, 1),
+    }
+    scopes = [
+        ScanScope(root_id="root-1", relative_path=".", policy_revision="policy-2"),
+        ScanScope(
+            root_id="root-1",
+            relative_path="Artist/Live",
+            policy_revision="policy-2",
+        ),
+        ScanScope(
+            root_id="removed-root", relative_path=".", policy_revision="policy-2"
+        ),
+    ]
+    assert await store.get_policy_scope_total_counts(scopes) == (2, 3)
+    nested_scopes = [
+        ScanScope(root_id="root-1", relative_path="Artist", policy_revision="policy-2"),
+        ScanScope(
+            root_id="root-1",
+            relative_path="Artist/Live",
+            policy_revision="policy-2",
+        ),
+        ScanScope(
+            root_id="removed-root", relative_path=".", policy_revision="policy-2"
+        ),
+    ]
+    assert await store.get_policy_scope_total_counts(nested_scopes) == (2, 3)
 
 
 @pytest.mark.asyncio

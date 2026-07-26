@@ -1,13 +1,9 @@
 import { createMutation } from '@tanstack/svelte-query';
 import { api } from '$lib/api/client';
 import { API } from '$lib/constants';
-import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
-import { ArtistQueryKeyFactory } from '$lib/queries/artist/ArtistQueryKeyFactory';
-import { DiscoverQueryKeyFactory } from '$lib/queries/discover/DiscoverQueryKeyFactory';
-import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
 import { toastStore } from '$lib/stores/toast';
-import { searchStore } from '$lib/stores/search';
-import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
+import { invalidateLibraryCatalog } from './LibraryCatalogInvalidation';
+import { createUuid } from '$lib/utils/uuid';
 import type { MembershipPreviewResponse, OperationResponse } from './LibraryOperationsTypes';
 
 export interface MembershipPreviewInput {
@@ -34,16 +30,6 @@ interface CatalogCorrectionResponse {
 	catalog_revision: number;
 }
 
-async function invalidateCatalog(): Promise<void> {
-	searchStore.clear();
-	await Promise.all([
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all }),
-		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.prefix }),
-		invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix }),
-		invalidateQueriesWithPersister({ queryKey: DiscoverQueryKeyFactory.prefix })
-	]);
-}
-
 export function reidentifyLibraryAlbum() {
 	return createMutation(() => ({
 		mutationFn: (input: {
@@ -55,11 +41,11 @@ export function reidentifyLibraryAlbum() {
 			api.global.post<OperationResponse>(API.library.reidentifyAlbum(input.albumId), {
 				expected_album_revision: input.expectedAlbumRevision,
 				expected_input_revision: input.expectedInputRevision,
-				idempotency_key: crypto.randomUUID(),
+				idempotency_key: createUuid(),
 				one_off_local_metadata: input.oneOffLocalMetadata
 			}),
 		onSuccess: async () => {
-			await invalidateCatalog();
+			await invalidateLibraryCatalog();
 			toastStore.show({ message: 'Identification started', type: 'success' });
 		},
 		onError: () => toastStore.show({ message: 'Could not start identification', type: 'error' })
@@ -79,7 +65,7 @@ export function selectReidentificationCandidate() {
 				candidate_key: input.candidateKey,
 				confirmation: input.confirmation
 			}),
-		onSuccess: invalidateCatalog,
+		onSuccess: invalidateLibraryCatalog,
 		onError: () =>
 			toastStore.show({ message: 'The candidates changed; review them again', type: 'error' })
 	}));
@@ -120,12 +106,12 @@ export function applyAlbumMembership(kind: 'split' | 'merge' | 'move' | 'reset')
 			return api.global.post<CatalogCorrectionResponse>(url, {
 				...input.request,
 				preview_token: input.previewToken,
-				idempotency_key: crypto.randomUUID(),
+				idempotency_key: createUuid(),
 				identity_choice: input.identityChoice
 			});
 		},
 		onSuccess: async () => {
-			await invalidateCatalog();
+			await invalidateLibraryCatalog();
 			toastStore.show({ message: 'Album organization updated', type: 'success' });
 		},
 		onError: () =>
@@ -150,10 +136,10 @@ export function applyArtistMerge() {
 		) =>
 			api.global.post<CatalogCorrectionResponse>(API.library.mergeArtists(), {
 				...input,
-				idempotency_key: crypto.randomUUID()
+				idempotency_key: createUuid()
 			}),
 		onSuccess: async () => {
-			await invalidateCatalog();
+			await invalidateLibraryCatalog();
 			toastStore.show({ message: 'Artists merged', type: 'success' });
 		},
 		onError: () =>

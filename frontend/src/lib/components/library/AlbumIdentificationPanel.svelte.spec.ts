@@ -10,7 +10,9 @@ const album: LibraryAlbumDetail = {
 	artist_name: 'Signal Artist',
 	artist_id: 'artist-1',
 	musicbrainz_release_group_id: null,
+	musicbrainz_release_id: null,
 	musicbrainz_artist_id: null,
+	album_identity_state: 'local_only',
 	track_count: 2,
 	total_duration_seconds: 300,
 	total_size_bytes: 1000,
@@ -25,7 +27,9 @@ const album: LibraryAlbumDetail = {
 	input_revision: 'input-5',
 	identification_status: 'local_metadata',
 	review_id: null,
-	review_revision: null
+	review_revision: null,
+	contribution_id: null,
+	contribution_state: null
 };
 
 function job(overrides: Partial<OperationResponse> = {}): OperationResponse {
@@ -133,6 +137,10 @@ beforeEach(() => {
 	h.jobs = {};
 	h.queryError = false;
 	h.start.mockResolvedValue(job({ state: 'queued' }));
+	h.select.mockResolvedValue(job({ state: 'succeeded' }));
+	h.pause.mockResolvedValue(job({ state: 'paused' }));
+	h.resume.mockResolvedValue(job({ state: 'running' }));
+	h.stop.mockResolvedValue(job({ state: 'stopped' }));
 });
 
 describe('AlbumIdentificationPanel', () => {

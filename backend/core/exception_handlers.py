@@ -144,7 +144,7 @@ async def source_resolution_error_handler(
         "Source resolution error: %s - %s %s", exc, request.method, request.url.path
     )
     return error_response(
-        status.HTTP_422_UNPROCESSABLE_ENTITY, SOURCE_RESOLUTION_ERROR, str(exc)
+        status.HTTP_422_UNPROCESSABLE_CONTENT, SOURCE_RESOLUTION_ERROR, str(exc)
     )
 
 
@@ -183,7 +183,7 @@ async def request_validation_error_handler(
         {k: v for k, v in err.items() if k != "ctx"} for err in exc.errors()
     ]
     return error_response(
-        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
         VALIDATION_ERROR,
         "Validation failed",
         details=clean_errors,
