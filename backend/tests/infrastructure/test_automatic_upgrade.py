@@ -886,8 +886,13 @@ async def test_target_startup_progress_heartbeat_advances_while_stage_is_active(
     async with automatic_upgrade.target_startup_progress(
         settings, "catalog_validation"
     ):
-        await asyncio.sleep(0.035)
-        progress = automatic_upgrade._target_progress(progress_path, token)
+        for _ in range(100):
+            progress = automatic_upgrade._target_progress(progress_path, token)
+            if progress is not None and progress["sequence"] >= 3:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("startup progress heartbeat did not reach sequence 3")
 
     assert progress is not None
     assert progress["stage"] == "catalog_validation"
@@ -943,8 +948,21 @@ def test_target_startup_heartbeat_extends_idle_deadline_until_validation(
         validated, admitted = automatic_upgrade._admission_paths(settings, token)
         progress = automatic_upgrade._admission_progress_path(settings, token)
 
+        # A real target writes its first heartbeat as it enters a startup stage.
+        # Write that state before returning from the fake Popen so this test is
+        # about an advancing heartbeat, not OS thread-start scheduling latency.
+        automatic_upgrade._write_state(
+            progress,
+            {
+                "token": token,
+                "stage": "catalog_validation",
+                "sequence": 1,
+                "elapsed_seconds": 0.0,
+            },
+        )
+
         def child() -> None:
-            for sequence in range(1, 7):
+            for sequence in range(2, 8):
                 automatic_upgrade._write_state(
                     progress,
                     {
@@ -956,23 +974,27 @@ def test_target_startup_heartbeat_extends_idle_deadline_until_validation(
                 )
                 time.sleep(0.02)
             automatic_upgrade._write_state(validated, {"token": token})
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline and not admitted.exists():
+            while process.returncode is None and not admitted.exists():
                 time.sleep(0.005)
-            process.returncode = 0
+            while process.returncode is None:
+                time.sleep(0.005)
 
         process.thread = threading.Thread(target=child, daemon=True)
         process.thread.start()
         return process
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    def target_ready(_port: int) -> bool:
+        process.returncode = 0
+        return True
+
+    monkeypatch.setattr(automatic_upgrade, "_target_ready", target_ready)
 
     assert (
         run_target_supervisor(
             settings,
             command=["target"],
-            admission_timeout_seconds=0.04,
+            admission_timeout_seconds=0.1,
         )
         == 0
     )

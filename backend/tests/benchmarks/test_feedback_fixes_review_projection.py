@@ -11,10 +11,11 @@ import pytest
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.library_review_service import LibraryReviewService
 
-REVIEW_ROWS = 115_000
+FAST_REVIEW_ROWS = 1_000
+SCALE_REVIEW_ROWS = 115_000
 
 
-def _seed_reviews(path: Path) -> None:
+def _seed_reviews(path: Path, review_rows: int) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
     NativeLibraryStore(path, threading.Lock())
@@ -33,8 +34,8 @@ def _seed_reviews(path: Path) -> None:
             "'artist', 'artist', 'automatic', 1, 1)"
         )
         batch_size = 2_000
-        for start in range(0, REVIEW_ROWS, batch_size):
-            stop = min(REVIEW_ROWS, start + batch_size)
+        for start in range(0, review_rows, batch_size):
+            stop = min(review_rows, start + batch_size)
             connection.executemany(
                 "INSERT INTO local_tracks "
                 "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
@@ -77,18 +78,17 @@ def _seed_reviews(path: Path) -> None:
         connection.execute("ANALYZE")
 
 
-@pytest.mark.asyncio
-async def test_115000_review_cursor_is_stable_and_named_indexes_cover_filters(
-    tmp_path: Path,
+async def _assert_review_cursor_and_indexes(
+    tmp_path: Path, *, review_rows: int
 ) -> None:
-    path = tmp_path / "review-benchmark.db"
-    _seed_reviews(path)
+    path = tmp_path / f"review-{review_rows}.db"
+    _seed_reviews(path, review_rows)
     store = NativeLibraryStore(path, threading.Lock())
     service = LibraryReviewService(store)
 
     first = await service.list_reviews(limit=50, state="needs_review", sort="newest")
     assert len(first.items) == 50
-    assert first.filtered_total == REVIEW_ROWS
+    assert first.filtered_total == review_rows
     assert first.has_more is True
     assert first.next_cursor is not None
 
@@ -148,3 +148,18 @@ async def test_115000_review_cursor_is_stable_and_named_indexes_cover_filters(
     assert "idx_library_reviews_state_cursor" in state_plan
     assert "idx_library_reviews_reason_cursor" in reason_plan
     assert "idx_library_reviews_created_cursor" in created_plan
+
+
+@pytest.mark.asyncio
+async def test_review_cursor_is_stable_and_named_indexes_cover_filters(
+    tmp_path: Path,
+) -> None:
+    await _assert_review_cursor_and_indexes(tmp_path, review_rows=FAST_REVIEW_ROWS)
+
+
+@pytest.mark.scale
+@pytest.mark.asyncio
+async def test_115000_review_cursor_is_stable_and_named_indexes_cover_filters(
+    tmp_path: Path,
+) -> None:
+    await _assert_review_cursor_and_indexes(tmp_path, review_rows=SCALE_REVIEW_ROWS)

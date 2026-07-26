@@ -48,9 +48,11 @@ jobs:
           pip install ruff==0.6.9
           ruff check backend
 
-      - name: Backend unit + integration tests
+      # Backend CI runs the complete suite. Keep this phase gate scoped to the
+      # native engine instead of running all 5,000+ backend tests a second time.
+      - name: Native backend unit + integration tests
         working-directory: ./backend
-        run: python -m pytest
+        run: python -m pytest tests/services/native
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

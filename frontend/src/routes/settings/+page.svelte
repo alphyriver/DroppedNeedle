@@ -22,6 +22,7 @@
 	import SettingsUsers from '$lib/components/settings/SettingsUsers.svelte';
 	import SettingsSecurity from '$lib/components/settings/SettingsSecurity.svelte';
 	import SettingsDownloadClient from '$lib/components/settings/SettingsDownloadClient.svelte';
+	import SettingsQbittorrent from '$lib/components/settings/SettingsQbittorrent.svelte';
 	import SettingsSabnzbd from '$lib/components/settings/SettingsSabnzbd.svelte';
 	import SettingsSourcePriority from '$lib/components/settings/SettingsSourcePriority.svelte';
 	import SettingsDownloadPolicy from '$lib/components/settings/SettingsDownloadPolicy.svelte';
@@ -299,6 +300,7 @@
 						<SettingsSourcePriority />
 						<SettingsDownloadClient />
 						<SettingsSabnzbd />
+						<SettingsQbittorrent />
 						<SettingsOnboardingChecklist />
 					</div>
 				{:else if activeTab === 'indexers' && authStore.isAdmin}

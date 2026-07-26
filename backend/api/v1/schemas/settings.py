@@ -270,10 +270,70 @@ class SabnzbdConnectionSettings(AppStruct):
         self.url = self.url.rstrip("/")
 
 
+class ProwlarrConnectionSettings(AppStruct):
+    """Prowlarr connection (fork feature): ONE URL + API key covering every indexer
+    the user manages in Prowlarr (usenet AND torrent/private trackers). When enabled
+    it replaces the per-indexer Newznab fan-out for Usenet search and supplies the
+    torrent source's search. ``api_key`` is a Fernet-encrypted secret, masked on
+    read, preserved on a masked save."""
+
+    enabled: bool = False
+    url: str = ""
+    api_key: str = ""
+    categories: list[int] = msgspec.field(default_factory=lambda: [3000])
+
+    def __post_init__(self) -> None:
+        self.url = self.url.strip()
+        if self.url and not self.url.startswith(("http://", "https://")):
+            self.url = f"http://{self.url}"
+        self.url = self.url.rstrip("/")
+        for suffix in ("/api/v1", "/api"):
+            if self.url.endswith(suffix):
+                self.url = self.url[: -len(suffix)].rstrip("/")
+                break
+
+
+class QbittorrentConnectionSettings(AppStruct):
+    """qBittorrent download-client connection (fork feature, torrent source).
+    qBittorrent 5.2+ Bearer ``api_key`` authentication; the key is encrypted at
+    rest and masked on read. ``category`` scopes DroppedNeedle's torrents
+    (and its save path, configured in qBittorrent); ``downloads_mount`` is where
+    DroppedNeedle sees qBittorrent's completed dir (the remap target)."""
+
+    enabled: bool = False
+    client_type: str = "qbittorrent"
+    url: str = ""
+    api_key: str = ""
+    category: str = "droppedneedle"
+    downloads_mount: str = "/qbittorrent-downloads"
+
+    def __post_init__(self) -> None:
+        self.url = self.url.strip()
+        if self.url and not self.url.startswith(("http://", "https://")):
+            self.url = f"http://{self.url}"
+        self.url = self.url.rstrip("/")
+
+
+INDEXER_TYPES = frozenset({"newznab", "torznab"})
+
+
 class NewznabIndexerSettings(AppStruct):
-    """One configured Newznab indexer (D6). ``api_key`` is a Fernet-encrypted
-    secret, masked on read and preserved on a masked save - **per array element**.
-    DroppedNeedle ships no indexers; the user adds their own (guardrail 1)."""
+    """One configured indexer (D6). ``api_key`` is a Fernet-encrypted secret,
+    masked on read and preserved on a masked save - **per array element**.
+    DroppedNeedle ships no indexers; the user adds their own (guardrail 1).
+
+    ``type`` is the wire format, which also determines the protocol the indexer
+    searches: ``newznab`` -> usenet (``UsenetRelease``), ``torznab`` -> torrent
+    (``TorrentRelease``). Torznab is Newznab's torrent variant - same transport
+    and caps document, different extended-attribute namespace - so both share
+    this shape. Prowlarr is deliberately NOT a value here: it is a single
+    connection that returns *both* protocol arms, so it has no single type, and
+    it keeps its own ``ProwlarrConnectionSettings``.
+
+    The class name is retained (rather than ``IndexerSettings``) because it is
+    the persisted config key and part of the upstream schema; renaming it would
+    break saved settings and conflict on every upstream sync.
+    """
 
     id: str = ""
     type: str = "newznab"
@@ -285,10 +345,22 @@ class NewznabIndexerSettings(AppStruct):
     priority: int = 1
 
     def __post_init__(self) -> None:
+        self.type = (self.type or "newznab").strip().lower()
+        if self.type not in INDEXER_TYPES:
+            raise ValueError(
+                f"Unknown indexer type {self.type!r}; expected one of "
+                f"{', '.join(sorted(INDEXER_TYPES))}"
+            )
         self.url = self.url.strip()
         if self.url and not self.url.startswith(("http://", "https://")):
             self.url = f"https://{self.url}"
         self.url = self.url.rstrip("/")
+
+    @property
+    def protocol(self) -> str:
+        """The acquisition protocol this indexer searches - the ``IndexerResult``
+        arm its releases land in."""
+        return "torrent" if self.type == "torznab" else "usenet"
 
 
 class LidarrImportConnectionSettings(AppStruct):
@@ -343,6 +415,8 @@ ACOUSTID_KEY_MASK = "acoustid****"
 DOWNLOAD_CLIENT_API_KEY_MASK = "slskd****"
 INDEXER_API_KEY_MASK = "indexer****"
 SABNZBD_API_KEY_MASK = "sabnzbd****"
+PROWLARR_API_KEY_MASK = "prowlarr****"
+QBITTORRENT_API_KEY_MASK = "qbittorrent****"
 LIDARR_IMPORT_API_KEY_MASK = "lidarr****"
 SPOTIFY_SECRET_MASK = "spotify****"
 

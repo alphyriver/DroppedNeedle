@@ -1,5 +1,5 @@
 import { page } from '@vitest/browser/context';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
 const saveMutate = vi.fn().mockResolvedValue({});
@@ -10,6 +10,7 @@ const testMutate = vi.fn().mockResolvedValue({
 	categories: ['*', 'audio'],
 	complete_dir: '/data/Downloads/complete'
 });
+let indexersData: unknown[] = [];
 
 vi.mock('$lib/queries/downloads/DownloadClientsQueries.svelte', () => ({
 	getSabnzbdConfigQuery: () => ({
@@ -30,9 +31,8 @@ vi.mock('$lib/queries/downloads/DownloadClientsQueries.svelte', () => ({
 	testSabnzbd: () => ({ mutateAsync: testMutate, isPending: false })
 }));
 
-// No indexers configured - the SABnzbd card should warn the user that Usenet is inert.
 vi.mock('$lib/queries/downloads/IndexerQueries.svelte', () => ({
-	getIndexersQuery: () => ({ data: [], isLoading: false })
+	getIndexersQuery: () => ({ data: indexersData, isLoading: false })
 }));
 
 vi.mock('$lib/stores/toast', () => ({ toastStore: { show: vi.fn() } }));
@@ -40,6 +40,11 @@ vi.mock('$lib/stores/toast', () => ({ toastStore: { show: vi.fn() } }));
 import SettingsSabnzbd from './SettingsSabnzbd.svelte';
 
 describe('SettingsSabnzbd.svelte', () => {
+	beforeEach(() => {
+		indexersData = [];
+		saveMutate.mockClear();
+	});
+
 	it('shows the SABnzbd card header with an enable toggle (collapsed by default)', async () => {
 		render(SettingsSabnzbd);
 		await expect.element(page.getByText('SABnzbd')).toBeInTheDocument();
@@ -71,6 +76,26 @@ describe('SettingsSabnzbd.svelte', () => {
 		await page.getByLabelText('Enable SABnzbd download client').click();
 		expect(saveMutate).toHaveBeenCalledWith(expect.objectContaining({ enabled: true }));
 		// With no indexers, an enabled SABnzbd is inert - the card must say so.
-		await expect.element(page.getByText('No indexers configured.')).toBeInTheDocument();
+		await expect.element(page.getByText('No Newznab indexers configured.')).toBeInTheDocument();
+	});
+
+	it('does not count a Torznab indexer as a Usenet search source', async () => {
+		indexersData = [{ id: 't1', type: 'torznab', enabled: true }];
+		render(SettingsSabnzbd);
+
+		await page.getByRole('button', { name: 'Expand' }).click();
+		await page.getByLabelText('Enable SABnzbd download client').click();
+
+		await expect.element(page.getByText('No Newznab indexers configured.')).toBeInTheDocument();
+	});
+
+	it('accepts an enabled Newznab indexer as a Usenet search source', async () => {
+		indexersData = [{ id: 'n1', type: 'newznab', enabled: true }];
+		render(SettingsSabnzbd);
+
+		await page.getByRole('button', { name: 'Expand' }).click();
+		await page.getByLabelText('Enable SABnzbd download client').click();
+
+		await expect.element(page.getByText('No Newznab indexers configured.')).not.toBeInTheDocument();
 	});
 });

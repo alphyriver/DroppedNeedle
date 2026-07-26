@@ -8,9 +8,12 @@ import pytest
 
 from api.v1.schemas.settings import (
     SABNZBD_API_KEY_MASK,
+    QBITTORRENT_API_KEY_MASK,
     DownloadClientConnectionSettings,
     DownloadPolicySettings,
     NewznabIndexerSettings,
+    ProwlarrConnectionSettings,
+    QbittorrentConnectionSettings,
     SabnzbdConnectionSettings,
 )
 from core.config import Settings
@@ -64,6 +67,19 @@ def test_usenet_ready_requires_sabnzbd_and_an_enabled_indexer(prefs):
     )
     assert prefs.is_usenet_ready() is True
     assert prefs.is_download_source_ready() is True
+
+
+def test_torznab_indexer_does_not_make_usenet_ready(prefs):
+    prefs.save_sabnzbd_connection(
+        SabnzbdConnectionSettings(enabled=True, url="http://sab:8080", api_key="k")
+    )
+    prefs.save_indexer(
+        NewznabIndexerSettings(
+            type="torznab", name="Tracker", url="https://tracker.test/api", api_key="k"
+        )
+    )
+
+    assert prefs.is_usenet_ready() is False
 
 
 def test_usenet_only_is_ready_even_with_slskd_disabled(prefs):
@@ -135,14 +151,14 @@ def test_save_and_read_policy(prefs):
 
 
 def test_source_priority_defaults_soulseek_first(prefs):
-    assert prefs.get_source_priority() == ["soulseek", "usenet"]
+    assert prefs.get_source_priority() == ["soulseek", "usenet", "torrent"]
 
 
 def test_source_priority_save_and_normalise(prefs):
-    prefs.save_source_priority(["usenet"])  # only one given -> the other is appended
-    assert prefs.get_source_priority() == ["usenet", "soulseek"]
-    prefs.save_source_priority(["usenet", "bogus", "soulseek"])  # unknowns dropped
-    assert prefs.get_source_priority() == ["usenet", "soulseek"]
+    prefs.save_source_priority(["usenet"])  # only one given -> the others are appended
+    assert prefs.get_source_priority() == ["usenet", "soulseek", "torrent"]
+    prefs.save_source_priority(["usenet", "bogus", "torrent", "soulseek"])  # unknowns dropped
+    assert prefs.get_source_priority() == ["usenet", "torrent", "soulseek"]
 
 
 def test_sabnzbd_defaults_disabled(prefs):
@@ -172,3 +188,53 @@ def test_sabnzbd_masked_save_preserves_key(prefs):
     raw = prefs.get_sabnzbd_connection_raw()
     assert raw.api_key == "full-key"  # preserved
     assert raw.url == "http://new:8080"  # updated
+
+
+def test_qbittorrent_key_masked_encrypted_and_preserved(prefs):
+    prefs.save_qbittorrent_connection(
+        QbittorrentConnectionSettings(
+            enabled=True, url="http://qbt:8080", api_key="full-key"
+        )
+    )
+    assert prefs.get_qbittorrent_connection().api_key == QBITTORRENT_API_KEY_MASK
+    assert prefs.get_qbittorrent_connection_raw().api_key == "full-key"
+    stored = json.loads(prefs._config_path.read_text())["download_clients"]["qbittorrent"]["api_key"]
+    assert stored not in ("", "full-key")
+
+    prefs.save_qbittorrent_connection(
+        QbittorrentConnectionSettings(
+            enabled=True, url="http://new-qbt:8080", api_key=QBITTORRENT_API_KEY_MASK
+        )
+    )
+    assert prefs.get_qbittorrent_connection_raw().api_key == "full-key"
+    assert prefs.get_qbittorrent_connection_raw().url == "http://new-qbt:8080"
+
+
+def test_torrent_ready_requires_key_selected_client_and_prowlarr(prefs):
+    prefs.save_prowlarr_connection(
+        ProwlarrConnectionSettings(
+            enabled=True, url="http://prowlarr:9696", api_key="p"
+        )
+    )
+    prefs.save_qbittorrent_connection(
+        QbittorrentConnectionSettings(
+            enabled=True, url="http://qbt:8080", api_key="q"
+        )
+    )
+    assert prefs.is_torrent_ready() is True
+
+
+def test_torrent_ready_accepts_torznab_without_prowlarr(prefs):
+    prefs.save_indexer(
+        NewznabIndexerSettings(
+            type="torznab", name="Tracker", url="https://tracker.test/api", api_key="t"
+        )
+    )
+    prefs.save_qbittorrent_connection(
+        QbittorrentConnectionSettings(
+            enabled=True, url="http://qbt:8080", api_key="q"
+        )
+    )
+
+    assert prefs.is_torrent_ready() is True
+    assert prefs.is_builtin_download_ready() is True

@@ -65,14 +65,17 @@ def test_create_indexer_saves_and_rebuilds_target_download_singletons(monkeypatc
     from core.dependencies import (
         get_target_download_orchestrator,
         get_target_download_service,
+        get_torznab_indexer,
     )
 
     orchestrator_clear = MagicMock()
     service_clear = MagicMock()
+    torznab_clear = MagicMock()
     monkeypatch.setattr(
         get_target_download_orchestrator, "cache_clear", orchestrator_clear
     )
     monkeypatch.setattr(get_target_download_service, "cache_clear", service_clear)
+    monkeypatch.setattr(get_torznab_indexer, "cache_clear", torznab_clear)
     prefs = _prefs()
     app = _app(prefs)
     app.dependency_overrides[_get_current_admin] = mock_admin_user
@@ -85,6 +88,7 @@ def test_create_indexer_saves_and_rebuilds_target_download_singletons(monkeypatc
     prefs.save_indexer.assert_called_once()
     orchestrator_clear.assert_called_once()
     service_clear.assert_called_once()
+    torznab_clear.assert_called_once()
 
 
 def test_delete_indexer_admin():

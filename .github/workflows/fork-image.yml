@@ -1,0 +1,198 @@
+# Fork-only workflow: CI-gated multi-architecture publication with PEP 440
+# post-release tags (v<upstream-base-version>.post<N>). The counter resets when a
+# newer plain upstream release tag becomes reachable. Main pushes publish and release
+# the computed tag; tag and manual runs build without depending on skipped outputs.
+name: Fork Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "Dockerfile"
+      - "entrypoint.sh"
+      - ".github/workflows/fork-image.yml"
+      - ".github/scripts/next-fork-version.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    if: github.repository == 'alphyriver/DroppedNeedle'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - run: pip install -r backend/requirements-dev.txt
+      - run: ruff check backend
+      # The maintenance tests assume a deploy-style checkout: a repo-root
+      # docker-compose.yml (gitignored) plus a dirty worktree (the marker file).
+      - run: cp docker-compose.example.yml docker-compose.yml && touch .ci-dirty-worktree-marker
+      - run: python -m pytest backend/tests
+
+  frontend:
+    if: github.repository == 'alphyriver/DroppedNeedle'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+      - run: pnpm run format:check
+      - run: pnpm run check
+      - run: pnpm exec vitest run --project server
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm exec vitest run --project client
+
+  # Computes the next fork release tag on a branch push (merge to main, including the
+  # daily upstream-sync auto-merge). Not run for a manually-pushed v* tag or a
+  # workflow_dispatch replay - there's nothing to compute in either case.
+  version:
+    if: |
+      github.repository == 'alphyriver/DroppedNeedle' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/heads/')
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute next fork tag
+        id: compute
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(bash .github/scripts/next-fork-version.sh)
+          if [[ -n "$TAG" ]]; then
+            echo "Computed fork tag: $TAG" >&2
+          else
+            echo "HEAD already has a post-release tag - skipping." >&2
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [backend, frontend, version]
+    # `always()` because `version` is conditionally skipped (not failed) for a
+    # tag-triggered/workflow_dispatch run - a skipped `needs` would otherwise skip
+    # this job too. Still requires backend+frontend to have actually succeeded, and
+    # only for this repo (a fork of a fork shouldn't publish images to our registry).
+    if: |
+      always() &&
+      github.repository == 'alphyriver/DroppedNeedle' &&
+      needs.backend.result == 'success' &&
+      needs.frontend.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image metadata and tags
+        id: metadata
+        shell: bash
+        env:
+          COMPUTED_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/alphyriver/droppedneedle"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          CREATED=$(git log -1 --pretty=%cI)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "$COMPUTED_TAG" ]]; then
+            VERSION="$COMPUTED_TAG"
+          else
+            VERSION="dev"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "created=$CREATED"
+            echo "tags<<EOF"
+            echo "$IMAGE:latest"
+            echo "$IMAGE:sha-$SHORT_SHA"
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              echo "$IMAGE:${GITHUB_REF#refs/tags/}"
+            fi
+            if [[ -n "$COMPUTED_TAG" ]]; then
+              echo "$IMAGE:$COMPUTED_TAG"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          build-args: |
+            COMMIT_TAG=${{ steps.metadata.outputs.version }}
+            BUILD_DATE=${{ steps.metadata.outputs.created }}
+            DROPPEDNEEDLE_SOURCE_REVISION=${{ github.sha }}
+            IMAGE_SOURCE=https://github.com/${{ github.repository }}
+            DROPPEDNEEDLE_RELEASES_REPOSITORY=${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  # Tags the commit that was just built and creates a GitHub Release for it. Same
+  # branch-push guard as `version` - skipped for tag-triggered/workflow_dispatch runs
+  # and for a no-op re-run (version.outputs.tag is empty in both cases).
+  release:
+    if: |
+      github.repository == 'alphyriver/DroppedNeedle' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/heads/') &&
+      needs.version.outputs.tag != ''
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create and push tag
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          git config user.name "fork-release[bot]"
+          git config user.email "fork-release@users.noreply.github.com"
+          git tag -a "$TAG" -m "Fork build $TAG"
+          git push origin "$TAG"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true

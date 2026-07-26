@@ -43,6 +43,7 @@ from services.native.acquisition.status import DownloadStatus
 from services.native.acquisition.strategy import (
     SoulseekStrategy,
     SourceStrategy,
+    TorrentStrategy,
     UsenetStrategy,
 )
 from services.native.album_preflight_scorer import AlbumPreflightScorer
@@ -63,9 +64,6 @@ from services.native.library_manager import LibraryManager
 from services.native.track_matcher import TrackMatcher
 
 logger = logging.getLogger(__name__)
-
-# Fixed v1 source -> client_type map (the DownloadTask.download_client value).
-_CLIENT_FOR_SOURCE = {"soulseek": "slskd", "usenet": "sabnzbd"}
 
 # 6-hour ceiling on a single download's poll loop (absolute backstop; the
 # minutes-scale stall/queued watchdogs normally resolve a stuck transfer long
@@ -192,6 +190,10 @@ class DownloadOrchestrator:
         usenet_post_processing: int | None = None,
         usenet_min_release_age_minutes: float = 30.0,
         usenet_import_settle_seconds: float = 2.0,
+        torrent_indexer=None,  # IndexerProtocol | None (ProwlarrIndexer)
+        torrent_client=None,  # DownloadClientProtocol | None
+        torrent_scorer=None,  # TorrentReleaseScorer | None
+        torrent_enabled: bool = False,  # indexer and a torrent-capable client enabled
         # Fresh reader of the current download policy: re-check a stored candidate
         # against the live quality range before an automatic re-dispatch (failover /
         # track-repull). None = not wired (tests) -> re-gate skipped.
@@ -205,8 +207,11 @@ class DownloadOrchestrator:
         self._usenet_enabled = (
             usenet_enabled and usenet_indexer is not None and usenet_client is not None
         )
+        self._torrent_enabled = (
+            torrent_enabled and torrent_indexer is not None and torrent_client is not None
+        )
         self._soulseek_enabled = soulseek_enabled
-        self._source_priority = source_priority or ["soulseek", "usenet"]
+        self._source_priority = source_priority or ["soulseek", "usenet", "torrent"]
         self._store = download_store
         self._library = library_manager
         # Coverage completeness (P4): the requested release's expected tracklist,
@@ -240,6 +245,7 @@ class DownloadOrchestrator:
         self._get_download_policy = get_download_policy
         self._wanted_store = wanted_store
         self._usenet_scorer = usenet_scorer  # for the Usenet re-gate tier (Phase 2)
+        self._torrent_scorer = torrent_scorer  # for the torrent re-gate tier
         self._active_tasks: dict[str, asyncio.Task] = {}
 
         # Source strategies (step 4): all per-source behaviour (search, enqueue, import,
@@ -280,6 +286,23 @@ class DownloadOrchestrator:
                 priority=usenet_priority,
                 post_processing=usenet_post_processing,
                 min_release_age_seconds=usenet_min_release_age_minutes * 60.0,
+                library=library_manager,
+            )
+        # Same shape as Usenet: created whenever a torrent-capable client exists so a torrent
+        # task can still IMPORT even if search is disabled; search is gated by
+        # ``_source_enabled`` (the live ``_torrent_enabled`` toggle, which needs Prowlarr).
+        if torrent_client is not None:
+            self._strategies["torrent"] = TorrentStrategy(
+                indexer=torrent_indexer,
+                scorer=torrent_scorer,
+                client=torrent_client,
+                store=download_store,
+                file_processor=file_processor,
+                import_settle_seconds=usenet_import_settle_seconds,
+                staging=self._staging,
+                manifest_codec=manifest_codec,
+                naming_template=naming_template,
+                album_service=album_service,
                 library=library_manager,
             )
 
@@ -341,8 +364,8 @@ class DownloadOrchestrator:
         )
 
         try:
-            if not self._source_enabled("soulseek") and not self._source_enabled(
-                "usenet"
+            if not any(
+                self._source_enabled(s) for s in ("soulseek", "usenet", "torrent")
             ):
                 # Disabled-but-configured slskd shouldn't read as "not configured".
                 if self._client.is_configured():
@@ -384,6 +407,8 @@ class DownloadOrchestrator:
             return self._soulseek_enabled and self._client.is_configured()
         if source == "usenet":
             return self._usenet_enabled
+        if source == "torrent":
+            return self._torrent_enabled
         return False
 
     def _enabled_source_names(self) -> list[str]:
@@ -391,7 +416,11 @@ class DownloadOrchestrator:
         was tried, never a source that's switched off."""
         return [
             name
-            for source, name in (("soulseek", "Soulseek"), ("usenet", "Usenet"))
+            for source, name in (
+                ("soulseek", "Soulseek"),
+                ("usenet", "Usenet"),
+                ("torrent", "torrents"),
+            )
             if self._source_enabled(source)
         ]
 
@@ -474,7 +503,7 @@ class DownloadOrchestrator:
                     source_directory=selected.parent_directory,
                     preflight_score=selected.final_score,
                     source=selected.source,
-                    download_client=_CLIENT_FOR_SOURCE.get(selected.source, "slskd"),
+                    download_client=self.client_name_for_source(selected.source),
                 )
                 return True
 
@@ -524,6 +553,10 @@ class DownloadOrchestrator:
         no SABnzbd client resolved to the slskd client): the Usenet strategy exists iff a
         SABnzbd client exists, so a missing one falls through to Soulseek's client here."""
         return self._strategies.get(source) or self._strategies["soulseek"]
+
+    def client_name_for_source(self, source: str) -> str:
+        """Return the concrete adapter selected for an acquisition source."""
+        return self._strategy(source).client.client_name
 
     def _download_client_for(self, task) -> "DownloadClientProtocol":  # noqa: ANN001
         """The download client that owns this task's source (D2/D3)."""
@@ -851,7 +884,7 @@ class DownloadOrchestrator:
             cand.parent_directory,
             cand.final_score,
             source=cand.source,
-            download_client=_CLIENT_FOR_SOURCE.get(cand.source, "slskd"),
+            download_client=self.client_name_for_source(cand.source),
         )
         task = await self._store.get_task(task.id)
         logger.info("download.track_duration_fallback", extra={"task_id": task.id})
@@ -947,7 +980,7 @@ class DownloadOrchestrator:
                 cand.parent_directory,
                 cand.final_score,
                 source=cand.source,
-                download_client=_CLIENT_FOR_SOURCE.get(cand.source, "slskd"),
+                download_client=self.client_name_for_source(cand.source),
             )
             return await self._store.get_task(task.id)
         return None
@@ -973,6 +1006,10 @@ class DownloadOrchestrator:
             if cand.usenet_release is None or self._usenet_scorer is None:
                 return True  # can't judge -> don't block
             tier = self._usenet_scorer.release_tier(cand.usenet_release, track_count)
+        elif cand.source == "torrent":
+            if cand.torrent_release is None or self._torrent_scorer is None:
+                return True  # can't judge -> don't block
+            tier = self._torrent_scorer.release_tier(cand.torrent_release, track_count)
         else:
             audio = [f for f in cand.files if is_audio(f)]
             if not audio:

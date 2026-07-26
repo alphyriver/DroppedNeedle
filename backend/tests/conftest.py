@@ -17,3 +17,7 @@ def pytest_configure(config):
         "markers",
         "e2e: end-to-end test that may require external services (e.g. a real slskd container)",
     )
+    config.addinivalue_line(
+        "markers",
+        "scale: large generated-data benchmark excluded from the default test suite",
+    )
