@@ -1499,7 +1499,11 @@ async def _get_album_info(c: Ctx) -> Response:
         f"{str(c.request.base_url).rstrip('/')}/subsonic/rest/getCoverArt?id={cover_id}"
     )
     return c.render(
-        "albumInfo" if c.endpoint_name == "getalbuminfo" else "albumInfo2",
+        # Both variants wrap the payload in "albumInfo". getAlbumInfo2 is the
+        # one place Subsonic breaks its own "<endpoint>2 -> <element>2" naming
+        # convention (cf. getArtistInfo2 -> artistInfo2, getAlbumList2 ->
+        # albumList2), so this deliberately does not mirror the endpoint name.
+        "albumInfo",
         m.SAlbumInfo(
             musicBrainzId=(
                 album.musicbrainz_release_group_id
