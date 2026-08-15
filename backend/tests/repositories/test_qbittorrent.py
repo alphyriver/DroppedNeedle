@@ -27,12 +27,12 @@ def _info(**kw) -> QbtTorrentInfo:
     return QbtTorrentInfo(**base)
 
 
-def _client(infos=None):
+def _client(infos=None, mount=Path("/qbittorrent-downloads")):
     api = AsyncMock()
     api.torrents_info.return_value = infos if infos is not None else []
     api.delete_torrents.return_value = True
     return QbittorrentDownloadClient(
-        api, "http://qbt:8080", "api-key", Path("/qbittorrent-downloads")
+        api, "http://qbt:8080", "api-key", Path(mount)
     ), api
 
 
@@ -166,6 +166,49 @@ async def test_inspect_materialization_reports_no_attempt_owned_file_paths():
     assert result.file_paths == []
     assert result.workspace_path == "/qbittorrent-downloads/Album"
     assert result.mount_root == "/qbittorrent-downloads"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "progress"),
+    [
+        ("uploading", 1.0),
+        ("stalledup", 1.0),
+        ("downloading", 0.4),
+        ("stalleddl", 0.0),
+        ("error", 0.4),
+        ("missingfiles", 0.9),
+        ("checkingup", 1.0),
+    ],
+)
+async def test_inspect_materialization_never_reports_file_paths(
+    state, progress, tmp_path
+):
+    """The cleanup journal unlinks every path in ``file_paths``; a seeding
+    torrent's bytes are never the attempt's to remove. Enforced structurally by
+    ``_materialization`` having no such parameter - pinned here across every
+    state so a regression cannot slip in behind one branch.
+
+    The mount is a REAL populated directory: with a non-existent path this test
+    would pass even if the adapter started enumerating the content folder."""
+    mount = tmp_path / "qbittorrent-downloads"
+    album = mount / "Album"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"seeded")
+    client, _ = _client([_info(state=state, progress=progress)], mount=mount)
+    result = await client.inspect_materialization(_HANDLE)
+    assert result.file_paths == []
+    assert result.workspace_path == str(album)
+
+
+def test_materialization_factory_has_no_file_paths_parameter():
+    """Structural guard: the single construction point must not grow a
+    ``file_paths`` argument, or the invariant becomes opt-in again."""
+    import inspect
+
+    client, _ = _client()
+    params = inspect.signature(client._materialization).parameters
+    assert "file_paths" not in params
 
 
 @pytest.mark.asyncio

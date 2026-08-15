@@ -11,11 +11,13 @@ seeding** - seeding is a tracker obligation, not part of the download lifecycle.
 finished downloading is NEVER deleted (it must keep seeding; the import COPIES
 files, see ``TorrentStrategy``); only an incomplete torrent is removed WITH its
 partial data. ``inspect_materialization`` therefore reports no ``file_paths`` -
-a seeding torrent's bytes are not the attempt's to unlink. list_completed_files
-remaps qBittorrent's
-``content_path`` (its namespace) onto the DroppedNeedle downloads mount by
-stripping the ``save_path`` prefix, then enumerates audio files (the folder-based
-import source, D18).
+a seeding torrent's bytes are not the attempt's to unlink, so cleanup has nothing
+to remove. Note the asymmetry with ``list_completed_files``, which DOES return
+those files: the import reads them, cleanup must not delete them.
+
+list_completed_files remaps qBittorrent's ``content_path`` (its namespace) onto
+the DroppedNeedle downloads mount by stripping the ``save_path`` prefix, then
+enumerates audio files (the folder-based import source, D18).
 
 No ``from __future__ import annotations`` (the conformance test compares real
 signatures).
@@ -159,18 +161,12 @@ class QbittorrentDownloadClient:
     ) -> DownloadMaterialization:
         """Resolve current torrent state and the local content path.
 
-        ``file_paths`` is deliberately left EMPTY even for a completed torrent.
-        Those bytes belong to the seeding torrent, not to the attempt, and the
-        cleanup journal unlinks every path reported here. ``workspace_path``
-        still carries the location as evidence."""
+        Every return goes through ``_materialization``, which structurally cannot
+        report ``file_paths`` - see its docstring for why that matters."""
         info = await self._find(handle)
         healthy = await self.downloads_mount_healthy()
         if info is None:
-            return DownloadMaterialization(
-                state="missing",
-                mount_root=str(self._mount),
-                mount_healthy=healthy,
-            )
+            return self._materialization(state="missing", mount_healthy=healthy)
         state = info.state.lower()
         if state in _FAILED_STATES:
             resolved = "failed"
@@ -179,12 +175,11 @@ class QbittorrentDownloadClient:
         else:
             resolved = "active"
         local = self._local_path(info) if info.content_path else None
-        return DownloadMaterialization(
+        return self._materialization(
             state=resolved,
-            remote_storage=info.content_path or "",
-            mount_root=str(self._mount),
-            workspace_path=str(local) if local is not None else "",
             mount_healthy=healthy,
+            remote_storage=info.content_path or "",
+            workspace_path=str(local) if local is not None else "",
         )
 
     async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
@@ -266,6 +261,31 @@ class QbittorrentDownloadClient:
         return await asyncio.to_thread(_ok)
 
     # --- internals --------------------------------------------------------------
+
+    def _materialization(
+        self,
+        *,
+        state: str,
+        mount_healthy: bool,
+        remote_storage: str = "",
+        workspace_path: str = "",
+    ) -> DownloadMaterialization:
+        """The ONLY construction point for this adapter's ``DownloadMaterialization``.
+
+        There is deliberately no ``file_paths`` parameter. The acquisition cleanup
+        journal unlinks every path reported in ``file_paths``, and a seeding
+        torrent's bytes are never the attempt's to remove - the import COPIES them
+        out and the torrent keeps seeding under its category. Leaving the field out
+        of the signature means a caller cannot reintroduce it one return-path at a
+        time; anyone who needs to must change this factory and read this note first.
+        ``workspace_path`` still carries the location as cleanup evidence."""
+        return DownloadMaterialization(
+            state=state,
+            remote_storage=remote_storage,
+            mount_root=str(self._mount),
+            workspace_path=workspace_path,
+            mount_healthy=mount_healthy,
+        )
 
     async def _remove_unless_seeding(self, handle: TaskHandle, *, action: str) -> bool:
         """Shared body of ``abort``/``discard_client_artifacts`` (mirrors slskd's
