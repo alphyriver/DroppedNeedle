@@ -4,7 +4,10 @@ import { render } from 'vitest-browser-svelte';
 import type { LibraryActivityItem, ScanRun } from '$lib/queries/library/LibraryOperationsTypes';
 
 const h = vi.hoisted(() => ({
-	activity: { data: { items: [] }, isLoading: false, isError: false } as Record<string, unknown>,
+	activity: { data: { items: [], work_items: [] }, isLoading: false, isError: false } as Record<
+		string,
+		unknown
+	>,
 	runs: { data: { active: null, queued: null }, isLoading: false, isError: false } as Record<
 		string,
 		unknown
@@ -24,6 +27,15 @@ const h = vi.hoisted(() => ({
 		isLoading: false
 	} as Record<string, unknown>,
 	reviews: { data: { pages: [{ filtered_total: 12 }] } } as Record<string, unknown>,
+	artistReconciliation: {
+		data: {
+			automatically_resolved_count: 14,
+			waiting_for_identity_count: 49,
+			genuine_review_count: 3
+		},
+		isLoading: false,
+		isError: false
+	} as Record<string, unknown>,
 	history: {
 		data: { pages: [{ items: [], next_cursor: null }] },
 		isLoading: false,
@@ -110,6 +122,9 @@ vi.mock('$lib/queries/library/LibraryPolicyQueries.svelte', () => ({
 vi.mock('$lib/queries/library/LibraryReviewQueries.svelte', () => ({
 	getLibraryReviewsQuery: () => h.reviews
 }));
+vi.mock('$lib/queries/artist-reconciliation/ArtistReconciliationQueries.svelte', () => ({
+	getArtistReconciliationProgressQuery: () => h.artistReconciliation
+}));
 vi.mock('$lib/queries/library/LibraryReviewMutations.svelte', () => ({
 	previewBulkLibraryReview: () => ({
 		mutateAsync: h.bulkPreview,
@@ -146,6 +161,16 @@ vi.mock('$lib/queries/library/LibraryRepairMutations.svelte', () => ({
 	createLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	applyLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
+vi.mock('./LibraryManagementControlRoom.svelte', () => {
+	const Comp = function () {};
+	Comp.prototype = {};
+	return { default: Comp };
+});
+vi.mock('./LibraryManagementActionDesk.svelte', () => {
+	const Comp = function () {};
+	Comp.prototype = {};
+	return { default: Comp };
+});
 
 import LibraryOperationsPanel from './LibraryOperationsPanel.svelte';
 
@@ -220,6 +245,24 @@ beforeEach(() => {
 });
 
 describe('LibraryOperationsPanel', () => {
+	it('starts detailed controls expanded and keeps them collapsible', async () => {
+		render(LibraryOperationsPanel);
+		const scanDetails = page
+			.getByRole('region', { name: 'Library Scanning & Identification' })
+			.element() as HTMLDetailsElement;
+		const managementDetails = page
+			.getByRole('region', { name: 'Management details' })
+			.element() as HTMLDetailsElement;
+		expect(scanDetails.open).toBe(true);
+		expect(managementDetails.open).toBe(true);
+
+		const scanSummary = page.getByText('Scan details', { exact: true });
+		await scanSummary.click();
+		expect(scanDetails.open).toBe(false);
+		await scanSummary.click();
+		expect(scanDetails.open).toBe(true);
+	});
+
 	it('shows separate stacked workload cards and truthful metrics', async () => {
 		h.activity = {
 			data: { items: [activity('scan'), activity('identification')] },
@@ -246,13 +289,19 @@ describe('LibraryOperationsPanel', () => {
 			}
 		};
 		render(LibraryOperationsPanel);
+		await expect
+			.element(page.getByRole('region', { name: 'Library Scanning & Identification' }))
+			.toBeVisible();
 		await expect.element(page.getByRole('heading', { name: 'Local files' })).toBeVisible();
-		await expect.element(page.getByRole('heading', { name: 'Identification' })).toBeVisible();
+		await expect
+			.element(page.getByRole('heading', { name: 'Identification', exact: true }))
+			.toBeVisible();
 		await expect.element(page.getByText('40 of 100')).toBeVisible();
 		await expect.element(page.getByText('25 of 100')).toBeVisible();
 		await page.getByText('Root progress and phase details').click();
 		await expect.element(page.getByText('Main library · automatic')).toBeVisible();
 		await expect.element(page.getByText('12', { exact: true })).toBeVisible();
+		await expect.element(page.getByText(/It never writes tags, renames, or moves/)).toBeVisible();
 	});
 
 	it('shows identification as idle while foreground repair keeps the panel expanded', async () => {

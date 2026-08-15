@@ -150,6 +150,7 @@
 							mbid={featured.album.mbid || ''}
 							alt={featured.album.name}
 							size="full"
+							requestSize={250}
 							lazy={false}
 							rounded="none"
 							className="block aspect-square w-full object-cover"
@@ -283,6 +284,7 @@
 									mbid={pick.album.mbid || ''}
 									alt={pick.album.name}
 									size="full"
+									requestSize={250}
 									lazy={true}
 									rounded="none"
 									className="block aspect-square w-full object-cover"

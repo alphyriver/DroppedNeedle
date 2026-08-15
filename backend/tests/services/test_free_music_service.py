@@ -467,14 +467,21 @@ async def test_retry_reruns_a_failed_task(tmp_path):
         release_group_mbid="rg",
         artist_name="Brad Sucks",
         album_title="Guess Who's a Mess",
+        track_count=10,
     )
     await _settle(service, store, task_id)
 
     archive.search_audio = AsyncMock(return_value=[_item()])
+    archive.get_item_files = AsyncMock(
+        return_value=(CC, _files("FLAC", 2, size=5000) + _files("VBR MP3", 10))
+    )
     await service.retry(task_id, user_id="u1", is_admin=False)
     task = await _settle(service, store, task_id)
 
     assert task.status == FreeMusicStatus.COMPLETED
+    assert task.track_count == 10
+    assert task.format == "mp3"
+    assert task.files_total == 10
     drop_import.create_job.assert_awaited_once()
 
 

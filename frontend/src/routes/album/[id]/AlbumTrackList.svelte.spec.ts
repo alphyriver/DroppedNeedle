@@ -68,6 +68,8 @@ function heldFor(recording_mbid: string): HeldImport {
 	return {
 		id: 1,
 		release_group_mbid: 'rg-1',
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid,
 		track_number: 3,
 		disc_number: 1,
@@ -79,12 +81,15 @@ function heldFor(recording_mbid: string): HeldImport {
 		file_format: 'flac',
 		duration_seconds: 100,
 		reason: 'fingerprint_mismatch',
+		reason_detail: null,
 		source: 'usenet',
 		source_task_id: 't',
 		created_at: 0,
 		evidence_title: 'Other Song',
 		evidence_artist: 'Other Artist',
-		evidence_score: 0.9
+		evidence_score: 0.9,
+		management_retry_count: 0,
+		management_next_retry_at: null
 	};
 }
 

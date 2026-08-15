@@ -45,17 +45,68 @@ describe('createDownloadStream', () => {
 			bytes_total: 10,
 			files_completed: 1,
 			files_total: 2,
-			progress_percent: 50
+			progress_percent: 50,
+			candidate_index: 1,
+			source: 'soulseek',
+			quality_format: 'flac',
+			quality_bit_depth: 16,
+			quality_sample_rate: 44100,
+			advertised_queue_depth: 0,
+			queue_position_start: 91,
+			queue_position_end: 100,
+			remote_queued: true,
+			preferred_quality_fallback_at: 1234.5,
+			attempt_number: 1,
+			attempt_total: 3,
+			has_next_source: true
 		});
 		expect(s.state.progress?.progress_percent).toBe(50);
 		expect(s.state.progress?.bytes_total).toBe(10);
+		expect(s.state.source).toEqual({
+			candidate_index: 1,
+			source: 'soulseek',
+			quality_format: 'flac',
+			quality_bit_depth: 16,
+			quality_sample_rate: 44100,
+			advertised_queue_depth: 0,
+			queue_position_start: 91,
+			queue_position_end: 100,
+			remote_queued: true,
+			preferred_quality_fallback_at: 1234.5,
+			attempt_number: 1,
+			attempt_total: 3,
+			has_next_source: true
+		});
 	});
 
 	it('captures status events', () => {
 		const s = createDownloadStream();
 		s.start('t1');
-		FakeEventSource.instances[0].emit('status', { status: 'downloading' });
-		expect(s.state.status).toBe('downloading');
+		FakeEventSource.instances[0].emit('progress', {
+			queue_position_start: 91,
+			queue_position_end: 100
+		});
+		FakeEventSource.instances[0].emit('status', {
+			status: 'retrying',
+			candidate_index: 1,
+			source: 'soulseek',
+			quality_format: 'flac',
+			quality_bit_depth: 16,
+			quality_sample_rate: 44100,
+			advertised_queue_depth: 0,
+			queue_position_start: null,
+			queue_position_end: null,
+			remote_queued: false,
+			attempt: 2,
+			attempt_total: 3,
+			has_next_source: true
+		});
+		expect(s.state.status).toBe('retrying');
+		expect(s.state.source?.attempt_number).toBe(2);
+		expect(s.state.source?.quality_bit_depth).toBe(16);
+		expect(s.state.source?.candidate_index).toBe(1);
+		expect(s.state.source?.queue_position_start).toBeNull();
+		expect(s.state.source?.remote_queued).toBe(false);
 	});
 
 	it('marks done and closes the stream on the complete event', () => {

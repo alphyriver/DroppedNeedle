@@ -1,5 +1,6 @@
 """QbittorrentDownloadClient: state mapping, enqueue correlation-by-tag, the
-private-tracker cancel rule (never delete a completed torrent), and path remap."""
+private-tracker rule (never delete a completed torrent), the abort/inspect/discard
+cleanup contract, and path remap."""
 
 from pathlib import Path
 import httpx
@@ -96,20 +97,83 @@ async def test_enqueue_without_link_raises():
         await client.enqueue(EnqueueRequest(task_id="t1", source="torrent"))
 
 
-# --- cancel: the private-tracker rule ----------------------------------------------
+# --- abort / discard: the private-tracker rule -------------------------------------
+
+_HANDLE = TaskHandle(source="torrent", torrent_hash="abc123")
+
 
 @pytest.mark.asyncio
-async def test_cancel_completed_torrent_never_deletes():
+async def test_abort_completed_torrent_never_deletes():
     client, api = _client([_info(state="uploading", progress=1.0)])
-    assert await client.cancel(TaskHandle(source="torrent", torrent_hash="abc123")) is True
+    assert await client.abort(_HANDLE) is True
     api.delete_torrents.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_cancel_incomplete_torrent_deletes_with_files():
+async def test_abort_incomplete_torrent_deletes_with_files():
     client, api = _client([_info(state="downloading", progress=0.4)])
-    assert await client.cancel(TaskHandle(source="torrent", torrent_hash="abc123")) is True
+    assert await client.abort(_HANDLE) is True
     api.delete_torrents.assert_awaited_once_with("abc123", delete_files=True)
+
+
+@pytest.mark.asyncio
+async def test_abort_missing_torrent_succeeds_so_cleanup_does_not_wedge():
+    """Nothing left to stop is success; False would spin the cleanup journal."""
+    client, api = _client([])
+    assert await client.abort(_HANDLE) is True
+    api.delete_torrents.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discard_retains_completed_torrent_for_seeding():
+    """The qBittorrent "record" IS the seeding session, so it is kept on purpose."""
+    client, api = _client([_info(state="uploading", progress=1.0)])
+    assert await client.discard_client_artifacts(_HANDLE) is True
+    api.delete_torrents.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discard_removes_incomplete_torrent_with_its_data():
+    client, api = _client([_info(state="downloading", progress=0.4)])
+    assert await client.discard_client_artifacts(_HANDLE) is True
+    api.delete_torrents.assert_awaited_once_with("abc123", delete_files=True)
+
+
+# --- materialization ---------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "progress", "expected"),
+    [
+        ("uploading", 1.0, "completed"),
+        ("downloading", 0.4, "active"),
+        ("error", 0.4, "failed"),
+    ],
+)
+async def test_inspect_materialization_maps_state(state, progress, expected):
+    client, _ = _client([_info(state=state, progress=progress)])
+    result = await client.inspect_materialization(_HANDLE)
+    assert result.state == expected
+
+
+@pytest.mark.asyncio
+async def test_inspect_materialization_reports_no_attempt_owned_file_paths():
+    """A seeding torrent's bytes are not the attempt's to unlink: the cleanup
+    journal removes every path reported in ``file_paths``, so it stays empty and
+    the location travels as ``workspace_path`` evidence instead."""
+    client, _ = _client([_info(state="uploading", progress=1.0)])
+    result = await client.inspect_materialization(_HANDLE)
+    assert result.file_paths == []
+    assert result.workspace_path == "/qbittorrent-downloads/Album"
+    assert result.mount_root == "/qbittorrent-downloads"
+
+
+@pytest.mark.asyncio
+async def test_inspect_materialization_missing_torrent():
+    client, _ = _client([])
+    result = await client.inspect_materialization(_HANDLE)
+    assert result.state == "missing"
+    assert result.file_paths == []
 
 
 # --- path remap --------------------------------------------------------------------

@@ -125,6 +125,7 @@ def test_catalog_cache_prefixes_cover_every_target_projection() -> None:
         "local_files_",
         "artist_info:",
         "album_info:",
+        "album_tracks_info:",
         "artist_discovery:",
         "discover_queue_enrich:",
         "source_resolution",

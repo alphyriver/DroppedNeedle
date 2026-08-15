@@ -280,9 +280,9 @@ async def test_only_lossless_range_drops_mp3():
 
 
 @pytest.mark.asyncio
-async def test_match_band_precedes_quality_tier():
-    # A weak FLAC must not hide a materially better MP3 match. Quality remains the
-    # preference only after candidates are in the same safe identity band.
+async def test_quality_precedes_score_within_same_safe_acceptance_tier():
+    # Both candidates pass the same automatic safety boundary, so the user's
+    # quality-first policy chooses lossless before using match score as a tie-breaker.
     mp3 = [
         _mk(_PARENT, f"OK Computer {n:02d}.mp3", ext="mp3", bitrate=320)
         for n in range(1, 13)
@@ -293,7 +293,8 @@ async def test_match_band_precedes_quality_tier():
     ]
     scorer = AlbumPreflightScorer(_store())
     candidates = await scorer.rank(_TARGET, mp3 + flac)
-    assert candidates[0].username == "alice"
+    assert {candidate.tier for candidate in candidates[:2]} == {"auto"}
+    assert candidates[0].username == "bob"
 
 
 @pytest.mark.asyncio
@@ -464,6 +465,75 @@ async def test_hires_folder_outranks_redbook_within_lossless():
         candidates[0].username == "bob"
     )  # the 24/96 folder ranks first within lossless
     assert candidates[0].files[0].bit_depth == 24
+
+
+@pytest.mark.asyncio
+async def test_queued_24_48_outranks_free_16_44_within_lossless():
+    redbook = [
+        _mk(
+            _PARENT,
+            f"OK Computer {n:02d}.flac",
+            username="free-redbook",
+            free=True,
+            queue_length=0,
+            speed=20_000_000,
+        )
+        for n in range(1, 13)
+    ]
+    hires = [
+        DownloadSearchResult(
+            username="queued-hires",
+            filename=f"{_PARENT}/OK Computer {n:02d}.flac",
+            parent_directory=_PARENT,
+            size=80_000_000,
+            extension="flac",
+            bitrate=900,
+            bit_depth=24,
+            sample_rate=48_000,
+            duration=240.0,
+            has_free_slot=False,
+            upload_speed=500_000,
+            queue_length=2710,
+        )
+        for n in range(1, 13)
+    ]
+
+    candidates = await AlbumPreflightScorer(_store()).rank(_TARGET, redbook + hires)
+
+    assert [candidate.username for candidate in candidates[:2]] == [
+        "queued-hires",
+        "free-redbook",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_complete_album_availability_uses_the_slowest_file():
+    ready = [
+        _mk(
+            _PARENT,
+            f"OK Computer {n:02d}.flac",
+            username="ready",
+            speed=1_000_000,
+            free=True,
+            queue_length=0,
+        )
+        for n in range(1, 13)
+    ]
+    mixed = [
+        _mk(
+            _PARENT,
+            f"OK Computer {n:02d}.flac",
+            username="mixed",
+            speed=20_000_000,
+            free=n != 12,
+            queue_length=100 if n == 12 else 0,
+        )
+        for n in range(1, 13)
+    ]
+
+    candidates = await AlbumPreflightScorer(_store()).rank(_TARGET, mixed + ready)
+
+    assert [candidate.username for candidate in candidates[:2]] == ["ready", "mixed"]
 
 
 def test_cjk_not_mangled():

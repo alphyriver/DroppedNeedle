@@ -140,9 +140,9 @@ class MusicBrainzMatcher:
         return album
 
     async def _album_text_match(self, target: TargetAlbum) -> MatchResult:
-        query = f"{target.artist} {target.album}".strip()
-        results = await self._mb_repo.search_albums(
-            query,
+        results = await self._mb_repo.search_release_groups(
+            target.artist,
+            target.album,
             limit=10,
             include_all_types=True,
             priority=RequestPriority.BACKGROUND_SYNC,

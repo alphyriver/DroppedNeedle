@@ -1,5 +1,7 @@
 """Centralized cache key generation for consistent, sorted, testable cache keys."""
 
+import hashlib
+
 from typing import Optional
 
 
@@ -19,10 +21,15 @@ MB_RG_BY_TAG_PREFIX = "mb_rg_by_tag:"
 MB_URL_RESOLUTION_PREFIX = "mb:url:resolution:"
 MB_RELEASE_VERIFY_PREFIX = "mb:release:verify:"
 MB_DUPLICATE_SEARCH_PREFIX = "mb:release:duplicate-search:"
+MB_RELEASE_EDITION_SEARCH_PREFIX = "mb:release:edition-search:"
+MB_MANAGEMENT_RELEASE_PREFIX = "mb:management:release:"
+CAA_MANAGEMENT_PREFIX = "caa:management:"
 
 LB_PREFIX = "lb_"
 
 LFM_PREFIX = "lfm_"
+
+LRCLIB_PREFIX = "lrclib:"
 
 JELLYFIN_PREFIX = "jellyfin_"
 
@@ -60,6 +67,7 @@ SOURCE_RESOLUTION_PREFIX = "source_resolution"
 
 ARTIST_INFO_PREFIX = "artist_info:"
 ALBUM_INFO_PREFIX = "album_info:"
+ALBUM_TRACKS_INFO_PREFIX = "album_tracks_info:"
 
 ARTIST_DISCOVERY_PREFIX = "artist_discovery:"
 DISCOVER_QUEUE_ENRICH_PREFIX = "discover_queue_enrich:"
@@ -78,8 +86,8 @@ AUDIODB_PREFIX = "audiodb_"
 DISCOGS_RELEASE_PREFIX = "discogs:release:"
 DISCOGS_SEARCH_PREFIX = "discogs:search:"
 
-GETIT_OPTIONS_PREFIX = "getit:options:"
-GETIT_ARTIST_OPTIONS_PREFIX = "getit:artist_options:"
+GETIT_OPTIONS_PREFIX = "getit:v2:options:"
+GETIT_ARTIST_OPTIONS_PREFIX = "getit:v2:artist_options:"
 
 
 def library_policy_prefixes() -> list[str]:
@@ -110,6 +118,7 @@ def library_identification_prefixes() -> list[str]:
         LOCAL_FILES_PREFIX,
         ARTIST_INFO_PREFIX,
         ALBUM_INFO_PREFIX,
+        ALBUM_TRACKS_INFO_PREFIX,
         ARTIST_DISCOVERY_PREFIX,
         DISCOVER_QUEUE_ENRICH_PREFIX,
         SOURCE_RESOLUTION_PREFIX,
@@ -121,12 +130,12 @@ def getit_prefixes() -> list[str]:
     return [GETIT_OPTIONS_PREFIX, GETIT_ARTIST_OPTIONS_PREFIX]
 
 
-def getit_options_key(release_group_mbid: str, region: str, decorated: bool) -> str:
-    return f"{GETIT_OPTIONS_PREFIX}{release_group_mbid}:{region}:{int(decorated)}"
+def getit_options_key(release_group_mbid: str, region: str) -> str:
+    return f"{GETIT_OPTIONS_PREFIX}{release_group_mbid}:{region}"
 
 
-def getit_artist_options_key(artist_mbid: str, decorated: bool) -> str:
-    return f"{GETIT_ARTIST_OPTIONS_PREFIX}{artist_mbid}:{int(decorated)}"
+def getit_artist_options_key(artist_mbid: str) -> str:
+    return f"{GETIT_ARTIST_OPTIONS_PREFIX}{artist_mbid}"
 
 
 def musicbrainz_prefixes() -> list[str]:
@@ -148,11 +157,40 @@ def musicbrainz_prefixes() -> list[str]:
         MB_URL_RESOLUTION_PREFIX,
         MB_RELEASE_VERIFY_PREFIX,
         MB_DUPLICATE_SEARCH_PREFIX,
+        MB_RELEASE_EDITION_SEARCH_PREFIX,
+        MB_MANAGEMENT_RELEASE_PREFIX,
+        ALBUM_TRACKS_INFO_PREFIX,
     ]
+
+
+def mb_release_edition_search_key(
+    title: str, artist: str, limit: int, offset: int
+) -> str:
+    normalized = "\x00".join(
+        " ".join(value.casefold().split()) for value in (title, artist)
+    )
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"{MB_RELEASE_EDITION_SEARCH_PREFIX}{digest}:{limit}:{offset}"
+
+
+def mb_recording_canonical_id_key(recording_mbid: str) -> str:
+    return f"{MB_RECORDING_PREFIX}{recording_mbid.casefold()}:canonical-id"
 
 
 def listenbrainz_prefixes() -> list[str]:
     return [LB_PREFIX]
+
+
+def listenbrainz_management_genres_key(release_group_mbid: str) -> str:
+    return f"{LB_PREFIX}management:release-group-genres:{release_group_mbid}"
+
+
+def coverart_prefixes() -> list[str]:
+    return [CAA_MANAGEMENT_PREFIX]
+
+
+def coverart_management_key(entity_kind: str, mbid: str, download_size: str) -> str:
+    return f"{CAA_MANAGEMENT_PREFIX}{entity_kind}:{mbid}:{download_size}"
 
 
 def discogs_prefixes() -> list[str]:
@@ -170,6 +208,40 @@ def discogs_search_key(query: str, limit: int) -> str:
 
 def lastfm_prefixes() -> list[str]:
     return [LFM_PREFIX]
+
+
+def _lastfm_management_key(kind: str, *values: str) -> str:
+    normalized = "\x00".join(" ".join(value.casefold().split()) for value in values)
+    digest = hashlib.sha256(normalized.encode()).hexdigest()
+    return f"{LFM_PREFIX}management:{kind}:{digest}"
+
+
+def lastfm_management_album_genres_key(artist_name: str, album_title: str) -> str:
+    return _lastfm_management_key("album-genres", artist_name, album_title)
+
+
+def lastfm_management_artist_genres_key(artist_name: str) -> str:
+    return _lastfm_management_key("artist-genres", artist_name)
+
+
+def lrclib_exact_lyrics_key(
+    track_name: str,
+    artist_name: str,
+    album_name: str,
+    duration_seconds: int,
+) -> str:
+    normalized = "\x00".join(
+        " ".join(value.casefold().split())
+        for value in (track_name, artist_name, album_name)
+    )
+    digest = hashlib.sha256(
+        f"{normalized}\x00{duration_seconds}".encode("utf-8")
+    ).hexdigest()
+    return f"{LRCLIB_PREFIX}exact:{digest}"
+
+
+def lrclib_prefixes() -> list[str]:
+    return [LRCLIB_PREFIX]
 
 
 def home_prefixes() -> list[str]:
@@ -224,6 +296,21 @@ def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str
 def mb_release_key(release_id: str, includes: Optional[list[str]] = None) -> str:
     includes_str = ",".join(sorted(includes)) if includes else "default"
     return f"{MB_RELEASE_DETAIL_PREFIX}{release_id}:{includes_str}"
+
+
+def mb_management_release_key(
+    release_id: str,
+    includes: tuple[str, ...],
+    preferred_locales: tuple[str, ...],
+    artist_standardization: str,
+) -> str:
+    includes_part = ",".join(sorted(set(includes)))
+    locales_part = ",".join(locale.strip().casefold() for locale in preferred_locales)
+    standardization_part = artist_standardization.strip().casefold()
+    return (
+        f"{MB_MANAGEMENT_RELEASE_PREFIX}{release_id}:"
+        f"inc={includes_part}:locales={locales_part}:artists={standardization_part}"
+    )
 
 
 def library_albums_key(include_unmonitored: bool = False) -> str:

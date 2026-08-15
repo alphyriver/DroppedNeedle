@@ -2,7 +2,13 @@ import { page } from '@vitest/browser/context';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
-import type { AlbumBasicInfo, AlbumEditionsResponse, AlbumTracksInfo } from '$lib/types';
+import type {
+	AlbumBasicInfo,
+	AlbumEditionsResponse,
+	AlbumTracksInfo,
+	LibraryAlbumDetail,
+	LibraryAlbumSummary
+} from '$lib/types';
 
 const h = vi.hoisted(() => ({
 	editions: undefined as AlbumEditionsResponse | undefined,
@@ -24,6 +30,95 @@ vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 
 vi.mock('$lib/queries/library/LibraryMutations.svelte', () => ({
 	rescanAlbum: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
+
+const localAlbum: LibraryAlbumDetail = {
+	id: 'local-album-1',
+	title: 'Avalon',
+	artist_name: 'Anthony Green',
+	artist_id: 'local-artist-1',
+	musicbrainz_release_group_id: '4b6276da-e7c7-36df-8771-34b92f774d3b',
+	musicbrainz_release_id: '0687c8a5-40a2-4a0c-bdc9-c1d80d94bef5',
+	musicbrainz_artist_id: 'eba4c290-2ce6-42c9-affd-5b1ffab84a8f',
+	album_identity_state: 'release_linked',
+	track_count: 20,
+	total_duration_seconds: 3900,
+	total_size_bytes: 1,
+	format: 'flac',
+	year: 2008,
+	is_compilation: false,
+	cover_available: true,
+	date_added: 1,
+	sort_name: null,
+	original_release_date: '2008-08-04',
+	contribution_id: null,
+	contribution_state: null,
+	row_revision: 4,
+	input_revision: 'input-4',
+	identification_status: 'identified',
+	review_id: null,
+	review_revision: null,
+	management_identity_readiness: 'ready',
+	mapped_track_count: 20,
+	management_identity_kind: 'exact_release',
+	custom_manifest_id: null,
+	custom_manifest_version: null,
+	custom_manifest_track_count: 0,
+	custom_manifest_recognized_track_count: 0,
+	custom_manifest_stale: false,
+	management_excluded: false,
+	management_exclusion_revision: null,
+	management_excluded_at: null,
+	active_edition_conversion: null
+};
+
+vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
+	getLibraryAlbumDetailQuery: () => ({
+		data: localAlbum,
+		isLoading: false,
+		isError: false
+	})
+}));
+
+vi.mock('$lib/queries/library/LibraryOperationQueries.svelte', () => ({
+	getLibraryOperationQuery: () => ({ data: undefined, isError: false })
+}));
+
+vi.mock('$lib/queries/library/LibraryEditionQueries.svelte', () => ({
+	getReleaseEditionSearchQuery: () => ({
+		data: undefined,
+		isLoading: false,
+		isFetching: false,
+		isError: false,
+		refetch: vi.fn()
+	})
+}));
+
+vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
+	reidentifyLibraryAlbum: () => ({ mutateAsync: vi.fn(), isPending: false, isError: false }),
+	reenableAlbumManagement: () => ({ mutateAsync: vi.fn(), isPending: false, isError: false }),
+	selectReidentificationCandidate: () => ({
+		mutateAsync: vi.fn(),
+		isPending: false,
+		isError: false
+	})
+}));
+
+vi.mock('$lib/queries/library/EditionConversionQueries.svelte', () => {
+	const mutation = () => ({ mutateAsync: vi.fn(), isPending: false, reset: vi.fn() });
+	return {
+		getEditionConversionQuery: () => ({ data: undefined, refetch: vi.fn() }),
+		createEditionConversionPreflight: mutation,
+		createEditionConversionPreview: mutation,
+		startEditionConversion: mutation,
+		retryEditionConversion: mutation,
+		recheckEditionConversion: mutation,
+		cancelEditionConversion: mutation
+	};
+});
+
+vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
+	controlLibraryOperation: () => ({ mutateAsync: vi.fn() })
 }));
 
 vi.mock('$lib/queries/downloads/UpgradeQueries.svelte', () => ({
@@ -73,15 +168,19 @@ const tracksInfo: AlbumTracksInfo = {
 function renderHeader({
 	onrefresh = vi.fn(),
 	libraryTrackCount = 20,
-	libraryBelowCutoff = false
+	libraryBelowCutoff = false,
+	localCopies = [],
+	trackData = tracksInfo
 }: {
 	onrefresh?: () => void;
 	libraryTrackCount?: number;
 	libraryBelowCutoff?: boolean;
+	localCopies?: LibraryAlbumSummary[];
+	trackData?: AlbumTracksInfo;
 } = {}) {
 	render(AlbumHeader, {
 		album,
-		tracksInfo,
+		tracksInfo: trackData,
 		loadingTracks: false,
 		inLibrary: true,
 		isRequested: false,
@@ -92,6 +191,7 @@ function renderHeader({
 		libraryInLibrary: true,
 		libraryTrackCount,
 		libraryBelowCutoff,
+		localCopies,
 		mbTrackCount: 20,
 		releaseGroupMbid: album.musicbrainz_id,
 		onrequest: vi.fn(),
@@ -170,6 +270,24 @@ describe('AlbumHeader automatic edition selection', () => {
 		});
 	});
 
+	it('uses edition resolution when native tracks have no stored release identity', async () => {
+		const editions = h.editions;
+		expect(editions).toBeDefined();
+		if (!editions) throw new Error('Expected edition data');
+		h.editions = { ...editions, selected_release_mbid: 'release-20' };
+		renderHeader({
+			trackData: { ...tracksInfo, selected_release_mbid: null }
+		});
+
+		await expect
+			.element(
+				page.getByRole('button', {
+					name: 'Edition: Automatic · 2008 · US · 20 tracks'
+				})
+			)
+			.toBeVisible();
+	});
+
 	it('offers to complete a partial edition', async () => {
 		renderHeader({ libraryTrackCount: 11 });
 
@@ -183,5 +301,15 @@ describe('AlbumHeader automatic edition selection', () => {
 		renderHeader({ libraryBelowCutoff: true });
 
 		await expect.element(page.getByRole('button', { name: 'Upgrade this edition' })).toBeVisible();
+	});
+
+	it('exposes local re-identification beside the canonical release controls', async () => {
+		renderHeader({ localCopies: [localAlbum] });
+
+		const trigger = page.getByRole('button', { name: 'Re-identify…' });
+		await expect.element(trigger).toBeVisible();
+		await trigger.click();
+		await expect.element(page.getByRole('heading', { name: 'Identify Avalon' })).toBeVisible();
+		await expect.element(page.getByText('This screen never writes music files.')).toBeVisible();
 	});
 });

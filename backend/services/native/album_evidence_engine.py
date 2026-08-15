@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from difflib import SequenceMatcher
 
 from models.identification import (
@@ -16,7 +17,7 @@ from models.identification import (
 )
 from services.native.local_album_grouper import _hungarian_min
 
-MATCHER_VERSION = "feedback-fixes-v1"
+MATCHER_VERSION = "feedback-fixes-v2"
 PAIR_COST_CEILING = 0.40
 ALBUM_DISTANCE_CEILING = 0.35
 CANDIDATE_MARGIN_FLOOR = 0.05
@@ -28,7 +29,6 @@ DURATION_HARD_LIMIT_SECONDS = 30.0
 MAX_CANDIDATES = 10
 
 _NON_WORD = re.compile(r"[^\w]+", re.UNICODE)
-_UNSAFE_SECONDARY_TYPES = frozenset({"compilation", "live"})
 
 
 def _fold(value: str) -> str:
@@ -63,12 +63,47 @@ class _Pair:
         self.kinds = kinds
 
 
-def _pair(local: GroupingTrack, candidate: CandidateTrack) -> _Pair:
+def _pair(
+    local: GroupingTrack,
+    candidate: CandidateTrack,
+    *,
+    recording_occurrences: int = 1,
+    recording_position_occurrences: int = 1,
+) -> _Pair:
+    identity_kinds: list[str] = []
+    if local.release_track_mbid and candidate.release_track_mbid:
+        if local.release_track_mbid != candidate.release_track_mbid:
+            return _Pair(2.0, True, ["release_track_mbid_conflict"])
+        identity_kinds.append("release_track_mbid")
     if local.recording_mbid and candidate.recording_mbid:
-        if local.recording_mbid == candidate.recording_mbid:
-            return _Pair(0.0, False, ["recording_mbid"])
-        return _Pair(2.0, True, ["recording_mbid_conflict"])
+        if local.recording_mbid != candidate.recording_mbid:
+            return _Pair(2.0, True, ["recording_mbid_conflict"])
+        identity_kinds.append("recording_mbid")
+    if identity_kinds:
+        if (
+            "recording_mbid" in identity_kinds
+            and "release_track_mbid" not in identity_kinds
+            and recording_occurrences > 1
+        ):
+            position_matches = (
+                local.track_number > 0
+                and local.disc_number == candidate.disc_number
+                and local.track_number
+                in {candidate.position, candidate.absolute_position}
+                and recording_position_occurrences == 1
+            )
+            if not position_matches:
+                return _Pair(0.75, False, ["ambiguous_release_track_identity"])
+            identity_kinds.append("compatible_position")
+        return _Pair(0.0, False, identity_kinds)
 
+    return _descriptive_pair(local, candidate)
+
+
+def _descriptive_pair(
+    local: GroupingTrack,
+    candidate: CandidateTrack,
+) -> _Pair:
     title_cost = _distance(local.title, candidate.title) if local.title else 1.0
     duration_difference = _duration_difference(local, candidate)
     if (
@@ -123,6 +158,96 @@ def _album_metadata_class(local: str, candidate: str) -> str:
 class AlbumEvidenceEngine:
     """Assign tracks once, persist the result, and let every consumer reuse it."""
 
+    def complete_administrator_exact_release_mapping(
+        self,
+        local_tracks: list[GroupingTrack],
+        candidate: AlbumCandidate,
+        evidence: CandidateEvidence,
+    ) -> bool:
+        """Fill a manual exact-release map only from complete position and duration proof."""
+
+        if not local_tracks or len(local_tracks) != len(candidate.tracks):
+            return False
+        local_by_position: dict[tuple[int, int], GroupingTrack] = {}
+        for track in local_tracks:
+            key = (track.disc_number, track.track_number)
+            if (
+                track.disc_number < 1
+                or track.track_number < 1
+                or key in local_by_position
+            ):
+                return False
+            local_by_position[key] = track
+        candidate_by_position: dict[tuple[int, int], CandidateTrack] = {}
+        for track in candidate.tracks:
+            key = (track.disc_number, track.position)
+            if (
+                track.disc_number < 1
+                or track.position < 1
+                or key in candidate_by_position
+                or not track.recording_mbid
+                or not track.release_track_mbid
+            ):
+                return False
+            candidate_by_position[key] = track
+        evidence_kind = "administrator_exact_release_position_duration"
+        matched_tracks: list[tuple[GroupingTrack, CandidateTrack]]
+        if set(local_by_position) == set(candidate_by_position):
+            matched_tracks = [
+                (local, candidate_by_position[position])
+                for position, local in local_by_position.items()
+            ]
+        else:
+            local_by_absolute_position = {
+                track.track_number: track for track in local_tracks
+            }
+            candidate_by_absolute_position = {
+                track.absolute_position: track for track in candidate.tracks
+            }
+            expected_positions = set(range(1, len(local_tracks) + 1))
+            if (
+                any(track.disc_number != 1 for track in local_tracks)
+                or set(local_by_absolute_position) != expected_positions
+                or set(candidate_by_absolute_position) != expected_positions
+            ):
+                return False
+            evidence_kind = "administrator_exact_release_absolute_position_duration"
+            matched_tracks = [
+                (
+                    local_by_absolute_position[position],
+                    candidate_by_absolute_position[position],
+                )
+                for position in sorted(expected_positions)
+            ]
+        evidence_by_id = {item.local_track_id: item for item in evidence.track_evidence}
+        if set(evidence_by_id) != {track.local_track_id for track in local_tracks}:
+            return False
+        for local, provider_track in matched_tracks:
+            if (
+                local.duration_seconds is None
+                or provider_track.duration_seconds is None
+                or abs(local.duration_seconds - provider_track.duration_seconds)
+                > DURATION_GRACE_SECONDS
+            ):
+                return False
+        for local, provider_track in matched_tracks:
+            item = evidence_by_id[local.local_track_id]
+            item.evidence_kinds = list(
+                dict.fromkeys(
+                    [
+                        *item.evidence_kinds,
+                        evidence_kind,
+                    ]
+                )
+            )
+            item.candidate_track_title = provider_track.title
+            item.candidate_disc_number = provider_track.disc_number
+            item.candidate_track_position = provider_track.position
+            item.recording_mbid = provider_track.recording_mbid
+            item.release_track_mbid = provider_track.release_track_mbid
+        evidence.unmatched_expected_tracks = []
+        return True
+
     def evaluate_candidate(
         self,
         local_tracks: list[GroupingTrack],
@@ -132,11 +257,35 @@ class AlbumEvidenceEngine:
         candidate_count = len(candidate.tracks)
         size = local_count + candidate_count
         pair_cache: dict[tuple[int, int], _Pair] = {}
+        recording_counts = Counter(
+            track.recording_mbid for track in candidate.tracks if track.recording_mbid
+        )
+        compatible_recording_positions = [
+            Counter(
+                candidate_track.recording_mbid
+                for candidate_track in candidate.tracks
+                if candidate_track.recording_mbid
+                and local.track_number > 0
+                and local.disc_number == candidate_track.disc_number
+                and local.track_number
+                in {candidate_track.position, candidate_track.absolute_position}
+            )
+            for local in local_tracks
+        ]
         if size:
             costs = [[2_000_000] * size for _ in range(size)]
             for local_index, local in enumerate(local_tracks):
                 for candidate_index, candidate_track in enumerate(candidate.tracks):
-                    pair = _pair(local, candidate_track)
+                    pair = _pair(
+                        local,
+                        candidate_track,
+                        recording_occurrences=recording_counts[
+                            candidate_track.recording_mbid
+                        ],
+                        recording_position_occurrences=compatible_recording_positions[
+                            local_index
+                        ][candidate_track.recording_mbid],
+                    )
                     pair_cache[(local_index, candidate_index)] = pair
                     costs[local_index][candidate_index] = int(pair.cost * 1_000_000)
                 costs[local_index][candidate_count + local_index] = 650_000
@@ -166,6 +315,7 @@ class AlbumEvidenceEngine:
                         candidate_disc_number=candidate_track.disc_number,
                         candidate_track_position=candidate_track.position,
                         recording_mbid=candidate_track.recording_mbid,
+                        release_track_mbid=candidate_track.release_track_mbid,
                     )
                 )
                 continue
@@ -185,11 +335,50 @@ class AlbumEvidenceEngine:
                 and candidate_recordings
                 and local.recording_mbid not in candidate_recordings
             )
-            conflict_kinds = (
-                ["recording_mbid_conflict"]
-                if explicit_recording_conflict
-                else (pair.kinds if pair and pair.hard_conflict else [])
+            candidate_release_tracks = {
+                candidate_track.release_track_mbid
+                for candidate_track in candidate.tracks
+                if candidate_track.release_track_mbid
+            }
+            explicit_release_track_conflict = bool(
+                local.release_track_mbid
+                and candidate_release_tracks
+                and local.release_track_mbid not in candidate_release_tracks
             )
+            conflict_kinds = []
+            if explicit_release_track_conflict:
+                conflict_kinds.append("release_track_mbid_conflict")
+            if explicit_recording_conflict:
+                conflict_kinds.append("recording_mbid_conflict")
+            if not conflict_kinds:
+                ambiguous_pair = next(
+                    (
+                        candidate_pair
+                        for (row, _), candidate_pair in pair_cache.items()
+                        if row == local_index
+                        and "ambiguous_release_track_identity" in candidate_pair.kinds
+                    ),
+                    None,
+                )
+                if ambiguous_pair is not None:
+                    conflict_kinds = ambiguous_pair.kinds
+                elif pair and pair.hard_conflict:
+                    conflict_kinds = pair.kinds
+            proposed_tracks = []
+            for candidate_track in candidate.tracks:
+                descriptive = _descriptive_pair(local, candidate_track)
+                exact_release_track = bool(
+                    local.release_track_mbid
+                    and candidate_track.release_track_mbid
+                    and local.release_track_mbid == candidate_track.release_track_mbid
+                )
+                independently_consistent = "normalized_title" in descriptive.kinds and (
+                    "compatible_position" in descriptive.kinds
+                    or "compatible_duration" in descriptive.kinds
+                )
+                if exact_release_track or independently_consistent:
+                    proposed_tracks.append(candidate_track)
+            proposed_track = proposed_tracks[0] if len(proposed_tracks) == 1 else None
             track_evidence.append(
                 TrackEvidence(
                     local_track_id=local.local_track_id,
@@ -199,6 +388,27 @@ class AlbumEvidenceEngine:
                         ["no_acceptable_candidate_track"]
                         if comparable
                         else ["incomparable"]
+                    ),
+                    candidate_track_title=(
+                        proposed_track.title if proposed_track is not None else None
+                    ),
+                    candidate_disc_number=(
+                        proposed_track.disc_number
+                        if proposed_track is not None
+                        else None
+                    ),
+                    candidate_track_position=(
+                        proposed_track.position if proposed_track is not None else None
+                    ),
+                    recording_mbid=(
+                        proposed_track.recording_mbid
+                        if proposed_track is not None
+                        else None
+                    ),
+                    release_track_mbid=(
+                        proposed_track.release_track_mbid
+                        if proposed_track is not None
+                        else None
                     ),
                 )
             )
@@ -235,10 +445,22 @@ class AlbumEvidenceEngine:
         )
         local_compilation = any(track.is_compilation for track in local_tracks)
         secondary = {value.casefold() for value in candidate.secondary_types}
-        unsafe_type = (
-            bool(secondary & _UNSAFE_SECONDARY_TYPES) and not local_compilation
+        release_type_requires_confirmation = "live" in secondary or (
+            "compilation" in secondary and not local_compilation
         )
-
+        exact_release_track_proof = bool(
+            candidate.release_mbid
+            and local_tracks
+            and all(track.release_track_mbid for track in local_tracks)
+            and len({track.release_track_mbid for track in local_tracks})
+            == len(local_tracks)
+            and len(track_evidence) == len(local_tracks)
+            and all(
+                item.classification == "supported"
+                and "release_track_mbid" in item.evidence_kinds
+                for item in track_evidence
+            )
+        )
         album_costs = [
             _distance(album_title, candidate.album_title) if album_title else 0.25,
             _distance(album_artist, candidate.album_artist_name)
@@ -258,8 +480,8 @@ class AlbumEvidenceEngine:
             reason = "INSUFFICIENT_METADATA"
         elif unknown > unknown_limit:
             reason = "UNKNOWN_EXTRAS_EXCEED_LIMIT"
-        elif unsafe_type:
-            reason = "UNSAFE_RELEASE_TYPE"
+        elif release_type_requires_confirmation and not exact_release_track_proof:
+            reason = "RELEASE_TYPE_REQUIRES_CONFIRMATION"
         elif comparable == 0 or supported != comparable:
             reason = "INSUFFICIENT_METADATA"
         elif distance > ALBUM_DISTANCE_CEILING:
@@ -313,8 +535,11 @@ class AlbumEvidenceEngine:
                 outcome, reason = "contradictory", "CONFLICTING_TRACK_EVIDENCE"
             elif "UNKNOWN_EXTRAS_EXCEED_LIMIT" in reasons:
                 outcome, reason = "insufficient_evidence", "UNKNOWN_EXTRAS_EXCEED_LIMIT"
-            elif "UNSAFE_RELEASE_TYPE" in reasons:
-                outcome, reason = "insufficient_evidence", "UNSAFE_RELEASE_TYPE"
+            elif "RELEASE_TYPE_REQUIRES_CONFIRMATION" in reasons:
+                outcome, reason = (
+                    "insufficient_evidence",
+                    "RELEASE_TYPE_REQUIRES_CONFIRMATION",
+                )
             else:
                 outcome, reason = "insufficient_evidence", "INSUFFICIENT_METADATA"
             return IdentificationDecision(

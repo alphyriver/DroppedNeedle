@@ -149,3 +149,94 @@ def test_quarantine_admin_projection_round_trips_soulseek_identity(tmp_path: Pat
     assert rows[0]["filename"] == "bad.flac"
     assert rows[0]["client_id"] == "soulseek"
     assert rows[0]["source"] == "soulseek"
+
+
+def _seed_narrow_download_attempts(db_path: Path) -> None:
+    """Recreate the shipped ``download_attempts`` table whose CHECK admits only
+    soulseek/usenet, with one in-flight usenet row to prove data survives."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """CREATE TABLE download_attempts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('soulseek','usenet')),
+                candidate_index INTEGER NOT NULL CHECK(candidate_index >= 0),
+                job_name TEXT NOT NULL DEFAULT '',
+                handle_json TEXT NOT NULL,
+                remote_storage TEXT,
+                mount_root TEXT,
+                workspace_path TEXT,
+                materialized_paths_json TEXT NOT NULL DEFAULT '[]',
+                publisher_bundle_ids_json TEXT NOT NULL DEFAULT '[]',
+                state TEXT NOT NULL CHECK(state IN (
+                    'acquiring','in_use','cleanup_pending','workspace_removed','complete',
+                    'preserved','needs_attention'
+                )),
+                disposition TEXT NOT NULL DEFAULT 'undecided'
+                    CHECK(disposition IN ('undecided','discard','preserve')),
+                cleanup_failures INTEGER NOT NULL DEFAULT 0 CHECK(cleanup_failures >= 0),
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_expires_at REAL,
+                error_code TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL,
+                row_revision INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX idx_download_attempts_task "
+            "ON download_attempts(task_id, candidate_index, created_at)"
+        )
+        conn.execute(
+            "INSERT INTO download_attempts "
+            "(id, task_id, source, candidate_index, handle_json, state, created_at, updated_at) "
+            "VALUES ('att-1','task-1','usenet',0,'{}','cleanup_pending',1.0,1.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_download_attempts_source_check_widens_to_admit_torrent(tmp_path: Path):
+    """A torrent attempt is unpersistable against the shipped two-source CHECK,
+    which would block the cleanup journal for the whole source. The rebuild must
+    widen the constraint AND carry existing rows and indexes across."""
+    import threading as _threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    db_path = tmp_path / "library.db"
+    _seed_narrow_download_attempts(db_path)
+
+    DownloadStore(db_path=db_path, write_lock=_threading.Lock())
+
+    conn = sqlite3.connect(db_path)
+    try:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='download_attempts'"
+        ).fetchone()[0]
+        assert "'torrent'" in sql
+        # The pre-existing attempt survived the rebuild.
+        assert conn.execute("SELECT source FROM download_attempts").fetchall() == [
+            ("usenet",)
+        ]
+        # A torrent attempt is now accepted.
+        conn.execute(
+            "INSERT INTO download_attempts "
+            "(id, task_id, source, candidate_index, handle_json, state, created_at, updated_at) "
+            "VALUES ('att-2','task-2','torrent',0,'{}','cleanup_pending',2.0,2.0)"
+        )
+        idx = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='download_attempts'"
+            )
+        }
+        assert "idx_download_attempts_task" in idx
+        assert "idx_download_attempts_cleanup" in idx
+    finally:
+        conn.close()

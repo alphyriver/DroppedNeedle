@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import PurePosixPath
 from typing import Any
 
 from api.v1.schemas.library_target import (
+    ActiveEditionConversionSummary,
     TargetNativeAlbum,
     TargetNativeAlbumDetail,
     TargetNativeAlbumStatusResponse,
     TargetNativeArtist,
+    TargetNativeArtistAppearance,
     TargetNativeProviderIdsResponse,
     TargetNativeStatsResponse,
     TargetNativeTrack,
 )
 from api.v1.schemas.library import ResolvedTrack, TrackResolveItem, TrackResolveResponse
 from infrastructure.persistence.native_library_store import NativeLibraryStore
+from core.exceptions import ResourceNotFoundError
+from models.edition_management import CustomEditionState
 from services.native.quality_tiers import tier_for, tier_rank
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.identification_revisions import album_input_revisions
@@ -55,6 +60,7 @@ class TargetNativeLibraryService:
         search: str | None,
         sort_by: str = "name",
         sort_order: str,
+        scope: str = "album",
     ) -> tuple[list[TargetNativeArtist], int]:
         rows, total = await self._store.list_target_artists(
             limit=limit,
@@ -62,15 +68,19 @@ class TargetNativeLibraryService:
             search=search,
             sort_by=sort_by,
             sort_order=sort_order,
+            scope=scope,
         )
         return [self._artist(row) for row in rows], total
+
+    async def artist_scope_counts(self) -> tuple[int, int]:
+        return await self._store.target_artist_scope_counts()
 
     async def artist(self, artist_id: str) -> TargetNativeArtist | None:
         canonical = await self.canonical_id("artist", artist_id)
         if canonical is None:
             return None
         rows, _ = await self._store.list_target_artists(
-            limit=1, offset=0, artist_ids=[canonical]
+            limit=1, offset=0, artist_ids=[canonical], scope="all"
         )
         return self._artist(rows[0]) if rows else None
 
@@ -82,6 +92,27 @@ class TargetNativeLibraryService:
             limit=10_000, offset=0, sort="name", artist_id=canonical
         )
         return [self._album(row) for row in rows]
+
+    async def artist_appearances(
+        self, artist_id: str, *, limit: int, offset: int
+    ) -> tuple[list[TargetNativeArtistAppearance], int, int]:
+        canonical = await self.canonical_id("artist", artist_id)
+        if canonical is None:
+            return [], 0, 0
+        rows, total, total_tracks = await self._store.list_target_artist_appearances(
+            canonical, limit=limit, offset=offset
+        )
+        return (
+            [
+                TargetNativeArtistAppearance(
+                    album=self._album(row["album"]),
+                    tracks=[self._track(track) for track in row["tracks"]],
+                )
+                for row in rows
+            ],
+            total,
+            total_tracks,
+        )
 
     async def tracks(
         self,
@@ -126,7 +157,15 @@ class TargetNativeLibraryService:
             return None
         identity = context["identity"]
         review = context["review"]
-        contribution = await self._store.get_active_album_contribution(album.id)
+        tracks = [
+            track for track in context["tracks"] if track["availability"] == "indexed"
+        ]
+        contribution, custom, exclusion, conversion = await asyncio.gather(
+            self._store.get_active_album_contribution(album.id),
+            self._store.get_custom_edition_state(album.id),
+            self._store.get_management_exclusion(album.id),
+            self._store.get_active_edition_conversion(album.id),
+        )
         if (
             identity is not None
             and review is not None
@@ -141,17 +180,70 @@ class TargetNativeLibraryService:
             status = "needs_review"
         else:
             status = "local_metadata"
+        album_values = {
+            field: getattr(album, field)
+            for field in TargetNativeAlbum.__struct_fields__
+            if field not in {"contribution_id", "contribution_state"}
+        }
+        if custom is not None:
+            album_values["album_identity_state"] = "custom_edition"
+            album_values["musicbrainz_release_id"] = None
         return TargetNativeAlbumDetail(
-            **{
-                field: getattr(album, field)
-                for field in TargetNativeAlbum.__struct_fields__
-                if field not in {"contribution_id", "contribution_state"}
-            },
+            **album_values,
             row_revision=int(context["album"]["row_revision"]),
-            input_revision=":".join(album_input_revisions(context["tracks"])),
+            input_revision=":".join(album_input_revisions(tracks)),
             identification_status=status,
             review_id=str(review["id"]) if review is not None else None,
             review_revision=int(review["row_revision"]) if review is not None else None,
+            management_identity_readiness=self._management_identity_readiness(
+                identity, tracks, custom=custom, excluded=exclusion is not None
+            ),
+            mapped_track_count=(
+                custom.recognized_track_count
+                if custom is not None
+                else self._mapped_track_count(identity, tracks)
+            ),
+            management_identity_kind=(
+                "custom_edition"
+                if custom is not None
+                else "exact_release"
+                if identity is not None and identity["release_mbid"]
+                else None
+            ),
+            custom_manifest_id=(custom.manifest.id if custom is not None else None),
+            custom_manifest_version=(
+                custom.manifest.version if custom is not None else None
+            ),
+            custom_manifest_track_count=(
+                len(custom.manifest.tracks) if custom is not None else 0
+            ),
+            custom_manifest_recognized_track_count=(
+                custom.recognized_track_count if custom is not None else 0
+            ),
+            custom_manifest_stale=custom.stale if custom is not None else False,
+            management_excluded=exclusion is not None,
+            management_exclusion_revision=(
+                exclusion.row_revision if exclusion is not None else None
+            ),
+            management_excluded_at=(
+                exclusion.excluded_at if exclusion is not None else None
+            ),
+            active_edition_conversion=(
+                ActiveEditionConversionSummary(
+                    job_id=conversion.id,
+                    release_mbid=conversion.target_release_mbid,
+                    state=conversion.state,
+                    kept_count=conversion.kept_count,
+                    acquire_count=conversion.acquire_count,
+                    staged_count=conversion.staged_count,
+                    failed_count=conversion.failed_count,
+                    recycle_count=conversion.recycle_count,
+                    row_revision=conversion.row_revision,
+                    final_preview_job_id=conversion.final_preview_job_id,
+                )
+                if conversion is not None
+                else None
+            ),
             contribution_id=(
                 str(contribution["id"]) if contribution is not None else None
             ),
@@ -294,10 +386,83 @@ class TargetNativeLibraryService:
         )
 
     @staticmethod
+    def _management_identity_readiness(
+        identity: dict[str, Any] | None,
+        tracks: list[dict[str, Any]],
+        *,
+        custom: CustomEditionState | None = None,
+        excluded: bool = False,
+    ) -> str:
+        if not tracks or excluded:
+            return "not_applicable"
+        if custom is not None:
+            return "custom_manifest_stale" if custom.stale else "ready"
+        if (
+            identity is None
+            or not identity["release_group_mbid"]
+            or not identity["release_mbid"]
+        ):
+            return "exact_release_required"
+        release_track_ids: set[str] = set()
+        for track in tracks:
+            release_track_mbid = track["release_track_mbid"]
+            if (
+                not track["identity_row_revision"]
+                or not track["recording_mbid"]
+                or not release_track_mbid
+                or track["identity_release_mbid"] != identity["release_mbid"]
+                or track["medium_position"] is None
+                or track["release_track_position"] is None
+                or release_track_mbid in release_track_ids
+            ):
+                return "track_mapping_required"
+            release_track_ids.add(str(release_track_mbid))
+        return "ready"
+
+    async def reenable_album_management(
+        self,
+        album_id: str,
+        *,
+        expected_exclusion_revision: int,
+        actor_user_id: str,
+        now: float,
+    ) -> bool:
+        canonical = await self.canonical_id("album", album_id)
+        if canonical is None:
+            raise ResourceNotFoundError("Library album not found.")
+        return await self._store.clear_management_exclusion(
+            canonical,
+            expected_row_revision=expected_exclusion_revision,
+            actor_user_id=actor_user_id,
+            now=now,
+        )
+
+    @staticmethod
+    def _mapped_track_count(
+        identity: dict[str, Any] | None, tracks: list[dict[str, Any]]
+    ) -> int:
+        if identity is None or not identity["release_mbid"]:
+            return 0
+        release_track_ids = {
+            str(track["release_track_mbid"])
+            for track in tracks
+            if track["identity_row_revision"]
+            and track["recording_mbid"]
+            and track["release_track_mbid"]
+            and track["identity_release_mbid"] == identity["release_mbid"]
+            and track["medium_position"] is not None
+            and track["release_track_position"] is not None
+        }
+        return len(release_track_ids)
+
+    @staticmethod
     def _album(row: dict[str, Any]) -> TargetNativeAlbum:
         release_group_mbid = row.get("provider_release_group_mbid")
         release_mbid = row.get("provider_release_mbid")
-        if release_mbid:
+        if row.get("custom_manifest_id"):
+            identity_state = "custom_edition"
+            release_mbid = None
+        elif release_mbid:
             identity_state = "release_linked"
         elif release_group_mbid:
             identity_state = "release_group_linked"
@@ -342,6 +507,9 @@ class TargetNativeLibraryService:
             ),
             album_count=int(row.get("album_count") or 0),
             track_count=int(row.get("track_count") or 0),
+            appearance_release_count=int(row.get("appearance_release_count") or 0),
+            appearance_track_count=int(row.get("appearance_track_count") or 0),
+            library_relationship=str(row.get("library_relationship") or "album_artist"),
             date_added=row.get("date_added"),
             row_revision=int(row.get("row_revision") or 1),
         )

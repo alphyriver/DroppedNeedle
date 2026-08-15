@@ -153,6 +153,7 @@
 							mbid={album.mbid || ''}
 							alt={album.name}
 							size="full"
+							requestSize={250}
 							lazy={true}
 							rounded="none"
 							className="block aspect-square w-full object-cover"

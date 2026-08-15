@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from api.v1.schemas.discover import DiscoverQueueEnrichment, DiscoverQueueItemLight, DiscoverQueueResponse
+from api.v1.schemas.discover import (
+    DiscoverQueueEnrichment,
+    DiscoverQueueItemLight,
+    DiscoverQueueResponse,
+)
 from services.discover_queue_manager import DiscoverQueueManager, QueueBuildStatus
 from infrastructure.persistence.discovery_snapshot_store import DiscoverySnapshotStore
 
@@ -295,7 +299,9 @@ async def test_build_prewarms_covers():
     expect_assertions = True
     queue = _make_queue(3)
     cover_repo = AsyncMock()
-    cover_repo.get_release_group_cover = AsyncMock(return_value=(b"img", "image/jpeg", "caa"))
+    cover_repo.get_release_group_cover = AsyncMock(
+        return_value=(b"img", "image/jpeg", "caa")
+    )
 
     discover = AsyncMock()
     discover.build_queue.return_value = queue
@@ -315,6 +321,10 @@ async def test_build_prewarms_covers():
         call.args[0] for call in cover_repo.get_release_group_cover.call_args_list
     )
     assert called_mbids == ["mbid-0", "mbid-1", "mbid-2"]
+    assert all(
+        call.kwargs["size"] == "250"
+        for call in cover_repo.get_release_group_cover.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -332,7 +342,9 @@ async def test_build_prewarm_failure_does_not_break_queue():
     expect_assertions = True
     queue = _make_queue(2)
     cover_repo = AsyncMock()
-    cover_repo.get_release_group_cover = AsyncMock(side_effect=RuntimeError("fetch failed"))
+    cover_repo.get_release_group_cover = AsyncMock(
+        side_effect=RuntimeError("fetch failed")
+    )
 
     discover = AsyncMock()
     discover.build_queue.return_value = queue

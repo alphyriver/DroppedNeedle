@@ -15,6 +15,7 @@ from api.v1.schemas.requests_page import (
 )
 from core.exceptions import PermissionDeniedError, ValidationError
 from infrastructure.cover_urls import prefer_release_group_cover_url
+from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.persistence.request_history import (
     RequestHistoryRecord,
     RequestHistoryStore,
@@ -189,6 +190,7 @@ class RequestsPageService:
                     artist_mbid=record.artist_mbid,
                     origin="user",
                     release_mbid=record.release_mbid,
+                    track_count_priority=RequestPriority.USER_INITIATED,
                 )
             except ValidationError as e:
                 # A cap/quota rejection (Feature C) is not a failure of the request:
@@ -326,6 +328,7 @@ class RequestsPageService:
                 artist_mbid=record.artist_mbid,
                 origin="retry",
                 release_mbid=record.release_mbid,
+                track_count_priority=RequestPriority.USER_INITIATED,
             )
         except ValidationError as e:
             # cap/quota rejection: restore the pre-retry status (don't strand it as

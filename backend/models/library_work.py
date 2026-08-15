@@ -7,7 +7,13 @@ from typing import Literal
 import msgspec
 
 from infrastructure.msgspec_fastapi import AppStruct
-from models.local_catalog import LocalAlbum, LocalArtist, LocalArtistCredit, LocalTrack
+from models.local_catalog import (
+    LocalAlbum,
+    LocalArtist,
+    LocalArtistCredit,
+    LocalTrack,
+    LocalTrackGenre,
+)
 
 
 class IdentificationJob(AppStruct):
@@ -128,7 +134,9 @@ class ScanControlResult(AppStruct):
 
 class OperationJob(AppStruct):
     id: str
-    kind: Literal["bulk_review_apply", "repair", "explicit_reidentification"]
+    kind: Literal[
+        "bulk_review_apply", "repair", "explicit_reidentification", "library_management"
+    ]
     requested_by_user_id: str | None = None
     state: str = "queued"
     input_catalog_revision: int | None = None
@@ -137,6 +145,46 @@ class OperationJob(AppStruct):
     created_at: float = 0.0
     row_revision: int = 1
     event_revision: int = 0
+
+
+class LibraryWorkItem(AppStruct):
+    id: str
+    kind: Literal[
+        "scan",
+        "identification",
+        "identity_preparation",
+        "reidentification",
+        "identity_review",
+        "maintenance",
+        "library_management",
+        "recovery",
+    ]
+    state: str
+    phase: str | None = None
+    mode: str | None = None
+    effect: Literal["catalog_only", "file_writing", "attention"] = "catalog_only"
+    processed: int = 0
+    total: int | None = None
+    unit: Literal["files", "albums", "releases", "items"] = "items"
+    indeterminate: bool = False
+    remaining_count: int | None = None
+    subject_count: int | None = None
+    started_at: float | None = None
+    updated_at: float = 0.0
+    origin: str | None = None
+    profile_name: str | None = None
+    scope_label: str | None = None
+    new_count: int = 0
+    changed_count: int = 0
+    missing_count: int = 0
+    warning_count: int = 0
+    blocked_count: int = 0
+    succeeded_count: int = 0
+    failed_count: int = 0
+    skipped_count: int = 0
+    priority: int = 100
+    failure_event_id: str | None = None
+    failure_at: float | None = None
 
 
 class OperationWorkItem(AppStruct):
@@ -186,6 +234,10 @@ class ScannedTrackWrite(msgspec.Struct):
     relative_path: str
     comparison_result: Literal["new", "changed"]
     grouping_context: str
+    artists: list[LocalArtist] = msgspec.field(default_factory=list)
+    album_credits: list[LocalArtistCredit] = msgspec.field(default_factory=list)
+    track_credits: list[LocalArtistCredit] = msgspec.field(default_factory=list)
+    genres: list[LocalTrackGenre] = msgspec.field(default_factory=list)
 
 
 class MigrationProvenance(AppStruct):

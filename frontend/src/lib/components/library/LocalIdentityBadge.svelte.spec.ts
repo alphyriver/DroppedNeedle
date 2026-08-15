@@ -7,6 +7,7 @@ describe('LocalIdentityBadge.svelte', () => {
 	it.each([
 		['local_only', 'Local-only'],
 		['release_group_linked', 'Local edition'],
+		['custom_edition', 'Custom edition'],
 		['release_linked', 'MusicBrainz linked']
 	] as const)('shows the album identity state %s', async (state, label) => {
 		render(LocalIdentityBadge, {

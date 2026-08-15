@@ -107,6 +107,7 @@ class TestLoadFromFileTypeValidation:
             "_internal",
             "connect_apps",
             "download_client",
+            "home_settings",
             "lastfm_settings",
             "library_scan_schedule",
             "library_settings",

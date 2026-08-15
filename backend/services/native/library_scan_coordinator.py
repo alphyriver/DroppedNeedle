@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from core.exceptions import StaleRevisionError, ValidationError
@@ -19,6 +19,7 @@ from models.library_work import (
     ScanScope,
 )
 from services.native.library_indexer import LibraryIndexer
+from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
 from services.native.library_inventory_scanner import LibraryInventoryScanner
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_reconciler import LibraryReconciler
@@ -26,6 +27,9 @@ from services.native.library_scan_events import LibraryScanEventPublisher
 from services.native.background_workload_gate import BackgroundWorkloadGate
 
 PolicyResolverGetter = Callable[[], LibraryPolicyResolver]
+IndexedAlbumCallback = Callable[[str], Awaitable[object]]
+INDEXED_ALBUM_CALLBACK_BATCH_SIZE = 16
+INDEXED_ALBUM_CALLBACK_RETRY_MAX_SECONDS = 300.0
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +45,8 @@ class LibraryScanCoordinator:
         *,
         clock: Callable[[], float] = time.time,
         workload_gate: BackgroundWorkloadGate | None = None,
+        filesystem_coordinator: LibraryFilesystemCoordinator | None = None,
+        on_indexed_album: IndexedAlbumCallback | None = None,
     ) -> None:
         self._store = store
         self._inventory = inventory
@@ -50,6 +56,8 @@ class LibraryScanCoordinator:
         self._events = events
         self._clock = clock
         self._workload_gate = workload_gate
+        self._filesystem = filesystem_coordinator
+        self._on_indexed_album = on_indexed_album
         self._last_progress_log: dict[str, float] = {}
         self._pending_control_run_ids: set[str] = set()
 
@@ -61,8 +69,10 @@ class LibraryScanCoordinator:
         counters = run.counters
         total = int(counters.get("total_count", 0))
         inspected = int(counters.get("inspected_count", 0))
-        percentage = 100.0 if run.state == "completed" else (
-            inspected * 100.0 / total if total else 0.0
+        percentage = (
+            100.0
+            if run.state == "completed"
+            else (inspected * 100.0 / total if total else 0.0)
         )
         elapsed = max(0.0, now - (run.started_at or now))
         throughput = inspected / elapsed if elapsed else 0.0
@@ -157,6 +167,8 @@ class LibraryScanCoordinator:
             await self._events.publish(run, event="scan.transition")
         if run.terminal_at is not None:
             await self._store.flush_scan_invalidation(terminal=True)
+            if self._filesystem is not None:
+                self._filesystem.forget_scan(run.id)
         self._log_progress(run, f"control_{control}", force=True)
         return ScanControlResult(
             run_id=run.id,
@@ -199,6 +211,8 @@ class LibraryScanCoordinator:
                 settled, "pause" if settled.state == "paused" else "stop", force=True
             )
             self._pending_control_run_ids.discard(settled.id)
+            if settled.state == "cancelled" and self._filesystem is not None:
+                self._filesystem.forget_scan(settled.id)
             return settled
 
     async def checkpoint(self, run_id: str, frozen_policy_revision: str) -> bool:
@@ -230,6 +244,8 @@ class LibraryScanCoordinator:
                 )
             await self._store.flush_scan_invalidation(terminal=True)
             self._pending_control_run_ids.discard(run.id)
+            if self._filesystem is not None:
+                self._filesystem.forget_scan(run.id)
             return False
         if run.state == "pausing":
             await self._settle_pending_control(run.id)
@@ -247,6 +263,7 @@ class LibraryScanCoordinator:
         if run is None:
             run = await self._store.claim_next_scan_run(now=self._clock())
         if run is None:
+            await self._schedule_pending_indexed_albums()
             return None
         if newly_claimed and self._events is not None:
             await self._events.publish(run, event="scan.transition")
@@ -271,11 +288,15 @@ class LibraryScanCoordinator:
                 if self._events is not None:
                     await self._events.publish(failed, event="scan.transition")
                 await self._store.flush_scan_invalidation(terminal=True)
+                if self._filesystem is not None:
+                    self._filesystem.forget_scan(failed.id)
             raise
         finally:
             self._pending_control_run_ids.discard(run.id)
             if self._workload_gate is not None:
                 self._workload_gate.set_scan_active(False)
+                self._store.work_wakeups.notify("identification")
+                self._store.work_wakeups.notify("operation")
 
     async def _continue_run(self, run: ScanRun, root_paths: dict[str, Path]) -> ScanRun:
         run, scopes, _ = await self._store.get_scan_run(run.id)
@@ -368,10 +389,48 @@ class LibraryScanCoordinator:
             expected_revision=run.row_revision,
             new_state="completed",
             now=self._clock(),
+            stage_management_candidates=self._on_indexed_album is not None,
         )
         if self._events is not None:
             await self._events.publish(run, event="scan.transition")
         await self._store.flush_scan_invalidation(terminal=True)
         self._log_progress(run, "completion", force=True)
         self._last_progress_log.pop(run.id, None)
+        if self._filesystem is not None:
+            self._filesystem.forget_scan(run.id)
         return run
+
+    async def _schedule_pending_indexed_albums(self) -> None:
+        if self._on_indexed_album is None:
+            return
+        now = self._clock()
+        candidates = await self._store.get_due_scan_management_candidates(
+            now=now,
+            limit=INDEXED_ALBUM_CALLBACK_BATCH_SIZE,
+        )
+        for candidate in candidates:
+            run_id = str(candidate["run_id"])
+            album_id = str(candidate["local_album_id"])
+            try:
+                await self._on_indexed_album(album_id)
+            except Exception:  # noqa: BLE001 - durable retry isolates scan from management
+                retry_seconds = min(
+                    INDEXED_ALBUM_CALLBACK_RETRY_MAX_SECONDS,
+                    2.0 ** min(int(candidate["attempt_count"]), 9),
+                )
+                await self._store.defer_scan_management_candidate(
+                    run_id,
+                    album_id,
+                    attempted_at=now,
+                    next_attempt_at=now + retry_seconds,
+                )
+                logger.warning(
+                    "Post-scan album scheduling failed for %s; retrying in %.0fs",
+                    album_id,
+                    retry_seconds,
+                    exc_info=True,
+                )
+            else:
+                await self._store.complete_scan_management_candidate(
+                    run_id, album_id, completed_at=now
+                )

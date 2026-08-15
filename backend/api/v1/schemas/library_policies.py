@@ -48,6 +48,24 @@ class LibrarySettingsUpdateRequest(AppStruct):
     expected_policy_revision: str
 
 
+class LibraryRestorableRoot(AppStruct):
+    root_id: str
+    path: str
+    indexed_file_count: int = 0
+
+
+class LibraryRestorableRootsResponse(AppStruct):
+    policy_revision: str
+    restorable_roots: list[LibraryRestorableRoot] = msgspec.field(
+        default_factory=list
+    )
+
+
+class LibraryRestoreRootsRequest(AppStruct):
+    expected_policy_revision: str
+    paths: dict[str, str] | None = None
+
+
 class LibraryPolicyTreeNode(AppStruct):
     id: str
     kind: Literal["root", "rule"]

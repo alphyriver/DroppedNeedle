@@ -30,7 +30,8 @@ from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.validators import validate_mbid
 from infrastructure.queue.priority_queue import RequestPriority
-from core.exceptions import ResourceNotFoundError
+from infrastructure.http.disconnect import DisconnectCallable, check_disconnected
+from core.exceptions import ClientDisconnectedError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBArtistImages
 from repositories.musicbrainz_base import extract_artist_name
@@ -258,6 +259,7 @@ class ArtistService:
         artist_info = await self._build_artist_from_musicbrainz(
             artist_id, library_artist_mbids, library_album_mbids
         )
+        await self._refresh_library_flags(artist_info)
         artist_info = await self._apply_audiodb_artist_images(
             artist_info,
             artist_id,
@@ -341,6 +343,7 @@ class ArtistService:
             artist_info = await self._build_artist_from_musicbrainz(
                 artist_id, include_extended=False, include_releases=False
             )
+            await self._refresh_library_flags(artist_info)
             artist_info = await self._apply_audiodb_artist_images(
                 artist_info,
                 artist_id,
@@ -398,7 +401,10 @@ class ArtistService:
                         and release.id.casefold() in requested_mbids
                         and not projection.owned
                     )
-                artist_info.in_library = await self._ownership.provider_artist_owned(
+                (
+                    artist_info.in_library,
+                    artist_info.appears_in_library,
+                ) = await self._ownership.provider_artist_relationship(
                     artist_info.musicbrainz_id
                 )
                 return
@@ -420,6 +426,7 @@ class ArtistService:
                     rg.requested = rg_id in requested_mbids and not rg.in_library
             mbid_lower = artist_info.musicbrainz_id.lower()
             artist_info.in_library = mbid_lower in artist_mbids
+            artist_info.appears_in_library = False
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to refresh library flags: {e}")
 
@@ -487,9 +494,15 @@ class ArtistService:
             return ArtistExtendedInfo(description=None, image=None)
 
     async def get_artist_releases(
-        self, artist_id: str, offset: int = 0, limit: int = 50
+        self,
+        artist_id: str,
+        offset: int = 0,
+        limit: int = 50,
+        *,
+        is_disconnected: DisconnectCallable | None = None,
     ) -> ArtistReleases:
         try:
+            await check_disconnected(is_disconnected)
             album_mbids: set[str] = set()
             requested_mbids: set[str] = set()
             if self._ownership is None:
@@ -512,7 +525,10 @@ class ArtistService:
                 requested_mbids,
                 included_primary_types,
                 included_secondary_types,
+                is_disconnected,
             )
+        except ClientDisconnectedError:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(
                 f"Error fetching releases for artist {artist_id} at offset {offset}: {e}"
@@ -538,6 +554,7 @@ class ArtistService:
         requested_mbids: set[str],
         included_primary_types: set[str],
         included_secondary_types: set[str],
+        is_disconnected: DisconnectCallable | None,
     ) -> ArtistReleases:
         if not included_primary_types:
             return ArtistReleases(
@@ -564,12 +581,14 @@ class ArtistService:
         batches_scanned = 0
 
         while batches_scanned < _MAX_SCAN_BATCHES:
+            await check_disconnected(is_disconnected)
             release_groups, mb_total = await self._mb_repo.get_artist_release_groups(
                 artist_id,
                 raw_offset,
                 _SCAN_BATCH,
                 priority=RequestPriority.USER_INITIATED,
             )
+            await check_disconnected(is_disconnected)
             if source_total is None:
                 source_total = mb_total
 
@@ -586,33 +605,32 @@ class ArtistService:
                     release_groups, artist_name=""
                 )
 
-            temp_artist = {"release-group-list": release_groups}
-            page_albums, page_singles, page_eps = categorize_release_groups(
-                temp_artist,
-                batch_album_mbids,
-                included_primary_types,
-                included_secondary_types,
-                batch_requested_mbids,
-            )
+            consumed = 0
+            for release_group in release_groups:
+                consumed += 1
+                page_albums, page_singles, page_eps = categorize_release_groups(
+                    {"release-group-list": [release_group]},
+                    batch_album_mbids,
+                    included_primary_types,
+                    included_secondary_types,
+                    batch_requested_mbids,
+                )
+                for target, items in (
+                    (all_albums, page_albums),
+                    (all_singles, page_singles),
+                    (all_eps, page_eps),
+                ):
+                    for item in items:
+                        if item.id and item.id not in seen_mbids:
+                            seen_mbids.add(item.id)
+                            target.append(item)
+                if len(seen_mbids) >= limit:
+                    break
 
-            for item in page_albums:
-                if item.id and item.id not in seen_mbids:
-                    seen_mbids.add(item.id)
-                    all_albums.append(item)
-            for item in page_singles:
-                if item.id and item.id not in seen_mbids:
-                    seen_mbids.add(item.id)
-                    all_singles.append(item)
-            for item in page_eps:
-                if item.id and item.id not in seen_mbids:
-                    seen_mbids.add(item.id)
-                    all_eps.append(item)
-
-            raw_offset += len(release_groups)
+            raw_offset += consumed
             batches_scanned += 1
 
-            total_collected = len(all_albums) + len(all_singles) + len(all_eps)
-            if total_collected >= limit:
+            if len(seen_mbids) >= limit:
                 break
             if raw_offset >= mb_total:
                 break
@@ -658,13 +676,13 @@ class ArtistService:
                 )
                 requested_mbids = set()
         elif self._ownership is not None:
-            mb_artist, artist_owned = await asyncio.gather(
+            mb_artist, artist_relationship = await asyncio.gather(
                 self._mb_repo.get_artist_by_id(artist_id),
-                self._ownership.provider_artist_owned(artist_id),
+                self._ownership.provider_artist_relationship(artist_id),
             )
             if not mb_artist:
                 raise ResourceNotFoundError("Artist not found")
-            library_mbids = {artist_id.casefold()} if artist_owned else set()
+            library_mbids = {artist_id.casefold()} if artist_relationship[0] else set()
             if include_releases:
                 album_mbids, requested_mbids = await self._target_release_group_flags(
                     mb_artist.get("release-group-list", []),

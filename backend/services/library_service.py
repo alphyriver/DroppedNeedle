@@ -20,6 +20,7 @@ from infrastructure.cache.cache_keys import (
     library_requested_mbids_key,
     SOURCE_RESOLUTION_PREFIX,
     ALBUM_INFO_PREFIX,
+    ALBUM_TRACKS_INFO_PREFIX,
     ARTIST_INFO_PREFIX,
     LIBRARY_PREFIX,
     LIBRARY_ALBUM_DETAILS_PREFIX,
@@ -785,6 +786,7 @@ class LibraryService:
         if self._memory_cache:
             keys_to_delete = [
                 f"{ALBUM_INFO_PREFIX}{album_mbid}",
+                f"{ALBUM_TRACKS_INFO_PREFIX}{album_mbid}",
                 f"{LIBRARY_ALBUM_DETAILS_PREFIX}{album_mbid}",
                 library_requested_mbids_key(),
             ]

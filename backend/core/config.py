@@ -22,6 +22,7 @@ _PREFERENCES_OWNED_CONFIG_KEYS = frozenset(
         "events",
         "free_music",
         "get_it",
+        "home_settings",
         "indexers",
         "jellyfin_settings",
         "lastfm_settings",

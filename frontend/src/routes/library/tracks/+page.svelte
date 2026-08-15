@@ -277,6 +277,7 @@
 							available={track.cover_available}
 							alt={track.album_title}
 							size="full"
+							requestSize={250}
 							rounded="md"
 							className="h-12 w-12 ring-1 ring-base-content/10"
 						/>

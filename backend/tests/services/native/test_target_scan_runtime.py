@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -12,10 +13,12 @@ import pytest
 
 from core.task_registry import TaskRegistry
 from infrastructure.sse_publisher import KEEPALIVE, SSEPublisher
+from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
 from models.library_work import ScanRun, ScanRunSnapshot, ScanScope
 from services.compat.target_scan_service import TargetCompatScanService
 from services.native.library_scan_events import LibraryScanEventPublisher
 from services.native.library_inventory_scanner import LibraryInventoryScanner
+from services.native.library_operation_supervisor import LibraryOperationSupervisor
 from services.native.library_scan_scheduler import LibraryAutomaticScanScheduler
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from api.v1.schemas.library_policies import (
@@ -72,10 +75,10 @@ async def test_subsonic_target_projection_uses_only_the_coordinator() -> None:
 
 
 @pytest.mark.asyncio
-async def test_supervisor_fetches_the_current_coordinator_each_iteration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_supervisor_fetches_the_current_coordinator_each_iteration() -> None:
     coordinators = [AsyncMock(), AsyncMock(), AsyncMock()]
+    for coordinator in coordinators:
+        coordinator.run_once.return_value = None
     calls = 0
 
     def getter():
@@ -84,14 +87,11 @@ async def test_supervisor_fetches_the_current_coordinator_each_iteration(
         calls += 1
         return result
 
-    async def stop_after_two(_seconds: float) -> None:
-        if calls >= 3:
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "services.native.library_scan_supervisor.asyncio.sleep", stop_after_two
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=[None, asyncio.CancelledError()]),
     )
-    await supervise_target_scans(getter, lambda: {"root-a": Path("/scratch")})
+    await supervise_target_scans(getter, lambda: {"root-a": Path("/scratch")}, wakeups)
 
     assert calls == 3
     coordinators[0].recover.assert_awaited_once()
@@ -104,10 +104,12 @@ async def test_only_one_target_supervisor_can_be_registered() -> None:
     registry = TaskRegistry.get_instance()
     registry.reset()
     coordinator = AsyncMock()
-    task = start_target_scan_supervisor(lambda: coordinator, lambda: {})
+    coordinator.run_once.return_value = None
+    wakeups = DurableWorkWakeups()
+    task = start_target_scan_supervisor(lambda: coordinator, lambda: {}, wakeups)
     assert registry.is_running(SUPERVISOR_TASK_NAME)
     with pytest.raises(RuntimeError):
-        start_target_scan_supervisor(lambda: coordinator, lambda: {})
+        start_target_scan_supervisor(lambda: coordinator, lambda: {}, wakeups)
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
@@ -116,13 +118,12 @@ async def test_only_one_target_supervisor_can_be_registered() -> None:
 
 
 @pytest.mark.asyncio
-async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration() -> None:
     coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
     scheduler = AsyncMock()
     resolver = SimpleNamespace(policy_revision="one")
-    calls = {"scheduler": 0, "resolver": 0, "settings": 0, "sleep": 0}
+    calls = {"scheduler": 0, "resolver": 0, "settings": 0}
 
     def scheduler_getter():
         calls["scheduler"] += 1
@@ -140,47 +141,40 @@ async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration(
             "timezone_name": "Europe/London",
         }
 
-    async def stop_after_two(_seconds: float) -> None:
-        calls["sleep"] += 1
-        if calls["sleep"] == 2:
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "services.native.library_scan_supervisor.asyncio.sleep", stop_after_two
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=[None, asyncio.CancelledError()]),
     )
     await supervise_target_scans(
         lambda: coordinator,
         lambda: {},
+        wakeups,
         scheduler_getter,
         resolver_getter,
         settings_getter,
     )
 
-    assert calls == {"scheduler": 2, "resolver": 2, "settings": 2, "sleep": 2}
+    assert calls == {"scheduler": 2, "resolver": 2, "settings": 2}
     assert scheduler.tick.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_target_identification_worker_recovers_claims_and_survives_iterations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_target_identification_worker_recovers_claims_and_survives_iterations() -> (
+    None
+):
     queue = AsyncMock()
     queue.is_paused.return_value = False
     queue.claim.side_effect = [{"id": "job-1"}, None]
     service = AsyncMock()
-    sleeps = 0
-
-    async def stop_after_two(_seconds: float) -> None:
-        nonlocal sleeps
-        sleeps += 1
-        if sleeps == 2:
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "services.native.target_application_runtime.asyncio.sleep", stop_after_two
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
     )
     await run_target_identification_worker(
-        lambda: queue, lambda: service, worker_id="test-worker"
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
     )
 
     assert queue.recover.await_count == 2
@@ -188,44 +182,38 @@ async def test_target_identification_worker_recovers_claims_and_survives_iterati
 
 
 @pytest.mark.asyncio
-async def test_identification_worker_starts_no_new_unit_while_scan_is_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_identification_worker_starts_no_new_unit_while_scan_is_active() -> None:
     queue = AsyncMock()
     queue.is_paused.return_value = False
-    queue.claim.return_value = {"id": "job-1"}
+    queue.claim.side_effect = [{"id": "job-1"}, None]
     service = AsyncMock()
     gate = BackgroundWorkloadGate()
     gate.set_scan_active(True)
-    sleeps = 0
+    wakeups = SimpleNamespace(revision=lambda _kind: 0, wait=AsyncMock())
 
-    async def release_then_stop(_seconds: float) -> None:
-        nonlocal sleeps
-        sleeps += 1
-        if sleeps == 1:
+    async def release_then_stop(*_args, **_kwargs) -> None:
+        if gate.scan_active:
             gate.set_scan_active(False)
         else:
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(
-        "services.native.target_application_runtime.asyncio.sleep", release_then_stop
-    )
+    wakeups.wait.side_effect = release_then_stop
 
     await run_target_identification_worker(
         lambda: queue,
         lambda: service,
         worker_id="test-worker",
         workload_gate=gate,
+        work_wakeups=wakeups,
     )
 
-    queue.claim.assert_awaited_once_with("test-worker")
+    assert queue.claim.await_count == 2
+    queue.claim.assert_any_await("test-worker")
     service.run_claimed_job.assert_awaited_once_with({"id": "job-1"}, "test-worker")
 
 
 @pytest.mark.asyncio
-async def test_identification_worker_rechecks_gate_immediately_before_claim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_identification_worker_rechecks_gate_immediately_before_claim() -> None:
     queue = AsyncMock()
     gate = BackgroundWorkloadGate()
 
@@ -236,11 +224,9 @@ async def test_identification_worker_rechecks_gate_immediately_before_claim(
     queue.is_paused.side_effect = activate_scan
     service = AsyncMock()
 
-    async def stop(_seconds: float) -> None:
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "services.native.target_application_runtime.asyncio.sleep", stop
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
     )
 
     await run_target_identification_worker(
@@ -248,6 +234,7 @@ async def test_identification_worker_rechecks_gate_immediately_before_claim(
         lambda: service,
         worker_id="test-worker",
         workload_gate=gate,
+        work_wakeups=wakeups,
     )
 
     queue.claim.assert_not_awaited()
@@ -255,32 +242,64 @@ async def test_identification_worker_rechecks_gate_immediately_before_claim(
 
 
 @pytest.mark.asyncio
-async def test_target_operation_worker_recovers_and_dispatches_each_iteration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_target_operation_worker_recovers_and_dispatches_each_iteration() -> None:
     supervisor = AsyncMock()
-    sleeps = 0
-
-    async def stop_after_two(_seconds: float) -> None:
-        nonlocal sleeps
-        sleeps += 1
-        if sleeps == 2:
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "services.native.target_application_runtime.asyncio.sleep", stop_after_two
+    recovery = AsyncMock()
+    supervisor.run_once.side_effect = [{"id": "job-1"}, None]
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
     )
-    await run_target_operation_worker(lambda: supervisor, worker_id="test-worker")
+    await run_target_operation_worker(
+        lambda: supervisor,
+        lambda: recovery,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+    )
 
     assert supervisor.recover.await_count == 2
+    assert recovery.recover_once.await_count == 2
     assert supervisor.run_once.await_count == 2
     supervisor.run_once.assert_awaited_with("test-worker")
 
 
 @pytest.mark.asyncio
-async def test_contribution_verification_worker_refreshes_provider_each_iteration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_operation_worker_does_not_reclaim_repairs_during_scan() -> None:
+    store = AsyncMock()
+    store.claim_operation_job.return_value = None
+    operations = AsyncMock()
+    operations.recover.return_value = 0
+    gate = BackgroundWorkloadGate()
+    gate.set_scan_active(True)
+    supervisor = LibraryOperationSupervisor(
+        store,
+        operations,
+        AsyncMock(),
+        AsyncMock(),
+        workload_gate=gate,
+    )
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+    await run_target_operation_worker(
+        lambda: supervisor,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+    )
+
+    store.claim_operation_job.assert_awaited_once()
+    assert store.claim_operation_job.await_args.args == ("test-worker",)
+    assert store.claim_operation_job.await_args.kwargs["lease_seconds"] == 60.0
+    assert store.claim_operation_job.await_args.kwargs["kind"] == "bulk_review_apply"
+    wakeups.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_contribution_verification_worker_refreshes_provider_each_iteration() -> (
+    None
+):
     workers = [AsyncMock(), AsyncMock()]
     calls = 0
 
@@ -290,20 +309,124 @@ async def test_contribution_verification_worker_refreshes_provider_each_iteratio
         calls += 1
         return worker
 
-    async def stop_after_two(_seconds: float) -> None:
-        if calls == 2:
-            raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        "services.native.target_application_runtime.asyncio.sleep", stop_after_two
+    workers[0].run_once.return_value = "contribution-1"
+    workers[1].run_once.return_value = None
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
     )
-    await run_library_contribution_verification_worker(getter, worker_id="test-worker")
+    await run_library_contribution_verification_worker(
+        getter, worker_id="test-worker", work_wakeups=wakeups
+    )
 
     assert calls == 2
     workers[0].recover.assert_awaited_once()
     workers[0].run_once.assert_awaited_once_with("test-worker")
     workers[1].recover.assert_awaited_once()
     workers[1].run_once.assert_awaited_once_with("test-worker")
+
+
+@pytest.mark.asyncio
+async def test_identification_enqueue_wakes_an_empty_worker_with_subsecond_dispatch() -> (
+    None
+):
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.side_effect = [None, {"id": "job-1"}, None]
+    service = AsyncMock()
+    dispatched = asyncio.Event()
+    service.run_claimed_job.side_effect = lambda *_args: dispatched.set()
+    wakeups = DurableWorkWakeups()
+    task = asyncio.create_task(
+        run_target_identification_worker(
+            lambda: queue,
+            lambda: service,
+            worker_id="test-worker",
+            work_wakeups=wakeups,
+        )
+    )
+    while queue.claim.await_count == 0:
+        await asyncio.sleep(0)
+
+    started = time.monotonic()
+    wakeups.notify("identification")
+    await asyncio.wait_for(dispatched.wait(), timeout=0.25)
+    elapsed = time.monotonic() - started
+
+    task.cancel()
+    await task
+    assert elapsed < 0.25
+    service.run_claimed_job.assert_awaited_once_with({"id": "job-1"}, "test-worker")
+
+
+@pytest.mark.asyncio
+async def test_empty_worker_recovers_ready_work_after_a_missed_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "services.native.target_application_runtime.IDENTIFICATION_RECOVERY_INTERVAL_SECONDS",
+        0.001,
+    )
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.side_effect = [None, {"id": "job-1"}, None]
+    service = AsyncMock()
+    dispatched = asyncio.Event()
+    service.run_claimed_job.side_effect = lambda *_args: dispatched.set()
+    task = asyncio.create_task(
+        run_target_identification_worker(
+            lambda: queue,
+            lambda: service,
+            worker_id="test-worker",
+            work_wakeups=DurableWorkWakeups(),
+        )
+    )
+
+    await asyncio.wait_for(dispatched.wait(), timeout=0.1)
+
+    task.cancel()
+    await task
+    assert queue.recover.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_identification_worker_never_overlaps_claimed_jobs() -> None:
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.side_effect = [{"id": "job-1"}, {"id": "job-2"}, None]
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_finished = asyncio.Event()
+
+    async def run_claimed(job: dict, _owner: str) -> None:
+        if job["id"] == "job-1":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_finished.set()
+
+    service = AsyncMock()
+    service.run_claimed_job.side_effect = run_claimed
+    wakeups = DurableWorkWakeups()
+    task = asyncio.create_task(
+        run_target_identification_worker(
+            lambda: queue,
+            lambda: service,
+            worker_id="test-worker",
+            work_wakeups=wakeups,
+        )
+    )
+    await first_started.wait()
+
+    wakeups.notify("identification")
+    await asyncio.sleep(0)
+    assert queue.claim.await_count == 1
+
+    release_first.set()
+    await asyncio.wait_for(second_finished.wait(), timeout=0.1)
+    task.cancel()
+    await task
+    assert service.run_claimed_job.await_count == 2
 
 
 @pytest.mark.asyncio

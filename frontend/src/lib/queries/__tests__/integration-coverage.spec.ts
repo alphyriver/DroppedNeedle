@@ -33,8 +33,19 @@ const COVERAGE: Array<[string, string, string]> = [
 	['download detail', API.downloads.get('T1'), '/api/v1/downloads/T1'],
 	['download stream', API.downloads.stream('T1'), '/api/v1/downloads/T1/stream'],
 	['download cancel', API.downloads.cancel('T1'), '/api/v1/downloads/T1/cancel'],
+	['download next source', API.downloads.nextSource('T1'), '/api/v1/downloads/T1/next-source'],
 	['download retry', API.downloads.retry('T1'), '/api/v1/downloads/T1/retry'],
 	['download reimport', API.downloads.reimport('T1'), '/api/v1/downloads/T1/reimport'],
+	[
+		'management hold retry',
+		API.downloads.heldManagementRetry('T1'),
+		'/api/v1/downloads/held/management/T1/retry'
+	],
+	[
+		'management hold discard',
+		API.downloads.heldManagementDiscard('T1'),
+		'/api/v1/downloads/held/management/T1/discard'
+	],
 	// search (user-scoped)
 	['search album', API.downloads.searchAlbum(), '/api/v1/downloads/search/album'],
 	['search job', API.downloads.searchJob('J1'), '/api/v1/downloads/search/J1'],
@@ -60,16 +71,72 @@ const COVERAGE: Array<[string, string, string]> = [
 	[
 		'library artists',
 		API.library.artists(),
-		'/api/v1/library/artists?limit=50&offset=0&sort_by=name&sort_order=asc'
+		'/api/v1/library/artists?limit=50&offset=0&sort_by=name&sort_order=asc&scope=album'
 	],
 	['library stats', API.library.stats(), '/api/v1/library/stats'],
 	['library provider IDs', API.library.mbids(), '/api/v1/library/mbids'],
 	['library membership', API.library.membership(), '/api/v1/library/membership'],
+	['local track lyrics', API.local.lyrics('T1'), '/api/v1/local/tracks/T1/lyrics'],
 	['recently added albums', API.library.recentlyAdded(), '/api/v1/library/recently-added?limit=20'],
 	['local album detail', API.library.albumDetail('A1'), '/api/v1/library/albums/A1'],
+	[
+		'MusicBrainz edition search',
+		API.library.reidentificationReleases('A1', 'Album', 'Artist'),
+		'/api/v1/library/albums/A1/reidentification/releases?title=Album&artist=Artist&limit=12&offset=0'
+	],
+	[
+		're-enable album management',
+		API.library.reenableAlbumManagement('A1'),
+		'/api/v1/library/albums/A1/management/re-enable'
+	],
+	[
+		'edition conversion preflight',
+		API.library.editionConversionPreflight('A1'),
+		'/api/v1/library/albums/A1/edition-conversions/preflight'
+	],
+	[
+		'edition conversion status',
+		API.library.editionConversion('J1'),
+		'/api/v1/library/edition-conversions/J1'
+	],
+	[
+		'create edition conversion preview',
+		API.library.editionConversionPreview('J1'),
+		'/api/v1/library/edition-conversions/J1/preview'
+	],
+	[
+		'start edition conversion',
+		API.library.editionConversionStart('J1'),
+		'/api/v1/library/edition-conversions/J1/start'
+	],
+	[
+		'retry edition conversion',
+		API.library.editionConversionRetry('J1'),
+		'/api/v1/library/edition-conversions/J1/retry'
+	],
+	[
+		'recheck edition conversion',
+		API.library.editionConversionRecheck('J1'),
+		'/api/v1/library/edition-conversions/J1/recheck'
+	],
+	[
+		'cancel edition conversion',
+		API.library.editionConversionCancel('J1'),
+		'/api/v1/library/edition-conversions/J1/cancel'
+	],
+	[
+		'exact MusicBrainz release artwork',
+		API.library.exactReleaseArtwork('R1'),
+		'/api/v1/covers/release/R1?size=250'
+	],
 	['local album copies', API.library.albumCopies('A1'), '/api/v1/library/albums/A1/copies'],
 	['local artist detail', API.library.artistDetail('R1'), '/api/v1/library/artists/R1'],
 	['local artist albums', API.library.artistAlbums('R1'), '/api/v1/library/artists/R1/albums'],
+	[
+		'local artist appearances',
+		API.library.artistAppearances('R1'),
+		'/api/v1/library/artists/R1/appearances?limit=20&offset=0'
+	],
 	['album status', API.library.album('M1'), '/api/v1/library/albums/M1/status'],
 	['album tracks', API.library.albumTracks('M1'), '/api/v1/library/albums/M1/tracks'],
 	[
@@ -145,8 +212,17 @@ const COVERAGE: Array<[string, string, string]> = [
 	['resolve local tracks', API.library.resolveTracks(), '/api/v1/library/resolve-tracks'],
 	// library admin (tags + scan control)
 	['track tags', API.library.trackTags('F1'), '/api/v1/library/tracks/F1/tags'],
-	['update track tags', API.library.updateTrackTags('F1'), '/api/v1/library/tracks/F1'],
 	['remove library track', API.library.removeTrack('F1'), '/api/v1/library/tracks/F1'],
+	[
+		'library management tag editor',
+		API.libraryManagement.tagEditor('F1'),
+		'/api/v1/library/management/tracks/F1/tag-editor'
+	],
+	[
+		'library management tag edit previews',
+		API.libraryManagement.tagEditPreviews(),
+		'/api/v1/library/management/tag-edit-previews'
+	],
 	['remove library album', API.library.removeAlbum('M1'), '/api/v1/library/album/M1'],
 	['rescan album', API.library.rescanAlbum('M1'), '/api/v1/library/albums/M1/rescan'],
 	['scan cancel', API.library.scanCancel(), '/api/v1/library/scan/cancel'],
@@ -156,6 +232,161 @@ const COVERAGE: Array<[string, string, string]> = [
 		'library operations stream',
 		API.library.operationsStream(),
 		'/api/v1/library/operations/stream'
+	],
+	[
+		'library management settings',
+		API.libraryManagement.settings(),
+		'/api/v1/settings/library-management'
+	],
+	[
+		'update library management settings',
+		API.libraryManagement.settings(),
+		'/api/v1/settings/library-management'
+	],
+	[
+		'library management settings impact',
+		API.libraryManagement.impact(),
+		'/api/v1/settings/library-management/impact'
+	],
+	[
+		'validate library management settings',
+		API.libraryManagement.validate(),
+		'/api/v1/settings/library-management/validate'
+	],
+	[
+		'create library management profile',
+		API.libraryManagement.profiles(),
+		'/api/v1/settings/library-management/profiles'
+	],
+	[
+		'library management profile',
+		API.libraryManagement.profile('P1'),
+		'/api/v1/settings/library-management/profiles/P1'
+	],
+	[
+		'update library management profile',
+		API.libraryManagement.profile('P1'),
+		'/api/v1/settings/library-management/profiles/P1'
+	],
+	[
+		'delete library management profile',
+		API.libraryManagement.profile('P1'),
+		'/api/v1/settings/library-management/profiles/P1'
+	],
+	[
+		'copy library management profile',
+		API.libraryManagement.copyProfile('P1'),
+		'/api/v1/settings/library-management/profiles/P1/copy'
+	],
+	[
+		'export library management profile',
+		API.libraryManagement.exportProfile('P1'),
+		'/api/v1/settings/library-management/profiles/P1/export'
+	],
+	[
+		'preview library management profile import',
+		API.libraryManagement.profileImportPreview(),
+		'/api/v1/settings/library-management/profile-imports/preview'
+	],
+	[
+		'import library management profile',
+		API.libraryManagement.profileImports(),
+		'/api/v1/settings/library-management/profile-imports'
+	],
+	[
+		'library management profile preset diff',
+		API.libraryManagement.profilePresetDiff('P1'),
+		'/api/v1/settings/library-management/profiles/P1/preset-diff'
+	],
+	[
+		'create library management activation preview',
+		API.libraryManagement.activationPreviews(),
+		'/api/v1/settings/library-management/activation-previews'
+	],
+	[
+		'library management activation preview status',
+		API.libraryManagement.activationPreview('J1'),
+		'/api/v1/settings/library-management/activation-previews/J1'
+	],
+	[
+		'confirm library management activation',
+		API.libraryManagement.activationConfirmations(),
+		'/api/v1/settings/library-management/activation-confirmations'
+	],
+	[
+		'create library management preview',
+		API.libraryManagement.previews(),
+		'/api/v1/library/management/previews'
+	],
+	[
+		'create library management baseline restore preview',
+		API.libraryManagement.baselineRestorePreviews(),
+		'/api/v1/library/management/baselines/restore-previews'
+	],
+	[
+		'create library management duplicate resolution preview',
+		API.libraryManagement.duplicateResolutionPreviews(),
+		'/api/v1/library/management/duplicate-resolution-previews'
+	],
+	[
+		'preview library management baseline purge impact',
+		API.libraryManagement.baselinePurgeImpact(),
+		'/api/v1/library/management/baselines/purge-impact'
+	],
+	[
+		'purge library management baselines',
+		API.libraryManagement.purgeBaselines(),
+		'/api/v1/library/management/baselines/purge'
+	],
+	[
+		'library management preview detail',
+		API.libraryManagement.preview('J1'),
+		'/api/v1/library/management/previews/J1'
+	],
+	[
+		'library management preview items',
+		API.libraryManagement.previewItems('J1'),
+		'/api/v1/library/management/previews/J1/items'
+	],
+	[
+		'library management preview artwork',
+		API.libraryManagement.previewArtwork('J1', 2, 'abc123'),
+		'/api/v1/library/management/previews/J1/items/2/artwork/abc123'
+	],
+	[
+		'apply library management preview',
+		API.libraryManagement.applyPreview('J1'),
+		'/api/v1/library/management/previews/J1/apply'
+	],
+	[
+		'discard library management preview',
+		API.libraryManagement.discardPreview('J1'),
+		'/api/v1/library/management/previews/J1/discard'
+	],
+	[
+		'library management operation history',
+		API.libraryManagement.operations(),
+		'/api/v1/library/management/operations'
+	],
+	[
+		'library management operation detail',
+		API.libraryManagement.operation('J1'),
+		'/api/v1/library/management/operations/J1'
+	],
+	[
+		'library management undo preview creation',
+		API.libraryManagement.undoPreview('J1'),
+		'/api/v1/library/management/operations/J1/undo-preview'
+	],
+	[
+		'library management operation results',
+		API.libraryManagement.operationResults('J1'),
+		'/api/v1/library/management/operations/J1/results'
+	],
+	[
+		'library management recovery diagnostics',
+		API.libraryManagement.recoveryDiagnostics(),
+		'/api/v1/library/management/recovery/diagnostics'
 	],
 	[
 		'pause identification',
@@ -240,6 +471,26 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/library/artists/merge-preview'
 	],
 	['merge artists', API.library.mergeArtists(), '/api/v1/library/artists/merge'],
+	[
+		'artist reconciliation progress',
+		API.library.artistReconciliation(),
+		'/api/v1/library/artists/reconciliation'
+	],
+	[
+		'artist duplicate groups',
+		API.library.artistDuplicateGroups(),
+		'/api/v1/library/artists/duplicate-groups'
+	],
+	[
+		'artist duplicate group',
+		API.library.artistDuplicateGroup('G1'),
+		'/api/v1/library/artists/duplicate-groups/G1'
+	],
+	[
+		'dismiss artist duplicate group',
+		API.library.dismissArtistDuplicateGroup('G1'),
+		'/api/v1/library/artists/duplicate-groups/G1/dismiss'
+	],
 	['identity repairs', API.library.identityRepairs(), '/api/v1/library/identity-repairs'],
 	[
 		'identity repair estimate',
@@ -273,6 +524,36 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/library/identity-repairs/J1/stop'
 	],
 	[
+		'identity preparations',
+		API.library.identityPreparations(),
+		'/api/v1/library/management/identity-preparations'
+	],
+	[
+		'identity preparation estimate',
+		API.library.identityPreparationEstimate([]),
+		'/api/v1/library/management/identity-preparations/estimate'
+	],
+	[
+		'identity preparation',
+		API.library.identityPreparation('J1'),
+		'/api/v1/library/management/identity-preparations/J1'
+	],
+	[
+		'identity preparation findings',
+		API.library.identityPreparationFindings('J1'),
+		'/api/v1/library/management/identity-preparations/J1/findings'
+	],
+	[
+		'apply identity preparation',
+		API.library.applyIdentityPreparation('J1'),
+		'/api/v1/library/management/identity-preparations/J1/apply'
+	],
+	[
+		'discard identity preparation',
+		API.library.discardIdentityPreparation('J1'),
+		'/api/v1/library/management/identity-preparations/J1/discard'
+	],
+	[
 		'scan diagnostics',
 		API.library.scanDiagnostics('R1'),
 		'/api/v1/library/scan-runs/R1/diagnostics'
@@ -288,6 +569,12 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/settings/library/policy-apply-preview'
 	],
 	['library path mapping', API.library.pathMapping(), '/api/v1/settings/library/path-mapping'],
+	[
+		'library restorable roots',
+		API.library.restorableRoots(),
+		'/api/v1/settings/library/restorable-roots'
+	],
+	['library restore roots', API.library.restoreRoots(), '/api/v1/settings/library/restore-roots'],
 	[
 		'resolve unmatched',
 		API.library.resolveUnmatched(1),
@@ -399,6 +686,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/requests/personal-mix-approvals'
 	],
 	[
+		'pending approval count',
+		API.requests.pendingApprovalCount(),
+		'/api/v1/requests/pending-approvals/count'
+	],
+	[
 		'personal mix approve',
 		API.requests.approvePersonalMix('U1'),
 		'/api/v1/requests/personal-mix-approvals/U1/approve'
@@ -491,6 +783,11 @@ const COVERAGE: Array<[string, string, string]> = [
 // Routes whose builder takes query params - assert the path prefix only.
 const PREFIX_COVERAGE: Array<[string, string, string]> = [
 	['downloads list', API.downloads.list(), '/api/v1/downloads'],
+	[
+		'downloads activity summary',
+		API.downloads.activitySummary(),
+		'/api/v1/downloads/activity-summary'
+	],
 	['search stream', API.downloads.searchStream('J1'), '/api/v1/downloads/search/stream'],
 	['library albums', API.library.albums(), '/api/v1/library/albums'],
 	['library artists', API.library.artists(), '/api/v1/library/artists'],
@@ -504,6 +801,45 @@ describe('native engine: backend routes have a frontend API surface', () => {
 
 	it.each(PREFIX_COVERAGE)('%s -> starts with %s', (_label, actual, expectedPrefix) => {
 		expect(actual.startsWith(expectedPrefix)).toBe(true);
+	});
+
+	it('encodes the bounded management preview cursor and filters', () => {
+		expect(
+			API.libraryManagement.previewItems('job/1', {
+				afterOrdinal: 9,
+				limit: 25,
+				eligibility: 'warning',
+				reasonCode: 'OPTIONAL ENRICHMENT',
+				rootId: 'root/1',
+				artistId: 'artist/1',
+				albumId: 'album/1',
+				audioFormat: 'flac',
+				collisionClass: 'normalized_path_collision',
+				hasPreservedValue: true,
+				hasRepresentationLoss: true,
+				changeKind: 'tags'
+			})
+		).toBe(
+			'/api/v1/library/management/previews/job%2F1/items?after_ordinal=9&limit=25&eligibility=warning&reason_code=OPTIONAL+ENRICHMENT&root_id=root%2F1&artist_id=artist%2F1&album_id=album%2F1&audio_format=flac&collision_class=normalized_path_collision&has_preserved_value=true&has_representation_loss=true&change_kind=tags'
+		);
+	});
+
+	it('encodes management history filters and opaque cursors', () => {
+		expect(
+			API.libraryManagement.operations({
+				limit: 20,
+				cursor: 'opaque cursor',
+				origin: 'manual',
+				profileId: 'profile/1',
+				rootId: 'root/1',
+				state: 'succeeded',
+				mode: 'duplicate_resolution',
+				createdFrom: 10,
+				createdTo: 20
+			})
+		).toBe(
+			'/api/v1/library/management/operations?limit=20&cursor=opaque+cursor&origin=manual&profile_id=profile%2F1&root_id=root%2F1&state=succeeded&mode=duplicate_resolution&created_from=10&created_to=20'
+		);
 	});
 
 	it('exposes a builder for every native endpoint group', () => {

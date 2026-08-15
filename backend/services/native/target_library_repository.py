@@ -134,6 +134,18 @@ class TargetLibraryRepository:
     async def get_artist_mbids(self) -> set[str]:
         return await self._store.target_provider_artist_ids()
 
+    async def get_artist_mbid_page(self, *, after_mbid: str, limit: int) -> list[str]:
+        """Keyset page over artist MBIDs, ordered case-insensitively.
+
+        Mirrors ``LibraryDB.get_artist_mbid_page`` so background tasks that page the
+        library work against either repository.
+        """
+        cursor = after_mbid.casefold()
+        mbids = sorted(
+            value.casefold() for value in await self.get_artist_mbids() if value
+        )
+        return [mbid for mbid in mbids if mbid > cursor][: max(1, limit)]
+
     async def existing_album_mbids(self, identifiers: list[str]) -> set[str]:
         normalized = {
             value.strip().casefold() for value in identifiers if value.strip()

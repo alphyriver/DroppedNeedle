@@ -4,39 +4,7 @@
 	import { onMount } from 'svelte';
 	import { fromStore } from 'svelte/store';
 	import { integrationStore } from '$lib/stores/integration';
-	import SettingsPreferences from '$lib/components/settings/SettingsPreferences.svelte';
-	import SettingsCache from '$lib/components/settings/SettingsCache.svelte';
-	import SettingsLibrary from '$lib/components/settings/SettingsLibrary.svelte';
-	import SettingsJellyfin from '$lib/components/settings/SettingsJellyfin.svelte';
-	import SettingsNavidrome from '$lib/components/settings/SettingsNavidrome.svelte';
-	import SettingsPlex from '$lib/components/settings/SettingsPlex.svelte';
-	import SettingsYouTube from '$lib/components/settings/SettingsYouTube.svelte';
-	import SettingsLastFmApp from '$lib/components/settings/SettingsLastFmApp.svelte';
-	import SettingsMusicSource from '$lib/components/settings/SettingsMusicSource.svelte';
-	import SettingsAdvanced from '$lib/components/settings/SettingsAdvanced.svelte';
-	import SettingsMusicBrainz from '$lib/components/settings/SettingsMusicBrainz.svelte';
-	import SettingsAbout from '$lib/components/settings/SettingsAbout.svelte';
-	import SettingsHome from '$lib/components/settings/SettingsHome.svelte';
-	import SettingsDiscover from '$lib/components/settings/SettingsDiscover.svelte';
-	import SettingsSidebar from '$lib/components/settings/SettingsSidebar.svelte';
-	import SettingsUsers from '$lib/components/settings/SettingsUsers.svelte';
-	import SettingsSecurity from '$lib/components/settings/SettingsSecurity.svelte';
-	import SettingsDownloadClient from '$lib/components/settings/SettingsDownloadClient.svelte';
-	import SettingsQbittorrent from '$lib/components/settings/SettingsQbittorrent.svelte';
-	import SettingsSabnzbd from '$lib/components/settings/SettingsSabnzbd.svelte';
-	import SettingsSourcePriority from '$lib/components/settings/SettingsSourcePriority.svelte';
-	import SettingsDownloadPolicy from '$lib/components/settings/SettingsDownloadPolicy.svelte';
-	import SettingsWanted from '$lib/components/settings/SettingsWanted.svelte';
-	import SettingsIndexers from '$lib/components/settings/SettingsIndexers.svelte';
-	import SettingsLidarrImport from '$lib/components/settings/SettingsLidarrImport.svelte';
-	import SettingsConnectApps from '$lib/components/settings/SettingsConnectApps.svelte';
-	import SettingsOnboardingChecklist from '$lib/components/settings/SettingsOnboardingChecklist.svelte';
-	import SettingsSpotify from '$lib/components/settings/SettingsSpotify.svelte';
-	import SettingsEvents from '$lib/components/settings/SettingsEvents.svelte';
-	import SettingsFreeMusic from '$lib/components/settings/SettingsFreeMusic.svelte';
-	import SettingsGetIt from '$lib/components/settings/SettingsGetIt.svelte';
-	import SettingsPlugins from '$lib/components/settings/SettingsPlugins.svelte';
-	import SettingsWrapped from '$lib/components/settings/SettingsWrapped.svelte';
+	import SettingsTabContent from '$lib/components/settings/SettingsTabContent.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getUpdateCheckQuery } from '$lib/queries/VersionQuery.svelte';
 	import {
@@ -85,7 +53,6 @@
 		youtube: 'youtube'
 	};
 
-	let activeTab = $state('library');
 	let filter = $state('');
 
 	const tiers = [
@@ -142,6 +109,10 @@
 		{ id: 'advanced', label: 'Advanced', tier: 'system', icon: Settings },
 		{ id: 'about', label: 'About', tier: 'system', icon: Info }
 	];
+	const requestedTab = page.url.searchParams.get('tab');
+	let activeTab = $state(
+		requestedTab && tabs.some((tab) => tab.id === requestedTab) ? requestedTab : 'library'
+	);
 
 	const normalizedFilter = $derived(filter.trim().toLowerCase());
 	function tabsForTier(tier: string) {
@@ -270,76 +241,7 @@
 			</aside>
 
 			<main class="flex-1 min-w-0 lg:min-h-0 lg:overflow-y-auto lg:pb-4">
-				{#if activeTab === 'settings'}
-					<SettingsPreferences />
-				{:else if activeTab === 'home'}
-					<SettingsHome />
-				{:else if activeTab === 'discover'}
-					<SettingsDiscover />
-				{:else if activeTab === 'sidebar'}
-					<SettingsSidebar />
-				{:else if activeTab === 'music-source'}
-					<SettingsMusicSource />
-				{:else if activeTab === 'cache'}
-					<SettingsCache />
-				{:else if activeTab === 'library'}
-					<SettingsLibrary />
-				{:else if activeTab === 'connect-apps'}
-					<SettingsConnectApps />
-				{:else if activeTab === 'download-client' && authStore.isAdmin}
-					<div class="space-y-6">
-						<div>
-							<h2 class="text-xl font-bold">Download clients</h2>
-							<p class="text-sm text-base-content/60">
-								Soulseek and Usenet are two ways to acquire music. Configure either or both, set
-								which is tried first, and tune the shared policy.
-							</p>
-						</div>
-						<SettingsDownloadPolicy />
-						<SettingsWanted />
-						<SettingsSourcePriority />
-						<SettingsDownloadClient />
-						<SettingsSabnzbd />
-						<SettingsQbittorrent />
-						<SettingsOnboardingChecklist />
-					</div>
-				{:else if activeTab === 'indexers' && authStore.isAdmin}
-					<SettingsIndexers />
-				{:else if activeTab === 'lidarr-import' && authStore.isAdmin}
-					<SettingsLidarrImport />
-				{:else if activeTab === 'jellyfin'}
-					<SettingsJellyfin />
-				{:else if activeTab === 'navidrome'}
-					<SettingsNavidrome />
-				{:else if activeTab === 'plex'}
-					<SettingsPlex />
-				{:else if activeTab === 'youtube'}
-					<SettingsYouTube />
-				{:else if activeTab === 'lastfm' && authStore.isAdmin}
-					<SettingsLastFmApp />
-				{:else if activeTab === 'spotify' && authStore.isAdmin}
-					<SettingsSpotify />
-				{:else if activeTab === 'events' && authStore.isAdmin}
-					<SettingsEvents />
-				{:else if activeTab === 'free-music' && authStore.isAdmin}
-					<SettingsFreeMusic />
-				{:else if activeTab === 'get-it' && authStore.isAdmin}
-					<SettingsGetIt />
-				{:else if activeTab === 'plugins' && authStore.isAdmin}
-					<SettingsPlugins />
-				{:else if activeTab === 'musicbrainz'}
-					<SettingsMusicBrainz />
-				{:else if activeTab === 'advanced'}
-					<SettingsAdvanced />
-				{:else if activeTab === 'about'}
-					<SettingsAbout />
-				{:else if activeTab === 'security' && authStore.isAdmin}
-					<SettingsSecurity />
-				{:else if activeTab === 'wrapped' && authStore.isAdmin}
-					<SettingsWrapped />
-				{:else if activeTab === 'users' && authStore.isAdmin}
-					<SettingsUsers />
-				{/if}
+				<SettingsTabContent tab={activeTab} isAdmin={authStore.isAdmin} />
 			</main>
 		</div>
 	</div>

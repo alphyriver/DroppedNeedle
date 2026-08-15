@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from pathlib import Path
 
 import msgspec
 
@@ -12,11 +13,15 @@ from api.v1.schemas.library_policies import (
     LibraryPolicyApplyRequest,
     LibraryPolicyImpactRequest,
     LibraryPolicyImpactResponse,
+    LibraryRestorableRoot,
+    LibraryRestorableRootsResponse,
+    LibraryRestoreRootsRequest,
+    LibraryRootSettings,
     LibrarySettingsResponse,
     LibraryPolicyTreeResponse,
     TypedLibrarySettings,
 )
-from core.exceptions import TargetStartupInvariantError
+from core.exceptions import TargetStartupInvariantError, ValidationError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.library_policy_reconciliation_service import (
     LibraryPolicyReconciliationService,
@@ -102,6 +107,14 @@ class TargetLibraryPolicyService:
                 settings,
                 expected_policy_revision=expected_policy_revision,
             )
+            if (
+                not proposed.settings.library_roots
+                and await self._store.catalog_has_tracks()
+            ):
+                raise ValidationError(
+                    "Removing every library root would orphan the existing catalog. "
+                    "Keep at least one root, or set its policy to Excluded instead."
+                )
             previous_pending = await self._store.get_pending_policy()
             pending_scopes = (
                 self._settings.rebase_scopes(
@@ -189,6 +202,108 @@ class TargetLibraryPolicyService:
                 ),
             ]
             return LibrarySettingsResponse(**payload)
+
+    @staticmethod
+    def _restored_root_label(path: str, used: set[str]) -> str:
+        base = Path(path).name or Path(path).anchor or "Library"
+        label = base
+        number = 2
+        while label.casefold() in used:
+            label = f"{base} ({number})"
+            number += 1
+        used.add(label.casefold())
+        return label
+
+    async def _known_root_paths(self) -> dict[str, str]:
+        # pending scopes freeze the paths from before the wipe
+        pending = await self._store.get_pending_policy()
+        if pending is None:
+            return {}
+        return {
+            str(scope.root_id): str(scope.root_path)
+            for scope in pending["pending_scopes"]
+            if scope.relative_path == "." and scope.root_path
+        }
+
+    async def _restorable_paths(
+        self, missing: list[str]
+    ) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+        return (
+            await self._known_root_paths(),
+            await self._store.get_restorable_root_paths(missing),
+        )
+
+    async def restorable_roots(self) -> LibraryRestorableRootsResponse:
+        migrated = await self._store.get_migrated_root_ids()
+        configured = {
+            root.id for root in self._settings.current_settings().library_roots
+        }
+        missing = sorted(migrated - configured)
+        known, derived = await self._restorable_paths(missing)
+        roots = []
+        for root_id in missing:
+            info = derived.get(root_id)
+            path = known.get(root_id)
+            if path is None and info is None:
+                continue
+            path = path if path is not None else str(info["path"])
+            count = int(info["indexed_file_count"]) if info is not None else 0
+            roots.append(
+                LibraryRestorableRoot(
+                    root_id=root_id,
+                    path=path,
+                    indexed_file_count=count,
+                )
+            )
+        return LibraryRestorableRootsResponse(
+            policy_revision=LibraryPolicyResolver(
+                self._settings.current_settings()
+            ).policy_revision,
+            restorable_roots=roots,
+        )
+
+    async def restore_roots(
+        self, request: LibraryRestoreRootsRequest
+    ) -> LibrarySettingsResponse:
+        current = self._settings.current_settings()
+        migrated = await self._store.get_migrated_root_ids()
+        configured = {root.id for root in current.library_roots}
+        missing = sorted(migrated - configured)
+        if not missing:
+            raise ValidationError("There are no removed library roots to restore.")
+        overrides = request.paths or {}
+        known, derived = await self._restorable_paths(missing)
+        used_labels = {root.label.casefold() for root in current.library_roots}
+        roots = list(current.library_roots)
+        for root_id in missing:
+            info = derived.get(root_id)
+            path = overrides.get(root_id) or known.get(root_id)
+            if path is None and info is None:
+                continue
+            path = path if path is not None else str(info["path"])
+            roots.append(
+                LibraryRootSettings(
+                    id=root_id,
+                    path=path,
+                    label=self._restored_root_label(path, used_labels),
+                    policy="automatic",
+                    rules=[],
+                )
+            )
+        if len(roots) == len(current.library_roots):
+            raise ValidationError(
+                "The removed library roots have no catalog files to recover "
+                "their path from."
+            )
+        return await self.save_settings(
+            TypedLibrarySettings(
+                library_roots=roots,
+                staging_path=current.staging_path,
+                naming_template=current.naming_template,
+                acoustid_api_key=current.acoustid_api_key,
+            ),
+            expected_policy_revision=request.expected_policy_revision,
+        )
 
     async def policy_tree(self) -> LibraryPolicyTreeResponse:
         tree = self._settings.policy_tree()

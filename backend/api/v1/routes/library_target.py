@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import RedirectResponse
@@ -8,12 +9,27 @@ from api.v1.schemas.library_target import (
     TargetNativeAlbumDetail,
     TargetNativeAlbumsResponse,
     TargetNativeAlbumStatusResponse,
+    ReleaseEditionResult,
+    ReleaseEditionSearchResponse,
     TargetNativeArtist,
+    TargetNativeArtistAppearancesResponse,
     TargetNativeArtistsResponse,
     TargetNativeStatsResponse,
     TargetNativeTrack,
     TargetNativeTracksResponse,
     TargetCatalogRemovalResponse,
+    ManagementReenableRequest,
+    ManagementReenableResponse,
+)
+from api.v1.schemas.edition_conversion import (
+    EditionConversionCancelRequest,
+    EditionConversionPreflightRequest,
+    EditionConversionPreviewRequest,
+    EditionConversionPreviewResponse,
+    EditionConversionRecheckRequest,
+    EditionConversionRetryRequest,
+    EditionConversionStartRequest,
+    EditionConversionStatusResponse,
 )
 from api.v1.schemas.library import (
     LibraryMbidsResponse,
@@ -21,7 +37,6 @@ from api.v1.schemas.library import (
     LibraryMembershipResponse,
     TrackResolveRequest,
     TrackResolveResponse,
-    TrackTagUpdateRequest,
 )
 from api.v1.schemas.library_scan_target import LegacyScanShimResponse
 from core.exceptions import ResourceNotFoundError, ValidationError
@@ -33,6 +48,8 @@ from core.dependencies.type_aliases import (
     TargetLibraryScanCoordinatorDep,
     TargetLibraryOwnershipServiceDep,
     TargetNativeLibraryServiceDep,
+    EditionConversionServiceDep,
+    TargetAlbumEditionFinderServiceDep,
     CachedLocalArtworkServiceDep,
     WantedWatcherServiceDep,
 )
@@ -89,18 +106,29 @@ async def get_target_artists(
     sort_by: str = "name",
     sort_order: str = "asc",
     q: str | None = None,
+    scope: str = "album",
 ) -> TargetNativeArtistsResponse:
     normalized_sort = (
-        sort_by if sort_by in {"name", "album_count", "date_added"} else "name"
+        sort_by
+        if sort_by in {"name", "album_count", "appearance_count", "date_added"}
+        else "name"
     )
+    normalized_scope = scope if scope in {"album", "contributors"} else "album"
     items, total = await service.artists(
         limit=max(1, min(limit, 100)),
         offset=max(0, offset),
         search=(q or "").strip() or None,
         sort_by=normalized_sort,
         sort_order="desc" if sort_order == "desc" else "asc",
+        scope=normalized_scope,
     )
-    return TargetNativeArtistsResponse(items=items, total=total)
+    album_artist_total, contributor_total = await service.artist_scope_counts()
+    return TargetNativeArtistsResponse(
+        items=items,
+        total=total,
+        album_artist_total=album_artist_total,
+        contributor_total=contributor_total,
+    )
 
 
 @router.get("/albums", response_model=TargetNativeAlbumsResponse)
@@ -253,6 +281,40 @@ async def get_target_artist_albums(
 
 
 @router.get(
+    "/artists/{artist_id}/appearances",
+    response_model=TargetNativeArtistAppearancesResponse,
+    name="target_artist_appearances",
+)
+async def get_target_artist_appearances(
+    request: Request,
+    artist_id: str,
+    _user: CurrentUserDep,
+    service: TargetNativeLibraryServiceDep,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> TargetNativeArtistAppearancesResponse | RedirectResponse:
+    canonical = await service.canonical_id("artist", artist_id)
+    if canonical is not None and canonical != artist_id:
+        target = request.url_for(
+            "target_artist_appearances", artist_id=canonical
+        ).include_query_params(limit=limit, offset=offset)
+        return RedirectResponse(
+            target,
+            status_code=308,
+        )
+    items, total, total_tracks = await service.artist_appearances(
+        artist_id, limit=limit, offset=offset
+    )
+    return TargetNativeArtistAppearancesResponse(
+        items=items,
+        total=total,
+        total_tracks=total_tracks,
+        offset=offset,
+        limit=limit,
+    )
+
+
+@router.get(
     "/albums/{album_id}",
     response_model=TargetNativeAlbumDetail,
     name="target_album_detail",
@@ -273,6 +335,189 @@ async def get_target_album(
     if album is None:
         raise ResourceNotFoundError("Library album not found.")
     return album
+
+
+@router.post(
+    "/albums/{album_id}/management/re-enable",
+    response_model=ManagementReenableResponse,
+)
+async def reenable_target_album_management(
+    album_id: str,
+    admin: CurrentAdminDep,
+    service: TargetNativeLibraryServiceDep,
+    body: ManagementReenableRequest = MsgSpecBody(ManagementReenableRequest),
+) -> ManagementReenableResponse:
+    reenabled = await service.reenable_album_management(
+        album_id,
+        expected_exclusion_revision=body.expected_exclusion_revision,
+        actor_user_id=admin.id,
+        now=time.time(),
+    )
+    return ManagementReenableResponse(reenabled=reenabled)
+
+
+@router.post(
+    "/albums/{album_id}/edition-conversions/preflight",
+    response_model=EditionConversionStatusResponse,
+)
+async def create_edition_conversion_preflight(
+    album_id: str,
+    admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+    body: EditionConversionPreflightRequest = MsgSpecBody(
+        EditionConversionPreflightRequest
+    ),
+) -> EditionConversionStatusResponse:
+    return await service.create_preflight(
+        local_album_id=album_id,
+        release_group_mbid=body.release_group_mbid,
+        release_mbid=body.release_mbid,
+        actor_user_id=admin.id,
+    )
+
+
+@router.post(
+    "/edition-conversions/{job_id}/start",
+    response_model=EditionConversionStatusResponse,
+)
+async def start_edition_conversion(
+    job_id: str,
+    _admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+    body: EditionConversionStartRequest = MsgSpecBody(EditionConversionStartRequest),
+) -> EditionConversionStatusResponse:
+    return await service.start(
+        job_id,
+        preflight_token=body.preflight_token,
+        expected_row_revision=body.expected_row_revision,
+        confirmation=body.confirmation,
+    )
+
+
+@router.get(
+    "/edition-conversions/{job_id}",
+    response_model=EditionConversionStatusResponse,
+)
+async def get_edition_conversion(
+    job_id: str,
+    _admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+) -> EditionConversionStatusResponse:
+    return await service.status(job_id)
+
+
+@router.post(
+    "/edition-conversions/{job_id}/preview",
+    response_model=EditionConversionPreviewResponse,
+)
+async def create_edition_conversion_preview(
+    job_id: str,
+    _admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+    body: EditionConversionPreviewRequest = MsgSpecBody(
+        EditionConversionPreviewRequest
+    ),
+) -> EditionConversionPreviewResponse:
+    return await service.create_final_preview(
+        job_id, expected_row_revision=body.expected_row_revision
+    )
+
+
+@router.post(
+    "/edition-conversions/{job_id}/retry",
+    response_model=EditionConversionStatusResponse,
+)
+async def retry_edition_conversion(
+    job_id: str,
+    _admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+    body: EditionConversionRetryRequest = MsgSpecBody(EditionConversionRetryRequest),
+) -> EditionConversionStatusResponse:
+    return await service.retry(
+        job_id,
+        target_ordinals=body.target_ordinals,
+        expected_row_revision=body.expected_row_revision,
+    )
+
+
+@router.post(
+    "/edition-conversions/{job_id}/recheck",
+    response_model=EditionConversionStatusResponse,
+)
+async def recheck_edition_conversion(
+    job_id: str,
+    _admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+    body: EditionConversionRecheckRequest = MsgSpecBody(
+        EditionConversionRecheckRequest
+    ),
+) -> EditionConversionStatusResponse:
+    return await service.recheck(
+        job_id, expected_row_revision=body.expected_row_revision
+    )
+
+
+@router.post(
+    "/edition-conversions/{job_id}/cancel",
+    response_model=EditionConversionStatusResponse,
+)
+async def cancel_edition_conversion(
+    job_id: str,
+    _admin: CurrentAdminDep,
+    service: EditionConversionServiceDep,
+    body: EditionConversionCancelRequest = MsgSpecBody(EditionConversionCancelRequest),
+) -> EditionConversionStatusResponse:
+    return await service.cancel(
+        job_id,
+        expected_row_revision=body.expected_row_revision,
+        confirmation=body.confirmation,
+    )
+
+
+@router.get(
+    "/albums/{album_id}/reidentification/releases",
+    response_model=ReleaseEditionSearchResponse,
+)
+async def search_reidentification_releases(
+    album_id: str,
+    _admin: CurrentAdminDep,
+    service: TargetAlbumEditionFinderServiceDep,
+    title: str = Query(min_length=1, max_length=250),
+    artist: str = Query(default="", max_length=250),
+    limit: int = Query(default=12, ge=1, le=12),
+    offset: int = Query(default=0, ge=0),
+) -> ReleaseEditionSearchResponse:
+    (
+        title_query,
+        artist_query,
+        current_release_group_mbid,
+        current_release_mbid,
+        page,
+    ) = await service.search(
+        album_id, title=title, artist=artist, limit=limit, offset=offset
+    )
+    return ReleaseEditionSearchResponse(
+        title_query=title_query,
+        artist_query=artist_query,
+        items=[
+            ReleaseEditionResult(
+                **{field: getattr(item, field) for field in item.__struct_fields__},
+                belongs_to_current_release_group=(
+                    current_release_group_mbid is not None
+                    and item.release_group_mbid.casefold()
+                    == current_release_group_mbid.casefold()
+                ),
+                is_current_release=(
+                    current_release_mbid is not None
+                    and item.release_mbid.casefold() == current_release_mbid.casefold()
+                ),
+            )
+            for item in page.items
+        ],
+        total=page.total,
+        offset=page.offset,
+        limit=page.limit,
+    )
 
 
 @router.get(
@@ -397,34 +642,6 @@ async def get_target_track_tags(
     writer: TargetCatalogWriterServiceDep,
 ) -> AudioTag:
     return await writer.read_tags(track_id)
-
-
-@router.post("/tracks/{track_id}", response_model=TargetNativeTrack)
-async def update_target_track_tags(
-    track_id: str,
-    admin: CurrentAdminDep,
-    writer: TargetCatalogWriterServiceDep,
-    body: TrackTagUpdateRequest = MsgSpecBody(TrackTagUpdateRequest),
-) -> TargetNativeTrack:
-    return await writer.update_tags(
-        track_id,
-        AudioTag(
-            title=body.title,
-            artist=body.artist,
-            album=body.album,
-            track_number=body.track_number,
-            album_artist=body.album_artist,
-            disc_number=body.disc_number,
-            year=body.year,
-            genre=body.genre,
-            musicbrainz_release_group_id=body.musicbrainz_release_group_id,
-            musicbrainz_release_id=body.musicbrainz_release_id,
-            musicbrainz_recording_id=body.musicbrainz_recording_id,
-            musicbrainz_artist_id=body.musicbrainz_artist_id,
-            musicbrainz_album_artist_id=body.musicbrainz_album_artist_id,
-        ),
-        actor_user_id=admin.id,
-    )
 
 
 @router.post(

@@ -1,5 +1,11 @@
 <script lang="ts">
-	import type { AlbumBasicInfo, AlbumTracksInfo, DownloadTask } from '$lib/types';
+	import type {
+		AlbumBasicInfo,
+		AlbumTracksInfo,
+		DownloadTask,
+		HeldImport,
+		LibraryAlbumSummary
+	} from '$lib/types';
 	import { getApiUrl } from '$lib/api/api-utils';
 	import { colors } from '$lib/colors';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
@@ -31,6 +37,7 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
+	import LocalAlbumIdentificationControl from './LocalAlbumIdentificationControl.svelte';
 
 	interface Props {
 		album: AlbumBasicInfo;
@@ -41,6 +48,7 @@
 		requesting: boolean;
 		refreshing: boolean;
 		headerDownloadTask: DownloadTask | null;
+		managementHeld?: HeldImport[];
 		downloadClientConfigured: boolean;
 
 		libraryInLibrary?: boolean;
@@ -50,6 +58,7 @@
 		coverageExpected?: number;
 		coverageCovered?: number;
 		releaseGroupMbid?: string;
+		localCopies?: LibraryAlbumSummary[];
 		onrequest: () => void;
 		ondelete: () => void;
 		onrefresh: () => void;
@@ -65,6 +74,7 @@
 		requesting,
 		refreshing,
 		headerDownloadTask,
+		managementHeld = [],
 		downloadClientConfigured,
 		libraryInLibrary = false,
 		libraryTrackCount = 0,
@@ -73,6 +83,7 @@
 		coverageExpected = 0,
 		coverageCovered = 0,
 		releaseGroupMbid = '',
+		localCopies = [],
 		onrequest,
 		ondelete,
 		onrefresh,
@@ -254,11 +265,9 @@
 	}
 
 	let backdropUrl = $derived(
-		album.cover_url ||
-			album.album_thumb_url ||
-			(album.musicbrainz_id
-				? getApiUrl(`/api/v1/covers/release-group/${album.musicbrainz_id}?size=250`)
-				: null)
+		album.musicbrainz_id
+			? getApiUrl(`/api/v1/covers/release-group/${album.musicbrainz_id}?size=500`)
+			: album.cover_url || album.album_thumb_url || null
 	);
 </script>
 
@@ -450,6 +459,34 @@
 							<RefreshCw class="h-3.5 w-3.5 {rescan.isPending ? 'animate-spin' : ''}" />
 							Rescan
 						</button>
+						{#if localCopies.length === 1}
+							<LocalAlbumIdentificationControl album={localCopies[0]} />
+						{:else if localCopies.length > 1}
+							<details class="dropdown dropdown-end">
+								<summary class="btn btn-ghost btn-xs gap-1">
+									<RefreshCw class="h-3.5 w-3.5" /> Re-identify copy...
+									<ChevronDown class="h-3.5 w-3.5" />
+								</summary>
+								<div
+									class="dropdown-content z-20 mt-2 w-72 rounded-box border border-base-content/10 bg-base-100 p-2 shadow-xl"
+								>
+									<p class="px-2 py-1 text-xs font-semibold text-base-content/55">
+										Choose a local copy
+									</p>
+									{#each localCopies as localCopy (localCopy.id)}
+										<div class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-base-200">
+											<div class="min-w-0 flex-1">
+												<p class="truncate text-sm font-medium">{localCopy.title}</p>
+												<p class="truncate text-xs text-base-content/55">
+													{localCopy.artist_name} · {localCopy.track_count} tracks
+												</p>
+											</div>
+											<LocalAlbumIdentificationControl album={localCopy} />
+										</div>
+									{/each}
+								</div>
+							</details>
+						{/if}
 					{/if}
 					{#if authStore.isTrusted && libraryBelowCutoff && downloadClientConfigured}
 						<button
@@ -489,7 +526,7 @@
 			{#if downloadClientConfigured}
 				<div class="pt-4 flex flex-col gap-3">
 					{#if headerDownloadTask}
-						<AlbumDownloadStatus task={headerDownloadTask} />
+						<AlbumDownloadStatus task={headerDownloadTask} {managementHeld} />
 					{/if}
 					<div class="flex flex-wrap items-start gap-3">
 						{#if inLibrary || libraryInLibrary}

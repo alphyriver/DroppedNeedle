@@ -1,8 +1,10 @@
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.exceptions import ResourceNotFoundError
+from core.exceptions import ExternalServiceError, ResourceNotFoundError
 from infrastructure.queue.priority_queue import RequestPriority
 from models.album import AlbumInfo
 from services.album_service import AlbumService
@@ -15,6 +17,10 @@ def _make_service() -> tuple[AlbumService, MagicMock, MagicMock]:
     memory_cache = MagicMock()
     disk_cache = MagicMock()
     preferences_service = MagicMock()
+    preferences_service.get_advanced_settings.return_value = SimpleNamespace(
+        cache_ttl_album_library=3600,
+        cache_ttl_album_non_library=600,
+    )
     audiodb_image_service = MagicMock()
     memory_cache.get = AsyncMock(return_value=None)
     memory_cache.set = AsyncMock()
@@ -250,6 +256,288 @@ async def test_get_album_tracks_info_prefers_owned_release_edition():
     assert result.total_tracks == 12
     assert len(result.tracks) == 12
     assert result.selected_release_mbid == "owned-rel"
+
+
+def _native_tracks(*, release_id: str | None = "owned-rel") -> list[dict]:
+    return [
+        {
+            "local_album_id": "local-album-1",
+            "provider_release_mbid": release_id,
+            "track_number": 1,
+            "disc_number": 1,
+            "track_title": "First",
+            "duration_seconds": 61.25,
+            "recording_mbid": "recording-1",
+            "release_track_mbid": "release-track-1",
+        },
+        {
+            "local_album_id": "local-album-1",
+            "provider_release_mbid": release_id,
+            "track_number": 2,
+            "disc_number": 2,
+            "track_title": "Second",
+            "duration_seconds": 122.5,
+            "recording_mbid": "recording-2",
+            "release_track_mbid": "release-track-2",
+        },
+    ]
+
+
+def _attach_native_store(service: AlbumService, rows: list[dict]) -> MagicMock:
+    store = MagicMock()
+    store.target_album_ownership_rows = AsyncMock(
+        return_value=[{"local_album_id": "local-album-1"}]
+    )
+    store.get_target_album_tracks = AsyncMock(return_value=rows)
+    service._native_library_store = store
+    return store
+
+
+@pytest.mark.asyncio
+async def test_owned_native_tracks_return_without_musicbrainz_lookup():
+    service, _library_repo, _library_db = _make_service()
+    store = _attach_native_store(service, _native_tracks())
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock()
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert [(track.disc_number, track.position) for track in result.tracks] == [
+        (1, 1),
+        (2, 2),
+    ]
+    assert result.total_length == 183750
+    assert result.selected_release_mbid == "owned-rel"
+    assert result.tracks[0].recording_id == "recording-1"
+    assert result.tracks[0].release_track_id == "release-track-1"
+    service._fetch_release_group.assert_not_awaited()
+    service._mb_repo.get_release_by_id.assert_not_called()
+    store.get_target_album_tracks.assert_awaited_once_with("local-album-1")
+
+
+@pytest.mark.asyncio
+async def test_unidentified_owned_tracks_return_locally_without_claiming_an_edition():
+    service, _library_repo, _library_db = _make_service()
+    _attach_native_store(service, _native_tracks(release_id=None))
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock()
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert result.total_tracks == 2
+    assert result.selected_release_mbid is None
+    service._fetch_release_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_matching_edition_pin_keeps_native_fast_path():
+    service, _library_repo, _library_db = _make_service()
+    _attach_native_store(service, _native_tracks())
+    service._release_pins = SimpleNamespace(get=AsyncMock(return_value="owned-rel"))
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock()
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert result.selected_release_mbid == "owned-rel"
+    service._fetch_release_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_different_edition_pin_fetches_only_that_selected_release():
+    service, _library_repo, _library_db = _make_service()
+    _attach_native_store(service, _native_tracks())
+    service._release_pins = SimpleNamespace(get=AsyncMock(return_value="pinned-rel"))
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(
+        return_value={
+            **_rg_with_ranked_release(),
+            "releases": [
+                {"id": "pinned-rel", "status": "Official", "country": "US"},
+                *_rg_with_ranked_release()["releases"],
+            ],
+        }
+    )
+    service._mb_repo.get_release_by_id = AsyncMock(return_value=_release_with_tracks(3))
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert result.selected_release_mbid == "pinned-rel"
+    service._mb_repo.get_release_by_id.assert_awaited_once_with(
+        "pinned-rel",
+        includes=["recordings", "labels"],
+        priority=RequestPriority.USER_INITIATED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_owned_copies_do_not_merge_native_tracks():
+    service, _library_repo, _library_db = _make_service()
+    store = _attach_native_store(service, _native_tracks())
+    store.target_album_ownership_rows.return_value = [
+        {"local_album_id": "local-album-1"},
+        {"local_album_id": "local-album-2"},
+    ]
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    service._mb_repo.get_release_by_id = AsyncMock(return_value=_release_with_tracks(4))
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert result.total_tracks == 4
+    store.get_target_album_tracks.assert_not_awaited()
+    service._mb_repo.get_release_by_id.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_remote_tracks_fetch_selected_release_only_on_success():
+    service, _library_repo, _library_db = _make_service()
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    service._mb_repo.get_release_by_id = AsyncMock(return_value=_release_with_tracks(4))
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert result.selected_release_mbid == "deluxe-rel"
+    assert result.total_tracks == 4
+    service._mb_repo.get_release_by_id.assert_awaited_once()
+    assert service._mb_repo.get_release_by_id.await_args.args[0] == "deluxe-rel"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_result", [None, {"id": "deluxe-rel", "media": []}])
+async def test_remote_tracks_fall_back_only_after_selected_miss_or_empty(
+    selected_result: dict | None,
+):
+    service, _library_repo, _library_db = _make_service()
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    service._mb_repo.get_release_by_id = AsyncMock(
+        side_effect=[selected_result, _release_with_tracks(2)]
+    )
+
+    result = await service.get_album_tracks_info(_MBID)
+
+    assert result.selected_release_mbid == "owned-rel"
+    assert result.total_tracks == 2
+    assert [
+        item.args[0] for item in service._mb_repo.get_release_by_id.await_args_list
+    ] == [
+        "deluxe-rel",
+        "owned-rel",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remote_selected_provider_failure_never_drifts_to_fallback():
+    service, _library_repo, _library_db = _make_service()
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    service._mb_repo.get_release_by_id = AsyncMock(
+        side_effect=ExternalServiceError("provider unavailable")
+    )
+
+    with pytest.raises(ExternalServiceError, match="provider unavailable"):
+        await service.get_album_tracks_info(_MBID)
+
+    service._mb_repo.get_release_by_id.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_remote_track_leader_failure_does_not_leak_future_exception():
+    service, _library_repo, _library_db = _make_service()
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    service._mb_repo.get_release_by_id = AsyncMock(
+        side_effect=ExternalServiceError("provider unavailable")
+    )
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        with pytest.raises(ExternalServiceError, match="provider unavailable"):
+            await service.get_album_tracks_info(_MBID)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert reported == []
+    assert service._tracks_in_flight == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remote_track_leader_cancels_waiters_and_clears_inflight():
+    service, _library_repo, _library_db = _make_service()
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    lookup_started = asyncio.Event()
+
+    async def blocked_release(*_args, **_kwargs) -> dict:
+        lookup_started.set()
+        await asyncio.Event().wait()
+        return _release_with_tracks(2)
+
+    service._mb_repo.get_release_by_id = AsyncMock(side_effect=blocked_release)
+    leader = asyncio.create_task(service.get_album_tracks_info(_MBID))
+    await lookup_started.wait()
+    waiter = asyncio.create_task(service.get_album_tracks_info(_MBID))
+    await asyncio.sleep(0)
+    leader.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert service._tracks_in_flight == {}
+
+
+@pytest.mark.asyncio
+async def test_composed_remote_tracks_are_cached_for_fresh_session_repeat():
+    service, _library_repo, _library_db = _make_service()
+    values: dict[str, object] = {}
+    service._cache.get.side_effect = lambda key: values.get(key)
+
+    async def save(key: str, value: object, ttl_seconds: int = 60) -> None:
+        values[key] = value
+
+    service._cache.set.side_effect = save
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    service._mb_repo.get_release_by_id = AsyncMock(return_value=_release_with_tracks(3))
+
+    first = await service.get_album_tracks_info(_MBID)
+    second = await service.get_album_tracks_info(_MBID)
+
+    assert second is first
+    service._fetch_release_group.assert_awaited_once()
+    service._cache.set.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_remote_track_requests_share_one_selected_lookup():
+    service, _library_repo, _library_db = _make_service()
+    service._get_cached_album_info = AsyncMock(return_value=None)
+    service._fetch_release_group = AsyncMock(return_value=_rg_with_ranked_release())
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def delayed_release(*_args, **_kwargs) -> dict:
+        lookup_started.set()
+        await release_lookup.wait()
+        return _release_with_tracks(2)
+
+    service._mb_repo.get_release_by_id = AsyncMock(side_effect=delayed_release)
+
+    first = asyncio.create_task(service.get_album_tracks_info(_MBID))
+    await lookup_started.wait()
+    second = asyncio.create_task(service.get_album_tracks_info(_MBID))
+    await asyncio.sleep(0)
+    release_lookup.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert second_result is first_result
+    service._mb_repo.get_release_by_id.assert_awaited_once()
 
 
 # -- P5: annotate_album_coverage (shared matcher on the album page) --

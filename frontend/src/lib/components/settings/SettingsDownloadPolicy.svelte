@@ -25,6 +25,7 @@
 	let manualMin = $state(0.5);
 	let maxConcurrent = $state(3);
 	let maxFailover = $state(3);
+	let preferredQualityWait = $state(15);
 	let autoRetryEnabled = $state(true);
 	let autoRetryMax = $state(6);
 	let usenetMinAge = $state(30);
@@ -44,6 +45,7 @@
 			manualMin = d.preflight_score_manual_min;
 			maxConcurrent = d.max_concurrent_downloads;
 			maxFailover = d.max_failover_attempts;
+			preferredQualityWait = d.preferred_quality_wait_minutes;
 			autoRetryEnabled = d.auto_retry_enabled;
 			autoRetryMax = d.auto_retry_max_attempts;
 			usenetMinAge = d.usenet_min_release_age_minutes;
@@ -78,6 +80,7 @@
 			preflight_score_manual_min: manualMin,
 			max_concurrent_downloads: maxConcurrent,
 			max_failover_attempts: maxFailover,
+			preferred_quality_wait_minutes: preferredQualityWait,
 			auto_retry_enabled: autoRetryEnabled,
 			auto_retry_max_attempts: autoRetryMax,
 			usenet_min_release_age_minutes: usenetMinAge
@@ -205,6 +208,19 @@
 					class="input input-bordered input-sm"
 					bind:value={maxFailover}
 				/>
+			</label>
+			<label class="form-control">
+				<span class="label-text">Preferred-quality queue wait (min)</span>
+				<input
+					type="number"
+					min="1"
+					max="1440"
+					class="input input-bordered input-sm"
+					bind:value={preferredQualityWait}
+				/>
+				<span class="mt-1 text-xs text-base-content/55">
+					After this zero-byte wait, try the best lower accepted quality.
+				</span>
 			</label>
 			<label class="form-control">
 				<span class="label-text">Auto-retry attempts</span>

@@ -71,6 +71,9 @@ NPM    ?= pnpm
 	backend-test-monitoring-cache \
 	backend-test-navidrome \
 	backend-test-multidisc \
+	test-library-management-multidisc-naming \
+	test-library-management-profile-sharing \
+	test-performance-snapshot-storage \
 	backend-test-performance \
 	backend-test-preferences \
 	backend-test-plex \
@@ -158,7 +161,16 @@ backend-lint: $(BACKEND_VENV_STAMP) ## Run backend Ruff checks
 	cd "$(ROOT_DIR)" && $(BACKEND_VENV_DIR)/bin/ruff check backend
 
 backend-test: $(BACKEND_VENV_STAMP) ## Run all backend tests
-	$(PYTEST)
+	@cd "$(BACKEND_DIR)" && \
+		mapfile -d '' test_files < <(find tests -type f -name 'test_*.py' -print0 | sort -z); \
+		batch_size=24; \
+		for ((start=0; start < $${#test_files[@]}; start += batch_size)); do \
+			end=$$((start + batch_size)); \
+			if ((end > $${#test_files[@]})); then end=$${#test_files[@]}; fi; \
+			printf 'Backend test batch %d-%d of %d files\n' \
+				"$$((start + 1))" "$$end" "$${#test_files[@]}"; \
+			.venv/bin/python -m pytest "$${test_files[@]:start:batch_size}" || exit $$?; \
+		done
 
 backend-test-compat: $(BACKEND_VENV_STAMP) ## Connect Apps: all compat backend tests (auth, serializers, endpoints, streaming, mapping, errors)
 	$(PYTEST) tests/compat -v
@@ -395,6 +407,20 @@ backend-test-download-routes: $(BACKEND_VENV_STAMP) ## Phase 6b/7: download-clie
 backend-test-orchestrator: $(BACKEND_VENV_STAMP) ## Phase 7: DownloadOrchestrator + FileProcessor.process_downloaded
 	$(PYTEST) tests/services/test_download_orchestrator.py tests/services/test_file_processor.py -v
 
+test-acquisition-cleanup: $(BACKEND_VENV_STAMP) ## Durable attempt cleanup: store, clients, filesystem safety, API and UI
+	$(PYTEST) tests/infrastructure/test_acquisition_cleanup_store.py \
+		tests/infrastructure/test_acquisition_cleanup_task.py \
+		tests/services/native/test_acquisition_cleanup_service.py \
+		tests/services/test_download_orchestrator.py \
+		tests/services/test_file_processor.py \
+		tests/infrastructure/test_e2e_usenet.py \
+		tests/repositories/test_download_client_protocol_contract.py \
+		tests/repositories/test_sabnzbd.py \
+		tests/routes/test_downloads_routes.py -v
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client \
+		src/lib/components/downloads/DownloadItem.svelte.spec.ts \
+		src/lib/components/ServiceHealthIndicator.svelte.spec.ts
+
 backend-test-usenet: $(BACKEND_VENV_STAMP) ## Usenet/SABnzbd: protocol split, Newznab, SABnzbd, folder-import, routing, migration gates
 	$(PYTEST) tests/repositories/test_download_client_protocol_contract.py \
 		tests/infrastructure/test_download_migration.py \
@@ -439,6 +465,57 @@ backend-test-monitoring-cache: $(BACKEND_VENV_STAMP) ## Run artist monitoring ca
 
 backend-test-multidisc: $(BACKEND_VENV_STAMP) ## Run multi-disc album tests
 	$(PYTEST) tests/services/test_album_utils.py tests/services/test_album_service.py tests/infrastructure/test_cache_layer_followups.py
+
+test-library-management-multidisc-naming: $(BACKEND_VENV_STAMP) ## Run dynamic Library Management multi-disc naming tests
+	$(PYTEST) \
+		tests/schemas/test_library_management_settings.py \
+		tests/services/test_preferences_library_management.py \
+		tests/services/native/test_canonical_release_metadata_service.py \
+		tests/services/native/test_artwork_projection_service.py \
+		tests/services/native/test_management_script_engines.py \
+		tests/services/native/test_library_management_naming_policy.py \
+		tests/services/native/test_library_management_profile_sharing.py \
+		tests/services/native/test_library_management_profile_service.py \
+		tests/services/native/test_library_management_preview_service.py \
+		tests/services/native/test_library_management_planner.py \
+		tests/services/native/test_library_management_publisher.py \
+		tests/services/native/test_automatic_import_management_service.py \
+		tests/services/native/test_target_import_library_service.py \
+		tests/services/native/test_automatic_scan_management_service.py \
+		tests/services/native/test_library_management_duplicate_service.py \
+		tests/services/native/test_library_management_baseline_service.py \
+		tests/services/native/test_library_management_recovery_service.py \
+		tests/services/native/test_library_management_undo_service.py \
+		tests/routes/test_library_management_routes.py
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/settings/SettingsLibraryManagement.svelte.spec.ts
+
+test-library-management-profile-sharing: $(BACKEND_VENV_STAMP) ## Run portable Library Management profile sharing tests
+	$(PYTEST) \
+		tests/services/native/test_library_management_profile_sharing.py \
+		tests/routes/test_library_management_routes.py \
+		tests/security/test_auth_on_every_endpoint.py
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server \
+		src/lib/queries/library-management/LibraryManagementMutations.spec.ts \
+		src/lib/queries/__tests__/integration-coverage.spec.ts
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/settings/SettingsLibraryManagement.svelte.spec.ts
+
+test-library-roots-restore: $(BACKEND_VENV_STAMP) ## Run library roots wipe guard and restore tests
+	$(PYTEST) \
+		tests/services/native/test_target_library_policy_service.py \
+		tests/routes/test_target_library_policy_routes.py \
+		tests/security/test_auth_on_every_endpoint.py
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server \
+		src/lib/queries/__tests__/integration-coverage.spec.ts
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/settings/SettingsLibrary.svelte.spec.ts
+
+test-performance-snapshot-storage: $(BACKEND_VENV_STAMP) ## Run snapshot storage and recovery contract tests
+	$(PYTEST) \
+		tests/infrastructure/test_library_management_snapshot_compaction.py \
+		tests/infrastructure/test_library_management_store.py \
+		tests/services/native/test_library_management_publisher.py \
+		tests/services/native/test_library_management_baseline_service.py \
+		tests/services/native/test_library_management_recovery_service.py \
+		tests/services/native/test_library_management_undo_service.py
 
 backend-test-navidrome: $(BACKEND_VENV_STAMP) ## Run all Navidrome integration backend tests
 	$(PYTEST) tests/repositories/test_navidrome_repository.py tests/services/test_navidrome_library_service.py tests/services/test_navidrome_playback_service.py tests/services/test_navidrome_cache_invalidation.py tests/services/test_navidrome_stream_proxy.py tests/routes/test_navidrome_routes.py -v

@@ -289,6 +289,21 @@ async def benchmark_identification_backlog(
                 "INSERT INTO auth_users(id,display_name,role,created_at) "
                 "VALUES ('admin','Benchmark Admin','admin','2026-01-01T00:00:00Z')"
             )
+            connection.execute(
+                "INSERT INTO local_tracks "
+                "(id,local_album_id,root_id,file_path,relative_path,path_hash,"
+                "file_size_bytes,file_mtime_ns,stat_revision,stat_revision_kind,"
+                "tag_revision,title,title_folded,artist_name,artist_name_folded,"
+                "album_title,album_title_folded,album_artist_name,"
+                "album_artist_name_folded,disc_number,track_number,file_format,"
+                "ingest_source,imported_at,membership_source) VALUES "
+                "('explicit-track',?,'benchmark-root','/music/explicit.flac',"
+                "'explicit.flac','explicit-hash',100,1,'100:1','exact','tag-1',"
+                "'Track','track','Benchmark Artist','benchmark artist','Album',"
+                "'album','Benchmark Artist','benchmark artist',1,1,'flac','scan',1,"
+                "'automatic')",
+                (f"album-{backlog_count}",),
+            )
             connection.executemany(
                 "INSERT INTO library_identification_jobs "
                 "(id, local_album_id, kind, state, priority, enqueue_sequence, "

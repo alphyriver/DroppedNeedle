@@ -29,6 +29,7 @@ class AlbumCandidateService:
         tracks: list[GroupingTrack],
         *,
         cached_fingerprint_release_groups: list[str] | None = None,
+        exact_release_mbid: str | None = None,
         explicit: bool = False,
         checkpoint: Callable[[], Awaitable[bool]] | None = None,
     ) -> list[AlbumCandidate]:
@@ -37,10 +38,34 @@ class AlbumCandidateService:
             if explicit
             else RequestPriority.BACKGROUND_SYNC
         )
+        if exact_release_mbid is not None:
+            if checkpoint is not None and not await checkpoint():
+                return []
+            exact = await self._provider.get_exact_release_candidate(
+                exact_release_mbid, priority
+            )
+            if exact is None:
+                return []
+            exact.source_kinds = ["administrator_exact_release"]
+            return [exact]
+
         ids: list[tuple[str, str]] = []
         embedded_groups = {
             track.release_group_mbid for track in tracks if track.release_group_mbid
         }
+        embedded_releases = [track.release_mbid for track in tracks]
+        if any(embedded_releases):
+            if not all(embedded_releases) or len(set(embedded_releases)) != 1:
+                return []
+            if checkpoint is not None and not await checkpoint():
+                return []
+            exact = await self._provider.get_exact_release_candidate(
+                str(embedded_releases[0]), priority
+            )
+            if exact is None:
+                return []
+            exact.source_kinds = ["embedded_exact_release"]
+            return [exact]
         if len(embedded_groups) == 1:
             ids.append((next(iter(embedded_groups)), "embedded"))
 
@@ -50,7 +75,7 @@ class AlbumCandidateService:
             if checkpoint is not None and not await checkpoint():
                 return []
             for release_group_id in await self._provider.search_album_candidate_ids(
-                f"{artist} {album}", ALBUM_SEARCH_LIMIT, priority
+                artist, album, ALBUM_SEARCH_LIMIT, priority
             ):
                 ids.append((release_group_id, "album_tags"))
             if checkpoint is not None and not await checkpoint():
@@ -92,6 +117,7 @@ class AlbumCandidateService:
             if source not in sources[release_group_id]:
                 sources[release_group_id].append(source)
         candidates: list[AlbumCandidate] = []
+        canonical_candidates: dict[tuple[str, str | None], AlbumCandidate] = {}
         for release_group_id in ordered[:MAX_CANDIDATES]:
             if checkpoint is not None and not await checkpoint():
                 return []
@@ -100,7 +126,15 @@ class AlbumCandidateService:
             )
             if candidate is None:
                 continue
+            canonical_key = (candidate.release_group_mbid, candidate.release_mbid)
+            existing = canonical_candidates.get(canonical_key)
+            if existing is not None:
+                existing.source_kinds = list(
+                    dict.fromkeys([*existing.source_kinds, *sources[release_group_id]])
+                )
+                continue
             candidate.source_kinds = sources[release_group_id]
+            canonical_candidates[canonical_key] = candidate
             candidates.append(candidate)
             if checkpoint is not None and not await checkpoint():
                 return []

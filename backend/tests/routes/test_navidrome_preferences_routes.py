@@ -53,6 +53,30 @@ def test_get_reads_only_authenticated_user():
     service.resolve.assert_awaited_once_with("alice")
 
 
+def test_get_preserves_disabled_source_response():
+    service = AsyncMock()
+    resolution = _resolution("selected", ("a",), available=False)
+    resolution = NavidromeFolderResolution(
+        preference=resolution.preference,
+        scope=resolution.scope,
+        source_available=False,
+    )
+    service.resolve.return_value = resolution
+
+    response = build_test_client(_app(service, "alice")).get(
+        "/me/navidrome/music-folder-preferences"
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "selected",
+        "selected_folder_ids": ["a"],
+        "available_folders": [],
+        "stale_folder_ids": [],
+        "source_available": False,
+        "scope_revision": resolution.scope.cache_segment,
+    }
+
+
 def test_put_saves_only_authenticated_user():
     service = AsyncMock()
     service.save.return_value = _resolution("selected", ("a", "b"))

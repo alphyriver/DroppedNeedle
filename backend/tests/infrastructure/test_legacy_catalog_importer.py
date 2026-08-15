@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import logging
 import sqlite3
 import threading
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,6 +16,7 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.persistence.native_library_store import (
+    _CATALOG_VALIDATION_MMAP_BYTES,
     VARIOUS_ARTISTS_ID,
     NativeLibraryStore,
 )
@@ -461,12 +464,16 @@ async def test_target_startup_requires_completed_marker_and_revalidates_after_re
             "unresolved_references": 0,
         }
     )
-    assert first_steady["invariants"] == second_steady["invariants"] == {
-        "foreign_key_violations": 0,
-        "orphan_tracks": 0,
-        "duplicate_paths": 0,
-        "unresolved_provenance": 0,
-    }
+    assert (
+        first_steady["invariants"]
+        == second_steady["invariants"]
+        == {
+            "foreign_key_violations": 0,
+            "orphan_tracks": 0,
+            "duplicate_paths": 0,
+            "unresolved_provenance": 0,
+        }
+    )
 
     await reopened.remove_target_favorite("alice", "track", TRACK_1)
 
@@ -650,6 +657,204 @@ async def test_steady_startup_rejects_every_durable_integrity_failure(
     assert (await store.validate_catalog_integrity())["unresolved_provenance"] == 1
     with pytest.raises(TargetStartupInvariantError, match="integrity validation"):
         await validator.validate("steady_state")
+
+
+@pytest.mark.asyncio
+async def test_startup_integrity_logs_sanitized_clause_timings(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _database, store = await _migrate_startup_fixture(tmp_path, "timed-integrity")
+    caplog.set_level(logging.INFO)
+
+    await TargetStartupValidator(store).validate("steady_state")
+
+    clause_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("target_startup.catalog_integrity_clause")
+    ]
+    assert len(clause_messages) == 4
+    assert {
+        message.split("clause=", 1)[1].split(" ", 1)[0] for message in clause_messages
+    } == {
+        "foreign_key_violations",
+        "orphan_tracks",
+        "duplicate_paths",
+        "unresolved_provenance",
+    }
+    assert all("elapsed_ms=" in message for message in clause_messages)
+    assert all("result_count=0" in message for message in clause_messages)
+    assert all("database_pages=" in message for message in clause_messages)
+    assert all(
+        f"mmap_bytes={_CATALOG_VALIDATION_MMAP_BYTES}" in message
+        for message in clause_messages
+    )
+    assert all("validation_mode=" in message for message in clause_messages)
+    assert {
+        "startup_state_read",
+        "migration_marker_present",
+        "migration_marker_revision",
+        "target_catalog_revision",
+    }.issubset(
+        {
+            record.getMessage().split("clause=", 1)[1].split(" ", 1)[0]
+            for record in caplog.records
+            if record.getMessage().startswith(
+                "target_startup.catalog_validation_clause"
+            )
+        }
+    )
+    assert any(
+        "target_startup.catalog_validation_clause phase=steady_state "
+        "clause=catalog_integrity" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_foreign_key_validation_checkpoint_is_safe_and_restart_stable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database, store = await _migrate_startup_fixture(tmp_path, "fk-checkpoint")
+    caplog.set_level(logging.INFO)
+
+    await store.validate_catalog_integrity()
+    caplog.clear()
+    await store.validate_catalog_integrity()
+    assert "clause=foreign_key_violations" in caplog.text
+    assert "validation_mode=cached" in caplog.text
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "UPDATE local_tracks SET title = title WHERE id = ?", (TRACK_1,)
+        )
+    caplog.clear()
+    await store.validate_catalog_integrity()
+    assert "validation_mode=cached" in caplog.text
+
+    reopened = NativeLibraryStore(database, threading.Lock())
+    caplog.clear()
+    await reopened.validate_catalog_integrity()
+    assert "validation_mode=cached" in caplog.text
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE foreign_key_schema_probe(id INTEGER PRIMARY KEY)"
+        )
+    caplog.clear()
+    await reopened.validate_catalog_integrity()
+    assert "validation_mode=full" in caplog.text
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE local_albums SET title = title WHERE id = ("
+            "SELECT local_album_id FROM local_tracks WHERE id = ?)",
+            (TRACK_1,),
+        )
+        assert (
+            connection.execute(
+                "SELECT clean FROM library_foreign_key_validation_state WHERE singleton = 1"
+            ).fetchone()[0]
+            == 0
+        )
+    caplog.clear()
+    await reopened.validate_catalog_integrity()
+    assert "validation_mode=full" in caplog.text
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_play_history SET local_track_id = 'missing-track' "
+            "WHERE id = 'history-1'"
+        )
+        assert (
+            connection.execute(
+                "SELECT clean FROM library_foreign_key_validation_state WHERE singleton = 1"
+            ).fetchone()[0]
+            == 0
+        )
+    caplog.clear()
+    counts = await reopened.validate_catalog_integrity()
+    assert counts["foreign_key_violations"] == 1
+    assert "validation_mode=full" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_foreign_key_checkpoint_serializes_an_external_writer(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, store = await _migrate_startup_fixture(tmp_path, "fk-checkpoint-race")
+    await store.validate_catalog_integrity()
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    writer_started = threading.Event()
+    original_digest = NativeLibraryStore._foreign_key_schema_sha256
+
+    def blocking_digest(connection: sqlite3.Connection) -> str:
+        validation_started.set()
+        assert release_validation.wait(timeout=2)
+        return original_digest(connection)
+
+    def external_write() -> None:
+        with sqlite3.connect(database, timeout=2) as connection:
+            writer_started.set()
+            connection.execute(
+                "UPDATE local_albums SET title = title WHERE id = ("
+                "SELECT local_album_id FROM local_tracks WHERE id = ?)",
+                (TRACK_1,),
+            )
+
+    monkeypatch.setattr(
+        NativeLibraryStore,
+        "_foreign_key_schema_sha256",
+        staticmethod(blocking_digest),
+    )
+    validation_task = asyncio.create_task(store.validate_catalog_integrity())
+    assert await asyncio.to_thread(validation_started.wait, 2)
+    writer_task = asyncio.create_task(asyncio.to_thread(external_write))
+    assert await asyncio.to_thread(writer_started.wait, 2)
+    await asyncio.sleep(0.05)
+    assert not writer_task.done()
+    release_validation.set()
+    await validation_task
+    await writer_task
+
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT clean FROM library_foreign_key_validation_state WHERE singleton = 1"
+            ).fetchone()[0]
+            == 0
+        )
+    caplog.set_level(logging.INFO)
+    await store.validate_catalog_integrity()
+    assert "validation_mode=full" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_startup_integrity_logs_the_failing_marker_clause(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _database, store = await _migrate_startup_fixture(tmp_path, "timed-marker-failure")
+    store.get_target_startup_state = AsyncMock(
+        return_value={
+            "marker": None,
+            "migration": None,
+            "catalog_revision": 1,
+        }
+    )
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(TargetStartupInvariantError):
+        await TargetStartupValidator(store).validate("steady_state")
+
+    assert any(
+        "clause=migration_marker_present" in record.getMessage()
+        and "result_count=1" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

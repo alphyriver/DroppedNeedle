@@ -8,6 +8,8 @@ from api.v1.schemas.library_policies import (
     LibraryPolicyImpactRequest,
     LibraryPolicyImpactResponse,
     LibraryPolicyTreeResponse,
+    LibraryRestorableRootsResponse,
+    LibraryRestoreRootsRequest,
     LibrarySettingsResponse,
     LibrarySettingsUpdateRequest,
 )
@@ -66,3 +68,18 @@ async def preview_saved_policy_apply(
     request: LibraryPolicyApplyRequest = MsgSpecBody(LibraryPolicyApplyRequest),
 ) -> LibraryPolicyApplyPreviewResponse:
     return await service.preview_apply(request)
+
+
+@router.get("/restorable-roots", response_model=LibraryRestorableRootsResponse)
+async def get_restorable_library_roots(
+    service: TargetLibraryPolicyServiceDep,
+) -> LibraryRestorableRootsResponse:
+    return await service.restorable_roots()
+
+
+@router.post("/restore-roots", response_model=LibrarySettingsResponse)
+async def restore_library_roots(
+    service: TargetLibraryPolicyServiceDep,
+    request: LibraryRestoreRootsRequest = MsgSpecBody(LibraryRestoreRootsRequest),
+) -> LibrarySettingsResponse:
+    return await service.restore_roots(request)

@@ -271,7 +271,9 @@
 					<div class="space-y-10 sm:space-y-12" class:is-refreshing={isUpdatingInBackground}>
 						{#if queueEnabled}
 							<div id="zone-queue" class="scroll-mt-28">
-								<DiscoverQueueDeck />
+								<DiscoverQueueDeck
+									youtubeEnabled={discoverData.integration_status.youtube ?? false}
+								/>
 							</div>
 						{/if}
 

@@ -48,17 +48,20 @@ class NavidromeFolderScopeService:
 
     async def resolve(self, user_id: str) -> NavidromeFolderResolution:
         preference = await self._store.get(user_id)
+        unavailable = NavidromeFolderResolution(
+            preference=preference,
+            scope=NavidromeFolderScope(
+                preference.mode,
+                preference.selected_folder_ids if preference.mode == "selected" else (),
+            ),
+            source_available=False,
+        )
+        if not self._repository.is_configured():
+            return unavailable
         try:
             folders = await self._repository.get_music_folders()
         except (ExternalServiceError, CircuitOpenError):
-            return NavidromeFolderResolution(
-                preference=preference,
-                scope=NavidromeFolderScope(
-                    preference.mode,
-                    preference.selected_folder_ids if preference.mode == "selected" else (),
-                ),
-                source_available=False,
-            )
+            return unavailable
         available = tuple((folder.id, folder.name) for folder in folders)
         available_ids = {folder_id for folder_id, _ in available}
         identity_matches = (
@@ -106,6 +109,8 @@ class NavidromeFolderScopeService:
             raise ValueError("Select at least one music folder")
         if len(selected_folder_ids) != len(set(selected_folder_ids)):
             raise ValueError("Duplicate music folder IDs are not allowed")
+        if not self._repository.is_configured():
+            raise ValueError("Navidrome is not configured")
         folders = await self._repository.get_music_folders()
         available_ids = {folder.id for folder in folders}
         unknown = sorted(set(selected_folder_ids) - available_ids)

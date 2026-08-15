@@ -28,6 +28,7 @@ class CandidateTrack(AppStruct):
     absolute_position: int = 0
     duration_seconds: float | None = None
     recording_mbid: str | None = None
+    release_track_mbid: str | None = None
 
 
 class AlbumCandidate(AppStruct):
@@ -43,6 +44,33 @@ class AlbumCandidate(AppStruct):
     source_kinds: list[str] = msgspec.field(default_factory=list)
 
 
+class ReleaseEdition(AppStruct):
+    release_mbid: str
+    release_group_mbid: str
+    artist_name: str
+    title: str
+    date: str | None = None
+    country: str | None = None
+    status: str | None = None
+    packaging: str | None = None
+    media_formats: list[str] = msgspec.field(default_factory=list)
+    disc_count: int = 0
+    track_count: int = 0
+    label: str | None = None
+    catalogue_number: str | None = None
+    barcode: str | None = None
+    disambiguation: str | None = None
+    musicbrainz_url: str = ""
+    score: int = 0
+
+
+class ReleaseEditionSearchPage(AppStruct):
+    items: list[ReleaseEdition] = msgspec.field(default_factory=list)
+    total: int = 0
+    offset: int = 0
+    limit: int = 12
+
+
 class TrackEvidence(AppStruct):
     local_track_id: str
     classification: EvidenceClass
@@ -51,6 +79,8 @@ class TrackEvidence(AppStruct):
     candidate_disc_number: int | None = None
     candidate_track_position: int | None = None
     recording_mbid: str | None = None
+    release_track_mbid: str | None = None
+    recording_mbid_redirects: list[str] = msgspec.field(default_factory=list)
 
 
 class CandidateEvidence(AppStruct):
@@ -96,6 +126,7 @@ class GroupingTrack(AppStruct):
     recording_mbid: str | None = None
     release_mbid: str | None = None
     release_group_mbid: str | None = None
+    release_track_mbid: str | None = None
     is_compilation: bool = False
     tags_readable: bool = True
     membership_locked: bool = False
@@ -133,6 +164,7 @@ class IdentificationAttempt(AppStruct):
     input_tag_revision: str = ""
     input_policy_revision: str = ""
     input_file_revision: str = ""
+    input_identity_revision: str = ""
     matcher_version: str = ""
     state: str = "completed"
     terminal_reason_code: str = ""

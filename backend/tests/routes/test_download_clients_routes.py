@@ -65,6 +65,7 @@ def test_get_policy_admin():
     resp = build_test_client(app).get("/download-clients/policy")
     assert resp.status_code == 200
     assert resp.json()["preflight_score_auto_accept"] == 0.70
+    assert resp.json()["preferred_quality_wait_minutes"] == 15
 
 
 def test_put_policy_rebuilds_target_download_singletons(monkeypatch):

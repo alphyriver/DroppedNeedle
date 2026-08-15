@@ -8,10 +8,14 @@ dispatches the orchestrator.
 import asyncio
 import logging
 import os
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.exceptions import (
+    AutomaticManagementHoldError,
     ConfigurationError,
     PermissionDeniedError,
     ResourceNotFoundError,
@@ -28,6 +32,10 @@ from models.download import (
     SearchJob,
     TargetAlbum,
     TargetTrack,
+)
+from models.library_management import (
+    AUTOMATIC_MANAGEMENT_RETRY_CODES,
+    MANAGEMENT_RETRY_DELAYS_SECONDS,
 )
 from repositories.protocols.download_client import DownloadClientProtocol
 from repositories.protocols.indexer import IndexerProtocol
@@ -174,6 +182,30 @@ class DownloadService:
         self._pins = release_pin_store
         self._ownership = ownership_service
         self._library_reconciler = library_reconciler or library_manager
+        self._management_hold_locks_guard = asyncio.Lock()
+        self._management_hold_locks: dict[str, asyncio.Lock] = {}
+        self._management_hold_lock_users: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def _management_hold_action(self, source_task_id: str) -> AsyncIterator[None]:
+        async with self._management_hold_locks_guard:
+            lock = self._management_hold_locks.setdefault(
+                source_task_id, asyncio.Lock()
+            )
+            self._management_hold_lock_users[source_task_id] = (
+                self._management_hold_lock_users.get(source_task_id, 0) + 1
+            )
+        try:
+            async with lock:
+                yield
+        finally:
+            async with self._management_hold_locks_guard:
+                users = self._management_hold_lock_users[source_task_id] - 1
+                if users == 0:
+                    self._management_hold_lock_users.pop(source_task_id, None)
+                    self._management_hold_locks.pop(source_task_id, None)
+                else:
+                    self._management_hold_lock_users[source_task_id] = users
 
     def _ensure_enabled(self) -> None:
         # flag captured at construction; the config-save PUT clears the
@@ -264,6 +296,103 @@ class DownloadService:
         # MusicBrainz track lengths are MILLISECONDS (see UsenetStrategy._expected_tracks).
         duration = (track.length / 1000.0) if track.length else None
         return track.recording_id, track.title, duration
+
+    async def _resolve_acquisition_identity(
+        self,
+        release_group_mbid: str,
+        release_mbid: str | None,
+        *,
+        recording_mbid: str | None = None,
+        release_track_mbid: str | None = None,
+        priority: RequestPriority = RequestPriority.USER_INITIATED,
+    ) -> tuple[str, list, object | None]:
+        """Resolve one exact edition and its complete per-track identity map.
+
+        An explicit release is fetched directly and never falls back. A normal
+        release-group request uses the resolver's selected edition, then pins that
+        result onto the task. Per-track requests additionally require one unique
+        release-track entry for the requested recording.
+        """
+
+        if self._album_service is None:
+            raise ConfigurationError(
+                "Exact MusicBrainz edition resolution is unavailable right now"
+            )
+        try:
+            if release_mbid:
+                info = await self._album_service.get_exact_edition_tracks_info(
+                    release_group_mbid,
+                    release_mbid,
+                    priority=priority,
+                )
+            else:
+                info = await self._album_service.get_album_tracks_info(
+                    release_group_mbid,
+                    priority=priority,
+                )
+        except Exception as error:  # noqa: BLE001 - fail closed before any task exists
+            raise ValidationError(
+                "The exact MusicBrainz edition could not be verified. No download was started."
+            ) from error
+
+        selected_release = release_mbid or getattr(info, "selected_release_mbid", None)
+        tracks = list(getattr(info, "tracks", []) or [])
+        if not selected_release or not tracks:
+            raise ValidationError(
+                "The exact MusicBrainz edition has no complete tracklist. No download was started."
+            )
+        positions: set[tuple[int, int]] = set()
+        release_track_ids: set[str] = set()
+        for track in tracks:
+            position = int(getattr(track, "position", 0) or 0)
+            disc = int(getattr(track, "disc_number", 1) or 1)
+            release_track_id = getattr(track, "release_track_id", None)
+            if (
+                position < 1
+                or disc < 1
+                or not getattr(track, "recording_id", None)
+                or not release_track_id
+                or (disc, position) in positions
+                or str(release_track_id).casefold() in release_track_ids
+            ):
+                raise ValidationError(
+                    "The exact MusicBrainz edition has an incomplete or ambiguous track map. "
+                    "No download was started."
+                )
+            positions.add((disc, position))
+            release_track_ids.add(str(release_track_id).casefold())
+
+        selected_track = None
+        if release_track_mbid:
+            matches = [
+                track
+                for track in tracks
+                if str(getattr(track, "release_track_id", "")).casefold()
+                == release_track_mbid.casefold()
+            ]
+            if len(matches) != 1 or (
+                recording_mbid
+                and str(getattr(matches[0], "recording_id", "")).casefold()
+                != recording_mbid.casefold()
+            ):
+                raise ValidationError(
+                    "The requested release track conflicts with the exact MusicBrainz edition. No download was started."
+                )
+            selected_track = matches[0]
+        elif recording_mbid:
+            matches = [
+                track
+                for track in tracks
+                if str(getattr(track, "recording_id", "")).casefold()
+                == recording_mbid.casefold()
+            ]
+            if len(matches) != 1:
+                raise ValidationError(
+                    "The requested recording does not map to one unique track on the exact "
+                    "MusicBrainz edition. No download was started."
+                )
+            selected_track = matches[0]
+        return str(selected_release), tracks, selected_track
 
     async def search_album(
         self,
@@ -547,9 +676,28 @@ class DownloadService:
         # Standalone manual-search job (no parked task): create the task, re-resolving
         # the single-track identity - the job rows don't carry it, and without it the
         # canonical-duration and title gates never arm on this download.
-        recording_mbid = track_title = None
+        release_mbid = release_track_mbid = recording_mbid = track_title = None
+        track_number = disc_number = None
         track_duration_seconds = None
-        if job.track_count == 1:
+        if self._album_service is not None and job.release_group_mbid:
+            (
+                release_mbid,
+                tracks,
+                _selected_track,
+            ) = await self._resolve_acquisition_identity(
+                job.release_group_mbid,
+                None,
+            )
+            job.track_count = len(tracks)
+            if len(tracks) == 1:
+                track = tracks[0]
+                recording_mbid = track.recording_id
+                release_track_mbid = track.release_track_id
+                track_title = track.title
+                track_number = track.position
+                disc_number = track.disc_number or 1
+                track_duration_seconds = track.length / 1000.0 if track.length else None
+        elif job.track_count == 1:
             (
                 recording_mbid,
                 track_title,
@@ -566,8 +714,12 @@ class DownloadService:
             album_title=job.album_title,
             year=job.year,
             track_count=job.track_count,
+            release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
             recording_mbid=recording_mbid,
             track_title=track_title,
+            track_number=track_number,
+            disc_number=disc_number,
             track_duration_seconds=track_duration_seconds,
             origin="user",
             source=candidate.source,
@@ -600,6 +752,7 @@ class DownloadService:
         artist_mbid: str | None = None,
         origin: str = "user",
         release_mbid: str | None = None,
+        release_track_mbid: str | None = None,
     ) -> str:
         """Create a download task and dispatch the orchestrator. Returns the new
         task id, the existing active task id (dedup), or the ``already_in_library``
@@ -621,7 +774,9 @@ class DownloadService:
 
         # track tasks dedup on the recording (not the album) so a different track of
         # the same album runs concurrently
-        if download_type == "track" and recording_mbid:
+        if origin == "edition_conversion":
+            existing = None
+        elif download_type == "track" and recording_mbid:
             existing = await self._store.get_active_task_for_track(
                 recording_mbid, user_id
             )
@@ -691,38 +846,65 @@ class DownloadService:
                 album_title = album_title or album_meta.title
                 artist_mbid = artist_mbid or album_meta.artist_id
 
-        # Backfill the album track count (best-effort) so the completeness gate and
-        # scorer can tell a partial source from a full one. Skipped for per-track
-        # downloads, which already carry track_count=1.
-        track_count = await self._ensure_track_count(release_group_mbid, track_count)
-
-        # A 1-track release (a single) also gets its recording identity threaded onto
-        # the task (title / recording MBID / canonical length) so search scores
-        # per-file and import verifies the canonical duration - the folder path
-        # otherwise imports a fuzzy-matched wrong file unchecked
-        # (.dev-notes/Bugs/2026-07-05-wrong-single-remediation-plan.md, P1.1). The
-        # tracks info was just fetched by _ensure_track_count, so this is a cache hit.
-        if (
-            download_type == "album"
-            and track_count == 1
-            and not (recording_mbid or track_title or track_duration_seconds)
-        ):
+        track_number = None
+        disc_number = None
+        if self._album_service is not None:
             (
-                recording_mbid,
-                track_title,
-                track_duration_seconds,
-            ) = await self._single_track_identity(release_group_mbid)
+                release_mbid,
+                tracks,
+                selected_track,
+            ) = await self._resolve_acquisition_identity(
+                release_group_mbid,
+                release_mbid,
+                recording_mbid=(recording_mbid if download_type == "track" else None),
+                release_track_mbid=(
+                    release_track_mbid if download_type == "track" else None
+                ),
+            )
+            track_count = 1 if download_type == "track" else len(tracks)
+            if selected_track is None and download_type == "album" and len(tracks) == 1:
+                selected_track = tracks[0]
+            if selected_track is not None:
+                release_track_mbid = selected_track.release_track_id
+                recording_mbid = selected_track.recording_id
+                track_title = selected_track.title
+                track_number = selected_track.position
+                disc_number = selected_track.disc_number or 1
+                track_duration_seconds = (
+                    selected_track.length / 1000.0
+                    if selected_track.length
+                    else track_duration_seconds
+                )
+        else:
+            # Minimal test/maintenance constructions without AlbumService retain the
+            # pre-existing best-effort behavior. Production always wires the resolver.
+            track_count = await self._ensure_track_count(
+                release_group_mbid, track_count
+            )
+            if (
+                download_type == "album"
+                and track_count == 1
+                and not (recording_mbid or track_title or track_duration_seconds)
+            ):
+                (
+                    recording_mbid,
+                    track_title,
+                    track_duration_seconds,
+                ) = await self._single_track_identity(release_group_mbid)
 
         task = await self._store.create_task(
             user_id=user_id,
             download_type=download_type,
             release_group_mbid=release_group_mbid,
             release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
             recording_mbid=recording_mbid,
             artist_mbid=artist_mbid,
             artist_name=artist_name,
             album_title=album_title,
             track_title=track_title,
+            track_number=track_number,
+            disc_number=disc_number,
             year=year,
             track_count=track_count,
             track_duration_seconds=track_duration_seconds,
@@ -743,6 +925,7 @@ class DownloadService:
         artist_mbid: str | None = None,
         origin: str = "user",
         release_mbid: str | None = None,
+        release_track_mbid: str | None = None,
     ) -> str:
         """Request a single track. Orphan tracks (album not in the library) resolve
         the release group via MusicBrainz, auto-create the album folder, and download
@@ -765,7 +948,9 @@ class DownloadService:
                     held, self._quality_cutoff, self._upgrade_allowed
                 ):
                     return ALREADY_IN_LIBRARY
-            elif await self._library.has_track(recording_mbid):
+            elif origin != "edition_conversion" and await self._library.has_track(
+                recording_mbid
+            ):
                 return ALREADY_IN_LIBRARY
 
         if not release_group_mbid:
@@ -807,6 +992,7 @@ class DownloadService:
             artist_mbid=artist_mbid,
             origin=origin,
             release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
         )
 
     @property
@@ -857,6 +1043,7 @@ class DownloadService:
         duration_seconds: int | None = None,
         release_group_mbid: str | None = None,
         artist_mbid: str | None = None,
+        release_mbid: str | None = None,
     ) -> str:
         """Enqueue a per-track quality upgrade (origin='upgrade', per-recording floor D12)."""
         return await self.request_track(
@@ -869,6 +1056,7 @@ class DownloadService:
             release_group_mbid=release_group_mbid,
             artist_mbid=artist_mbid,
             origin="upgrade",
+            release_mbid=release_mbid,
         )
 
     async def acquire_edition(self, user_id: str, release_group_mbid: str) -> dict:
@@ -965,6 +1153,7 @@ class DownloadService:
                 duration_seconds=duration,
                 release_group_mbid=release_group_mbid,
                 artist_mbid=artist_mbid,
+                release_mbid=release_id,
             )
             if result == ALREADY_IN_LIBRARY:
                 skipped += 1
@@ -1007,6 +1196,12 @@ class DownloadService:
             page_size=page_size,
         )
 
+    async def get_activity_summary(self, user_id: str, user_role: str):
+        return await self._store.get_activity_summary(user_id, user_role)
+
+    async def cleanup_states(self, task_ids: list[str]) -> dict[str, str]:
+        return await self._store.cleanup_states_for_tasks(task_ids)
+
     async def get_task_files(self, task_id: str, user_id: str, user_role: str):
         """The files of a task (from the linked candidate) + the task's aggregate
         counts. Returns ``(task, files)``. Per-transfer live detail beyond the
@@ -1022,6 +1217,20 @@ class DownloadService:
     async def cancel_task(self, task_id: str, user_id: str, user_role: str) -> None:
         """Cancel a download (ownership-enforced in the orchestrator)."""
         await self._orchestrator.cancel_task(task_id, user_id, user_role)
+
+    async def try_next_source(
+        self,
+        task_id: str,
+        user_id: str,
+        user_role: str,
+        expected_candidate_index: int,
+    ):
+        """Advance a zero-byte remotely queued transfer to its next ranked source."""
+
+        self._ensure_enabled()
+        return await self._orchestrator.try_next_source(
+            task_id, user_id, user_role, expected_candidate_index
+        )
 
     async def retry_task(self, task_id: str, user_id: str, user_role: str) -> str:
         """Retry a failed/cancelled/partial download; returns the new task id."""
@@ -1093,11 +1302,15 @@ class DownloadService:
         return await self._store.task_ids_with_unresolved_held(user_id, user_role)
 
     async def list_held(
-        self, user_id: str, user_role: str, release_group_mbid: str | None = None
+        self,
+        user_id: str,
+        user_role: str,
+        release_group_mbid: str | None = None,
+        source_task_id: str | None = None,
     ) -> list["HeldImport"]:
         """Tracks held for review, optionally scoped to one album (the album page)."""
         return await self._store.list_held_imports(
-            user_id, user_role, release_group_mbid
+            user_id, user_role, release_group_mbid, source_task_id
         )
 
     async def get_held(
@@ -1112,6 +1325,10 @@ class DownloadService:
         held = await self._store.get_held_import(held_id, user_id, user_role)
         if held is None:
             raise ResourceNotFoundError("Held track not found")
+        if held.reason.startswith("management:"):
+            raise ValidationError(
+                "Library Management holds must be retried as one complete acquisition unit"
+            )
         if self._file_processor is None:
             raise ConfigurationError("Import is unavailable right now")
         try:
@@ -1153,15 +1370,417 @@ class DownloadService:
         held = await self._store.get_held_import(held_id, user_id, user_role)
         if held is None:
             raise ResourceNotFoundError("Held track not found")
-        try:
-            Path(held.held_path).unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("Could not delete held file %s: %s", held.held_path, exc)
+        if held.reason.startswith("management:"):
+            raise ValidationError(
+                "Library Management holds must be discarded as one complete acquisition unit"
+            )
         await self._store.resolve_held_import(held_id, "discarded")
+        await self._delete_discarded_held_files([held])
         logger.info(
             "download.held_discarded",
             extra={"held_id": held_id, "release_group_mbid": held.release_group_mbid},
         )
+
+    async def retry_management_hold(
+        self, source_task_id: str, user_id: str, user_role: str
+    ) -> list[str]:
+        """Re-plan and publish a complete held acquisition against current settings."""
+
+        async with self._management_hold_action(source_task_id):
+            try:
+                return await self._retry_management_hold_locked(
+                    source_task_id, user_id, user_role
+                )
+            except ValidationError:
+                await self._schedule_management_hold_after_failure(
+                    source_task_id, user_id
+                )
+                raise
+
+    async def _schedule_management_hold_after_failure(
+        self, source_task_id: str, user_id: str
+    ) -> None:
+        held = await self._store.list_held_imports(
+            user_id, "admin", source_task_id=source_task_id
+        )
+        if not held:
+            return
+        reason_codes = {value.reason.removeprefix("management:") for value in held}
+        retry_count = max(value.management_retry_count for value in held)
+        next_retry_at = None
+        if len(reason_codes) == 1 and reason_codes <= AUTOMATIC_MANAGEMENT_RETRY_CODES:
+            retry_count += 1
+            delay_index = min(retry_count - 1, len(MANAGEMENT_RETRY_DELAYS_SECONDS) - 1)
+            next_retry_at = time.time() + MANAGEMENT_RETRY_DELAYS_SECONDS[delay_index]
+        await self._store.schedule_management_hold_retry(
+            [value.id for value in held],
+            retry_count=retry_count,
+            next_retry_at=next_retry_at,
+        )
+
+    async def retry_due_management_holds(self) -> None:
+        """Retry secured organizer units whose durable transient backoff is due."""
+
+        await self.cleanup_discarded_held_files()
+        due = await self._store.list_due_management_hold_units(time.time(), limit=2)
+        for source_task_id, user_id in due:
+            try:
+                await self.retry_management_hold(source_task_id, user_id, "admin")
+            except (ResourceNotFoundError, ValidationError):
+                continue
+            except Exception:  # noqa: BLE001 - one held unit must not stop the sweep
+                logger.exception(
+                    "Automatic organizer retry failed unexpectedly for %s",
+                    source_task_id,
+                )
+
+    async def _repair_legacy_management_hold(
+        self, source_task_id: str, held: list["HeldImport"]
+    ) -> list["HeldImport"]:
+        """Repair a legacy unit only from a complete exact-edition proof."""
+
+        task = await self._store.get_task(source_task_id)
+        ids = [value.id for value in held]
+
+        async def reject(message: str, *, provider_failure: bool = False):  # noqa: ANN202
+            code = "METADATA_UNAVAILABLE" if provider_failure else "TRACK_NOT_MAPPED"
+            await self._store.update_held_import_reason(
+                ids,
+                reason=f"management:{code}",
+                reason_detail=message,
+            )
+            raise ValidationError(message)
+
+        if task is None:
+            await reject(
+                "The original acquisition task is unavailable, so DroppedNeedle cannot "
+                "prove this held unit's exact edition safely."
+            )
+
+        complete_release_ids = {
+            value.release_mbid.casefold() for value in held if value.release_mbid
+        }
+        held_release_group_ids = {
+            value.release_group_mbid.casefold()
+            for value in held
+            if value.release_group_mbid
+        }
+        complete_track_task = task.download_type != "track" or bool(
+            len(held) == 1
+            and task.release_track_mbid
+            and held[0].release_track_mbid
+            and task.recording_mbid
+            and held[0].recording_mbid
+            and task.release_track_mbid.casefold()
+            == held[0].release_track_mbid.casefold()
+            and task.recording_mbid.casefold() == held[0].recording_mbid.casefold()
+            and task.track_number == held[0].track_number
+            and (task.disc_number or 1) == (held[0].disc_number or 1)
+        )
+        provider_identity_was_rejected = any(
+            value.reason == "management:TRACK_NOT_MAPPED" for value in held
+        )
+        complete = bool(
+            task.release_mbid
+            and task.release_group_mbid
+            and held_release_group_ids == {task.release_group_mbid.casefold()}
+            and {value.user_id for value in held} == {task.user_id}
+            and all(
+                value.release_mbid
+                and value.release_mbid.casefold() == task.release_mbid.casefold()
+                and value.release_track_mbid
+                and value.recording_mbid
+                and value.disc_number
+                and value.track_number
+                for value in held
+            )
+            and len(complete_release_ids) == 1
+            and len({(value.disc_number, value.track_number) for value in held})
+            == len(held)
+            and len({str(value.release_track_mbid).casefold() for value in held})
+            == len(held)
+            and complete_track_task
+            and not provider_identity_was_rejected
+        )
+        if complete:
+            return held
+
+        full_but_rejected_identity = all(
+            value.release_mbid
+            and value.release_track_mbid
+            and value.recording_mbid
+            and value.disc_number
+            and value.track_number
+            for value in held
+        )
+        if provider_identity_was_rejected and full_but_rejected_identity:
+            await reject(
+                "The secured files did not provide enough recording evidence for an "
+                "authoritative exact-edition mapping. Every file remains held."
+            )
+
+        if self._album_service is None:
+            await reject(
+                "Exact MusicBrainz edition proof is unavailable right now; every secured "
+                "file remains held.",
+                provider_failure=True,
+            )
+
+        release_group_ids = {
+            value.release_group_mbid.casefold()
+            for value in held
+            if value.release_group_mbid
+        }
+        if (
+            not task.release_group_mbid
+            or {value.user_id for value in held} != {task.user_id}
+            or release_group_ids != {task.release_group_mbid.casefold()}
+        ):
+            await reject(
+                "The secured files do not all belong to the original acquisition album. "
+                "No identity was repaired."
+            )
+
+        try:
+            release_mbid = (
+                task.release_mbid
+                or await self._album_service.resolve_edition(task.release_group_mbid)
+            )
+            if not release_mbid:
+                await reject(
+                    "MusicBrainz did not select one exact edition for this held unit. "
+                    "Every secured file remains unchanged."
+                )
+            info = await self._album_service.get_exact_edition_tracks_info(
+                task.release_group_mbid,
+                release_mbid,
+                priority=RequestPriority.USER_INITIATED,
+            )
+        except ValidationError:
+            raise
+        except Exception as error:  # noqa: BLE001 - external proof failure is fail-safe
+            try:
+                await reject(
+                    "MusicBrainz could not prove the selected exact edition. Every secured "
+                    "file remains unchanged; retry when metadata is available.",
+                    provider_failure=True,
+                )
+            except ValidationError as validation:
+                raise validation from error
+
+        provider_by_position: dict[tuple[int, int], object] = {}
+        release_track_ids: set[str] = set()
+        for track in info.tracks:
+            position = (track.disc_number or 1, track.position)
+            release_track_id = track.release_track_id
+            if (
+                track.position < 1
+                or not track.recording_id
+                or not release_track_id
+                or position in provider_by_position
+                or release_track_id.casefold() in release_track_ids
+            ):
+                await reject(
+                    "The selected exact edition has a duplicate or incomplete track map. "
+                    "No held identity was changed."
+                )
+            provider_by_position[position] = track
+            release_track_ids.add(release_track_id.casefold())
+
+        held_positions = {
+            (value.disc_number or 0, value.track_number or 0) for value in held
+        }
+        if task.download_type == "album" and held_positions != set(
+            provider_by_position
+        ):
+            await reject(
+                "The secured album is not a complete positional match for the selected "
+                "exact edition. No held identity was changed."
+            )
+        if task.download_type == "track" and len(held) != 1:
+            await reject(
+                "The secured track request does not contain exactly one file. No held "
+                "identity was changed."
+            )
+
+        mappings: list[tuple[int, int, int, str, str]] = []
+        for value in held:
+            position = (value.disc_number or 0, value.track_number or 0)
+            provider_track = provider_by_position.get(position)
+            if (
+                provider_track is None
+                or not value.recording_mbid
+                or value.recording_mbid.casefold()
+                != provider_track.recording_id.casefold()
+                or (
+                    value.release_mbid
+                    and value.release_mbid.casefold() != release_mbid.casefold()
+                )
+                or (
+                    value.release_track_mbid
+                    and value.release_track_mbid.casefold()
+                    != provider_track.release_track_id.casefold()
+                )
+            ):
+                await reject(
+                    f"Secured disc {position[0]}, track {position[1]} does not match the "
+                    "selected edition's recording identity. No held identity was changed."
+                )
+            if (
+                task.download_type == "track"
+                and task.recording_mbid
+                and task.recording_mbid.casefold()
+                != provider_track.recording_id.casefold()
+            ):
+                await reject(
+                    "The secured track does not match the recording requested by the "
+                    "original acquisition task. No held identity was changed."
+                )
+            mappings.append(
+                (
+                    value.id,
+                    position[0],
+                    position[1],
+                    provider_track.recording_id,
+                    provider_track.release_track_id,
+                )
+            )
+
+        task_release_track_mbid = (
+            mappings[0][4] if task.download_type == "track" else None
+        )
+        try:
+            await self._store.repair_management_hold_identity(
+                source_task_id,
+                release_mbid,
+                mappings,
+                task_release_track_mbid=task_release_track_mbid,
+            )
+        except ValueError as error:
+            await reject(
+                "The held acquisition changed while its exact identity was being verified. "
+                "No identity was repaired."
+            )
+            raise AssertionError("unreachable") from error
+
+        repaired = await self._store.list_held_imports(
+            task.user_id,
+            "admin",
+            source_task_id=source_task_id,
+        )
+        if len(repaired) != len(held):
+            await reject(
+                "The repaired held identity could not be reloaded safely. Every file remains held."
+            )
+        return repaired
+
+    async def _retry_management_hold_locked(
+        self, source_task_id: str, user_id: str, user_role: str
+    ) -> list[str]:
+        held = await self.list_held(user_id, user_role, source_task_id=source_task_id)
+        if not held:
+            raise ResourceNotFoundError("Held Library Management unit not found")
+        if any(not value.reason.startswith("management:") for value in held):
+            raise ValidationError(
+                "This acquisition contains recording checks that need track review"
+            )
+        if self._file_processor is None:
+            raise ConfigurationError(
+                "Library Management retry is unavailable right now"
+            )
+        held = await self._repair_legacy_management_hold(source_task_id, held)
+        ids = [value.id for value in held]
+        try:
+            targets = await self._file_processor.place_held_management_bundle(held)
+        except AutomaticManagementHoldError as error:
+            await self._store.update_held_import_reason(
+                ids,
+                reason=f"management:{error.reason_code}",
+                reason_detail=str(error),
+            )
+            raise ValidationError(str(error)) from error
+        except FileNotFoundError as error:
+            raise ValidationError(
+                "One or more secured files are missing; discard this held unit and "
+                "download it again"
+            ) from error
+
+        await self._store.resolve_held_imports(ids, "imported")
+        parents = sorted({value.parent for value in targets}, key=str)
+        if parents and self._library_reconciler is not None:
+            try:
+                await self._library_reconciler.reconcile_with_filesystem(
+                    targets=parents
+                )
+            except Exception:  # noqa: BLE001 - publication already committed
+                logger.warning(
+                    "post-management-hold reconcile failed for %s", source_task_id
+                )
+        try:
+            await self._orchestrator.settle_after_manual_import(source_task_id)
+        except Exception:  # noqa: BLE001 - publication already committed
+            logger.warning(
+                "post-management-hold task settle failed for %s", source_task_id
+            )
+        logger.info(
+            "download.management_hold_retried",
+            extra={"task_id": source_task_id, "files": len(targets)},
+        )
+        return [str(value) for value in targets]
+
+    async def discard_management_hold(
+        self, source_task_id: str, user_id: str, user_role: str
+    ) -> int:
+        """Delete all secured copies for one held management unit."""
+
+        async with self._management_hold_action(source_task_id):
+            return await self._discard_management_hold_locked(
+                source_task_id, user_id, user_role
+            )
+
+    async def _discard_management_hold_locked(
+        self, source_task_id: str, user_id: str, user_role: str
+    ) -> int:
+        held = await self.list_held(user_id, user_role, source_task_id=source_task_id)
+        if not held:
+            raise ResourceNotFoundError("Held Library Management unit not found")
+        if any(not value.reason.startswith("management:") for value in held):
+            raise ValidationError(
+                "This acquisition contains recording checks that need track review"
+            )
+        await self._store.resolve_held_imports(
+            [value.id for value in held], "discarded"
+        )
+        await self._delete_discarded_held_files(held)
+        try:
+            await self._orchestrator.cancel_task(source_task_id, user_id, user_role)
+        except ResourceNotFoundError:
+            pass
+        logger.info(
+            "download.management_hold_discarded",
+            extra={"task_id": source_task_id, "files": len(held)},
+        )
+        return len(held)
+
+    async def cleanup_discarded_held_files(self, *, limit: int = 100) -> None:
+        """Finish durable discard intents left by an interrupted filesystem cleanup."""
+
+        discarded = await self._store.list_pending_discard_file_cleanups(limit=limit)
+        await self._delete_discarded_held_files(discarded)
+
+    async def _delete_discarded_held_files(self, held: list["HeldImport"]) -> None:
+        completed: list[int] = []
+        for value in held:
+            source = Path(value.held_path)
+            try:
+                await asyncio.to_thread(source.unlink, missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Discarded held file still awaits cleanup: %s", source.name
+                )
+            else:
+                completed.append(value.id)
+        await self._store.complete_held_file_cleanup(completed)
 
     async def clear_finished(self, user_id: str, user_role: str) -> int:
         """Hard-delete the user's terminal completed + cancelled tasks (the queue's

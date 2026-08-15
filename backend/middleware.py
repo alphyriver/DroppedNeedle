@@ -56,6 +56,11 @@ _PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/v1/wrapped",
 )
 
+_NON_INTERACTIVE_API_PATHS: frozenset[str] = frozenset({
+    "/api/v1/following/events",
+    "/api/v1/now-playing/events",
+})
+
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Per-process token-bucket rate limiter with per-path overrides."""
@@ -190,8 +195,30 @@ class AuthMiddleware(BaseHTTPMiddleware):
         user, token = result
         request.state.user = user
         request.state.token = token
- 
-        return await call_next(request)
+
+        workload_gate = None
+        if self._tracks_interactive_activity(path):
+            from core.dependencies.service_providers import (
+                get_background_workload_gate,
+            )
+
+            workload_gate = get_background_workload_gate()
+            workload_gate.begin_interactive_request()
+
+        try:
+            return await call_next(request)
+        finally:
+            if workload_gate is not None:
+                workload_gate.end_interactive_request()
+
+    @staticmethod
+    def _tracks_interactive_activity(path: str) -> bool:
+        """Exclude long-lived media and SSE connections from activity tracking."""
+        if path in _NON_INTERACTIVE_API_PATHS:
+            return False
+        if path.startswith("/api/v1/stream/") or "/held-audio/" in path:
+            return False
+        return not path.endswith("/stream")
 
     @staticmethod
     def _is_public(path: str) -> bool:

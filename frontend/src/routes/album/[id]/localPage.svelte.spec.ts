@@ -5,13 +5,20 @@ import type { LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
 
 const h = vi.hoisted(() => ({
 	playQueue: vi.fn(),
-	goto: vi.fn()
+	goto: vi.fn(),
+	isAdmin: false
 }));
 
 vi.mock('$app/state', () => ({ page: { params: { id: 'local-album-1' } } }));
 vi.mock('$app/navigation', () => ({ goto: (...args: unknown[]) => h.goto(...args) }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
-	authStore: { isAdmin: false, isTrusted: false, user: { id: 'user-1' } }
+	authStore: {
+		get isAdmin() {
+			return h.isAdmin;
+		},
+		isTrusted: false,
+		user: { id: 'user-1' }
+	}
 }));
 vi.mock('$lib/stores/player.svelte', () => ({
 	playerStore: { playQueue: (...args: unknown[]) => h.playQueue(...args) }
@@ -41,6 +48,18 @@ const album: LibraryAlbumDetail = {
 	identification_status: 'local_metadata',
 	review_id: null,
 	review_revision: null,
+	management_identity_readiness: 'exact_release_required',
+	mapped_track_count: 0,
+	management_identity_kind: null,
+	custom_manifest_id: null,
+	custom_manifest_version: null,
+	custom_manifest_track_count: 0,
+	custom_manifest_recognized_track_count: 0,
+	custom_manifest_stale: false,
+	management_excluded: false,
+	management_exclusion_revision: null,
+	management_excluded_at: null,
+	active_edition_conversion: null,
 	contribution_id: null,
 	contribution_state: null
 };
@@ -94,6 +113,60 @@ vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 	getAlbumEditionsQuery: () => ({ data: undefined, isLoading: false, isError: false })
 }));
 
+vi.mock('$lib/queries/library/LibraryOperationQueries.svelte', () => ({
+	getLibraryOperationQuery: () => ({ data: undefined, isError: false })
+}));
+
+vi.mock('$lib/queries/library/LibraryEditionQueries.svelte', () => ({
+	getReleaseEditionSearchQuery: () => ({
+		data: {
+			title_query: '',
+			artist_query: '',
+			items: [],
+			total: 0,
+			offset: 0,
+			limit: 12
+		},
+		isLoading: false,
+		isFetching: false,
+		isError: false,
+		refetch: vi.fn()
+	})
+}));
+
+vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => {
+	const mutation = () => ({
+		mutateAsync: vi.fn(),
+		isPending: false,
+		isError: false,
+		reset: vi.fn()
+	});
+	return {
+		reidentifyLibraryAlbum: mutation,
+		selectReidentificationCandidate: mutation,
+		reenableAlbumManagement: mutation,
+		previewAlbumMembership: mutation,
+		applyAlbumMembership: mutation
+	};
+});
+
+vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
+	controlLibraryOperation: () => ({ mutateAsync: vi.fn() })
+}));
+
+vi.mock('$lib/queries/library/EditionConversionQueries.svelte', () => {
+	const mutation = () => ({ mutateAsync: vi.fn(), isPending: false, reset: vi.fn() });
+	return {
+		getEditionConversionQuery: () => ({ data: undefined, refetch: vi.fn() }),
+		createEditionConversionPreflight: mutation,
+		createEditionConversionPreview: mutation,
+		startEditionConversion: mutation,
+		retryEditionConversion: mutation,
+		recheckEditionConversion: mutation,
+		cancelEditionConversion: mutation
+	};
+});
+
 vi.mock('$lib/queries/libraryContributions/LibraryContributionMutations.svelte', () => ({
 	createLibraryContributionMutation: () => ({ isPending: false, mutate: vi.fn() })
 }));
@@ -102,6 +175,9 @@ import LocalAlbumPage from './LocalAlbumPage.svelte';
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	h.isAdmin = false;
+	album.management_identity_readiness = 'exact_release_required';
+	album.identification_status = 'local_metadata';
 });
 
 describe('local-only album page', () => {
@@ -136,5 +212,31 @@ describe('local-only album page', () => {
 			0,
 			false
 		);
+	});
+
+	it('warns an administrator when Library Management needs an exact identity', async () => {
+		h.isAdmin = true;
+		album.management_identity_readiness = 'track_mapping_required';
+		render(LocalAlbumPage, {
+			props: { albumId: album.id }
+		} as unknown as Parameters<typeof render>[1]);
+
+		await expect
+			.element(page.getByRole('button', { name: 'Re-identify…' }))
+			.toHaveClass(/identification-trigger-warning/);
+		await expect.element(page.getByText('Exact track map required')).toBeVisible();
+	});
+
+	it('does not warn when an exact edition and current track map are ready', async () => {
+		h.isAdmin = true;
+		album.management_identity_readiness = 'ready';
+		album.identification_status = 'identified';
+		render(LocalAlbumPage, {
+			props: { albumId: album.id }
+		} as unknown as Parameters<typeof render>[1]);
+
+		await expect
+			.element(page.getByRole('button', { name: 'Re-identify…' }))
+			.not.toHaveClass(/identification-trigger-warning/);
 	});
 });

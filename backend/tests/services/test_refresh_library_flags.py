@@ -127,7 +127,7 @@ class TestRefreshLibraryFlagsLibraryTransition:
             MagicMock(owned=True),
             MagicMock(owned=False),
         ]
-        ownership.provider_artist_owned.return_value = True
+        ownership.provider_artist_relationship.return_value = (True, False)
         mock_library_repo.get_requested_mbids.return_value = {"album-2"}
         service = ArtistService(
             mb_repo=AsyncMock(),
@@ -154,6 +154,32 @@ class TestRefreshLibraryFlagsLibraryTransition:
         mock_library_repo.get_requested_mbids.assert_awaited_once_with(
             ["album-1", "album-2"]
         )
-        ownership.provider_artist_owned.assert_awaited_once_with("artist-1")
+        ownership.provider_artist_relationship.assert_awaited_once_with("artist-1")
+        assert artist.in_library is True
+        assert artist.appears_in_library is False
         assert [release.in_library for release in artist.albums] == [True, False]
         assert [release.requested for release in artist.albums] == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_target_refresh_distinguishes_track_only_appearance(
+        self, mock_library_repo
+    ):
+        ownership = AsyncMock()
+        ownership.project_albums.return_value = []
+        ownership.provider_artist_relationship.return_value = (False, True)
+        mock_library_repo.get_requested_mbids.return_value = set()
+        service = ArtistService(
+            mb_repo=AsyncMock(),
+            library_repo=mock_library_repo,
+            wikidata_repo=AsyncMock(),
+            preferences_service=MagicMock(),
+            memory_cache=AsyncMock(),
+            disk_cache=AsyncMock(),
+            ownership_service=ownership,
+        )
+        artist = ArtistInfo(name="Guest", musicbrainz_id="artist-guest")
+
+        await service._refresh_library_flags(artist)
+
+        assert artist.in_library is False
+        assert artist.appears_in_library is True

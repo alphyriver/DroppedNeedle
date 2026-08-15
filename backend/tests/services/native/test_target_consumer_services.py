@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import sqlite3
 import shutil
 import threading
@@ -91,6 +92,7 @@ RECORDING_MBID = "50000000-0000-4000-8000-000000000001"
 ARTIST_MBID = "60000000-0000-4000-8000-000000000001"
 COMPILATION_ALBUM_ID = "10000000-0000-4000-8000-000000000003"
 COMPILATION_TRACK_ID = "20000000-0000-4000-8000-000000000003"
+COMPILATION_OTHER_TRACK_ID = "20000000-0000-4000-8000-000000000004"
 COMPILATION_ARTIST_ID = "30000000-0000-4000-8000-000000000003"
 TRACK_ARTIST_ID = "30000000-0000-4000-8000-000000000004"
 TRACK_ARTIST_MBID = "60000000-0000-4000-8000-000000000004"
@@ -319,6 +321,109 @@ async def test_target_identity_states_remain_separate_from_review_status(
 
 
 @pytest.mark.asyncio
+async def test_album_lists_project_active_custom_edition_identity(
+    target_services,
+) -> None:
+    store, _view, _favorites, _history, _root = target_services
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO library_custom_edition_manifests "
+            "(id,local_album_id,version,release_group_mbid,album_title,"
+            "album_artist_name,album_metadata_json,source_album_revision,"
+            "input_revision,content_hash,sealed_by_user_id,sealed_at) VALUES "
+            "('custom-manifest',?,1,?,'Local Only','Local Only Artist','{}',1,"
+            "'input','content','user-1',4)",
+            (LOCAL_ALBUM_ID, RELEASE_GROUP_MBID),
+        )
+        connection.execute(
+            "INSERT INTO library_custom_edition_active "
+            "(local_album_id,manifest_id,activated_at) VALUES "
+            "(?,'custom-manifest',4)",
+            (LOCAL_ALBUM_ID,),
+        )
+    service = TargetNativeLibraryService(store)
+
+    albums, _ = await service.albums(
+        limit=10, offset=0, sort="name", search=None, file_format=None
+    )
+    artist_albums = await service.artist_albums(LOCAL_ARTIST_ID)
+
+    listed = next(album for album in albums if album.id == LOCAL_ALBUM_ID)
+    assert listed.album_identity_state == "custom_edition"
+    assert listed.musicbrainz_release_id is None
+    assert artist_albums[0].album_identity_state == "custom_edition"
+
+
+@pytest.mark.asyncio
+async def test_album_detail_projects_current_management_identity_readiness(
+    target_services,
+) -> None:
+    store, _view, _favorites, _history, _root = target_services
+    service = TargetNativeLibraryService(store)
+
+    detail = await service.album_detail(IDENTIFIED_ALBUM_ID)
+    assert detail is not None
+    assert detail.management_identity_readiness == "exact_release_required"
+    assert detail.mapped_track_count == 0
+
+    release_mbid = "70000000-0000-4000-8000-000000000001"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_album_external_identities SET release_mbid = ? "
+            "WHERE local_album_id = ?",
+            (release_mbid, IDENTIFIED_ALBUM_ID),
+        )
+        connection.execute(
+            "UPDATE local_track_external_identities SET release_mbid = ?, "
+            "release_track_mbid = 'release-track-1', medium_position = 1, "
+            "release_track_position = 1 WHERE local_track_id = ?",
+            (release_mbid, IDENTIFIED_TRACK_ID),
+        )
+
+    detail = await service.album_detail(IDENTIFIED_ALBUM_ID)
+    assert detail is not None
+    assert detail.management_identity_readiness == "ready"
+    assert detail.mapped_track_count == 1
+
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_track_external_identities SET release_track_position = NULL "
+            "WHERE local_track_id = ?",
+            (IDENTIFIED_TRACK_ID,),
+        )
+
+    detail = await service.album_detail(IDENTIFIED_ALBUM_ID)
+    assert detail is not None
+    assert detail.management_identity_readiness == "track_mapping_required"
+    assert detail.mapped_track_count == 0
+
+    assert service._management_identity_readiness(None, []) == "not_applicable"
+
+
+def test_management_identity_readiness_rejects_duplicate_release_tracks() -> None:
+    identity = {
+        "release_group_mbid": RELEASE_GROUP_MBID,
+        "release_mbid": "release-1",
+    }
+    track = {
+        "identity_row_revision": 1,
+        "recording_mbid": "recording-1",
+        "identity_release_mbid": "release-1",
+        "release_track_mbid": "release-track-1",
+        "medium_position": 1,
+        "release_track_position": 1,
+    }
+
+    assert (
+        TargetNativeLibraryService._management_identity_readiness(
+            identity, [track, {**track, "recording_mbid": "recording-2"}]
+        )
+        == "track_mapping_required"
+    )
+
+
+@pytest.mark.asyncio
 async def test_artist_album_projection_includes_active_contribution_state(
     target_services,
 ) -> None:
@@ -363,6 +468,45 @@ async def test_provider_artwork_backfill_is_idempotent(target_services) -> None:
     assert artwork is not None
     assert artwork["source"] == "provider"
     assert artwork["source_locator"] == RELEASE_GROUP_MBID
+
+
+@pytest.mark.asyncio
+async def test_manual_identity_release_year_backfill_is_idempotent(
+    target_services,
+) -> None:
+    store, _view, _favorites, _history, _root = target_services
+    release_mbid = "70000000-0000-4000-8000-000000000001"
+    payload = '{"date":{"precision":"year","value":"1974"}}'
+    payload_hash = hashlib.sha256(payload.encode()).hexdigest()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_album_external_identities SET release_mbid = ? "
+            "WHERE local_album_id = ?",
+            (release_mbid, IDENTIFIED_ALBUM_ID),
+        )
+        connection.execute(
+            "INSERT INTO library_management_metadata_snapshots "
+            "(id, provider, entity_kind, entity_id, input_hash, "
+            "canonical_payload_json, payload_sha256, fetched_at, expires_at, "
+            "provider_version_notes) VALUES "
+            "('snapshot-1', 'musicbrainz', 'release', ?, ?, ?, ?, 5, 10, 'test')",
+            (release_mbid, "0" * 64, payload, payload_hash),
+        )
+
+    assert await store.backfill_manual_identity_release_years(updated_at=6) == 1
+    assert await store.backfill_manual_identity_release_years(updated_at=7) == 0
+
+    with sqlite3.connect(store.db_path) as connection:
+        album = connection.execute(
+            "SELECT year, updated_at FROM local_albums WHERE id = ?",
+            (IDENTIFIED_ALBUM_ID,),
+        ).fetchone()
+        track = connection.execute(
+            "SELECT year FROM local_tracks WHERE id = ?",
+            (IDENTIFIED_TRACK_ID,),
+        ).fetchone()
+    assert album == (1974, 6)
+    assert track == (1974,)
 
 
 @pytest.mark.asyncio
@@ -778,6 +922,7 @@ async def test_target_cover_forwards_provider_only_cover_operations(
     )
     provider.get_release_cover_etag.return_value = "release-etag"
     provider.debug_artist_image.return_value = {"artist_found": True}
+    provider.is_release_cover_warming = lambda identifier: identifier == "release-id"
     service = TargetCoverArtService(
         store,
         provider,
@@ -795,6 +940,8 @@ async def test_target_cover_forwards_provider_only_cover_operations(
 
     assert cover == (b"release-cover", "image/jpeg", "coverartarchive")
     assert etag == "release-etag"
+    assert service.is_release_cover_warming("release-id") is True
+    assert service.is_release_cover_warming("other-release") is False
     assert debug == {"artist_found": True}
     provider.get_release_cover.assert_awaited_once_with("release-id", "250", defer=True)
     provider.get_release_cover_etag.assert_awaited_once_with("release-id", "250")
@@ -816,6 +963,16 @@ async def test_target_genre_and_radio_pool_use_target_membership_only(
             "UPDATE local_tracks SET genre = 'Ambient', genre_folded = 'ambient' "
             "WHERE id IN (?, ?)",
             (IDENTIFIED_TRACK_ID, LOCAL_TRACK_ID),
+        )
+        connection.execute(
+            "DELETE FROM local_track_genres WHERE local_track_id IN (?, ?)",
+            (IDENTIFIED_TRACK_ID, LOCAL_TRACK_ID),
+        )
+        connection.executemany(
+            "INSERT INTO local_track_genres "
+            "(local_track_id, position, name, folded_name, source) "
+            "VALUES (?, 0, 'Ambient', 'ambient', 'local')",
+            [(IDENTIFIED_TRACK_ID,), (LOCAL_TRACK_ID,)],
         )
         connection.execute(
             "INSERT INTO artist_genres VALUES (?, ?, ?)",
@@ -882,7 +1039,7 @@ async def test_target_genre_and_radio_pool_use_target_membership_only(
 
 
 @pytest.mark.asyncio
-async def test_compilation_track_artist_is_browsable_across_target_projection(
+async def test_album_artist_ownership_and_contributor_appearances_stay_distinct(
     target_services,
 ) -> None:
     store, view, _favorites, _history, root = target_services
@@ -932,18 +1089,41 @@ async def test_compilation_track_artist_is_browsable_across_target_projection(
         file_format="flac",
         imported_at=4,
     )
+    other_path = root / f"{COMPILATION_OTHER_TRACK_ID}.flac"
+    other_path.write_bytes(b"fLaC" + b"\0" * 64)
+    other_track = LocalTrack(
+        id=COMPILATION_OTHER_TRACK_ID,
+        local_album_id=COMPILATION_ALBUM_ID,
+        root_id="root-1",
+        file_path=str(other_path),
+        relative_path=other_path.name,
+        path_hash="hash:compilation-other",
+        file_size_bytes=other_path.stat().st_size,
+        file_mtime_ns=other_path.stat().st_mtime_ns,
+        stat_revision="stat:compilation-other",
+        title="Other Track",
+        artist_name="Various Artists",
+        album_title="Compilation",
+        album_artist_name="Various Artists",
+        file_format="flac",
+        imported_at=4,
+    )
     await store.create_catalog_membership(
         CatalogMembership(
             album=album,
             artists=[album_artist, track_artist],
-            tracks=[track],
+            tracks=[track, other_track],
             album_credits=[
                 LocalArtistCredit(local_artist_id=COMPILATION_ARTIST_ID, position=0)
             ],
             track_credits={
                 COMPILATION_TRACK_ID: [
-                    LocalArtistCredit(local_artist_id=TRACK_ARTIST_ID, position=0)
-                ]
+                    LocalArtistCredit(local_artist_id=TRACK_ARTIST_ID, position=0),
+                    LocalArtistCredit(local_artist_id=IDENTIFIED_ARTIST_ID, position=1),
+                ],
+                COMPILATION_OTHER_TRACK_ID: [
+                    LocalArtistCredit(local_artist_id=COMPILATION_ARTIST_ID, position=0)
+                ],
             },
         )
     )
@@ -955,23 +1135,69 @@ async def test_compilation_track_artist_is_browsable_across_target_projection(
             (TRACK_ARTIST_ID, TRACK_ARTIST_MBID),
         )
 
-    artists, _ = await view.get_artists(limit=50)
-    detail = await view.get_artist_with_albums(TRACK_ARTIST_ID)
+    album_artists, album_artist_total = await view.get_artists(limit=50)
+    contributors, contributor_total = await view.get_artists(
+        limit=50, scope="contributors"
+    )
+    guest_detail = await view.get_artist_with_albums(TRACK_ARTIST_ID)
+    native = TargetNativeLibraryService(store)
+    guest = await native.artist(TRACK_ARTIST_ID)
+    identified = await native.artist(IDENTIFIED_ARTIST_ID)
+    guest_albums = await native.artist_albums(TRACK_ARTIST_ID)
+    (
+        appearances,
+        appearance_total,
+        appearance_track_total,
+    ) = await native.artist_appearances(TRACK_ARTIST_ID, limit=20, offset=0)
+    album_scope_count, contributor_scope_count = await native.artist_scope_counts()
     repository = TargetLibraryRepository(store)
     provider_artist_ids = await repository.get_artist_mbids()
-    stats = await TargetNativeLibraryService(store).stats()
+    stats = await native.stats()
 
-    assert TRACK_ARTIST_ID in {artist.artist_mbid for artist in artists}
-    assert detail is not None
-    artist, albums = detail
-    assert artist.artist_mbid == TRACK_ARTIST_ID
-    assert [item.rg_mbid for item in albums] == [COMPILATION_ALBUM_ID]
-    assert provider_artist_ids == {ARTIST_MBID, TRACK_ARTIST_MBID}
+    assert album_artist_total == 3
+    assert {artist.artist_mbid for artist in album_artists} == {
+        IDENTIFIED_ARTIST_ID,
+        LOCAL_ARTIST_ID,
+        COMPILATION_ARTIST_ID,
+    }
+    assert contributor_total == 2
+    assert {artist.artist_mbid for artist in contributors} == {
+        IDENTIFIED_ARTIST_ID,
+        TRACK_ARTIST_ID,
+    }
+    assert guest_detail is not None
+    guest_view, owned_albums = guest_detail
+    assert guest_view.artist_mbid == TRACK_ARTIST_ID
+    assert owned_albums == []
+    assert guest is not None
+    assert guest.album_count == 0
+    assert guest.track_count == 0
+    assert guest.appearance_release_count == 1
+    assert guest.appearance_track_count == 1
+    assert guest.library_relationship == "contributor"
+    assert identified is not None
+    assert identified.library_relationship == "both"
+    assert identified.album_count == 1
+    assert identified.appearance_release_count == 1
+    assert guest_albums == []
+    assert appearance_total == 1
+    assert appearance_track_total == 1
+    assert len(appearances) == 1
+    assert appearances[0].album.id == COMPILATION_ALBUM_ID
+    assert appearances[0].album.track_count == 2
+    assert [item.id for item in appearances[0].tracks] == [COMPILATION_TRACK_ID]
+    assert (album_scope_count, contributor_scope_count) == (3, 2)
+    assert await store.target_provider_artist_relationship(ARTIST_MBID) == (True, True)
+    assert await store.target_provider_artist_relationship(TRACK_ARTIST_MBID) == (
+        False,
+        True,
+    )
+    assert provider_artist_ids == {ARTIST_MBID}
     assert await repository.get_all_artist_mbids() == provider_artist_ids
-    assert stats.total_artists == 4
+    assert stats.total_artists == 3
 
     await store.mark_target_tracks_missing(
-        [COMPILATION_TRACK_ID],
+        [COMPILATION_TRACK_ID, COMPILATION_OTHER_TRACK_ID],
         actor_user_id=None,
         reason_code="test_missing",
         missing_at=5,
@@ -1350,7 +1576,7 @@ async def test_spotify_and_personal_mix_write_only_target_playlists(
 
 
 @pytest.mark.asyncio
-async def test_target_tag_and_removal_writers_audit_without_deleting_stable_rows(
+async def test_target_removal_writer_audits_without_deleting_stable_rows(
     target_services, tmp_path: Path
 ) -> None:
     store, _view, _favorites, _history, root = target_services
@@ -1376,11 +1602,6 @@ async def test_target_tag_and_removal_writers_audit_without_deleting_stable_rows
     membership.tracks[0].file_format = info.file_format
     membership.tracks[0].duration_seconds = info.duration_seconds
     await store.create_catalog_membership(membership)
-    with sqlite3.connect(store.db_path) as connection:
-        connection.execute(
-            "UPDATE local_tracks SET stat_revision_kind = 'legacy_float' WHERE id = ?",
-            (track_id,),
-        )
     preferences = SimpleNamespace(
         get_typed_library_settings=lambda: SimpleNamespace(
             library_roots=[SimpleNamespace(path=str(root))]
@@ -1391,32 +1612,6 @@ async def test_target_tag_and_removal_writers_audit_without_deleting_stable_rows
     )
     library_service = TargetNativeLibraryService(store)
     writer = TargetCatalogWriterService(store, local_files, library_service)
-    before_revision = await store.get_catalog_revision()
-
-    updated = await writer.update_tags(
-        track_id,
-        AudioTag(
-            title="Edited locally",
-            artist="Local artist",
-            album="Local album",
-            album_artist="Local artist",
-            track_number=4,
-            genre="Ambient",
-        ),
-        actor_user_id="user-1",
-    )
-
-    assert updated.id == track_id
-    assert updated.title == "Edited locally"
-    assert updated.musicbrainz_recording_id is None
-    assert AudioTagger().read_tags(path)[0].title == "Edited locally"
-    assert await store.get_catalog_revision() > before_revision
-    with sqlite3.connect(store.db_path) as connection:
-        stat_revision_kind = connection.execute(
-            "SELECT stat_revision_kind FROM local_tracks WHERE id = ?", (track_id,)
-        ).fetchone()[0]
-    assert stat_revision_kind == "exact"
-
     removed = await writer.remove_track(
         track_id, actor_user_id="user-1", delete_file=True
     )
@@ -1432,10 +1627,7 @@ async def test_target_tag_and_removal_writers_audit_without_deleting_stable_rows
             "WHERE local_track_id = ? ORDER BY created_at",
             (track_id,),
         ).fetchall()
-    assert actions == [
-        ("update_track_tags", "EXPLICIT_TAG_EDIT"),
-        ("remove_track", "FILE_DELETED"),
-    ]
+    assert actions == [("remove_track", "FILE_DELETED")]
 
 
 @pytest.mark.asyncio

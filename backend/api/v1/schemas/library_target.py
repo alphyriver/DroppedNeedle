@@ -1,5 +1,7 @@
 from typing import Literal
 
+import msgspec
+
 from infrastructure.msgspec_fastapi import AppStruct
 
 
@@ -10,6 +12,11 @@ class TargetNativeArtist(AppStruct):
     artist_identity_state: Literal["local_only", "musicbrainz_linked"] = "local_only"
     album_count: int = 0
     track_count: int = 0
+    appearance_release_count: int = 0
+    appearance_track_count: int = 0
+    library_relationship: Literal["album_artist", "contributor", "both"] = (
+        "album_artist"
+    )
     date_added: float | None = None
     row_revision: int = 1
 
@@ -23,7 +30,7 @@ class TargetNativeAlbum(AppStruct):
     musicbrainz_release_id: str | None = None
     musicbrainz_artist_id: str | None = None
     album_identity_state: Literal[
-        "local_only", "release_group_linked", "release_linked"
+        "local_only", "release_group_linked", "release_linked", "custom_edition"
     ] = "local_only"
     track_count: int = 0
     total_duration_seconds: float = 0
@@ -39,6 +46,19 @@ class TargetNativeAlbum(AppStruct):
     contribution_state: str | None = None
 
 
+class ActiveEditionConversionSummary(AppStruct):
+    job_id: str
+    release_mbid: str
+    state: Literal["preflight", "acquiring", "ready", "needs_recheck"]
+    kept_count: int
+    acquire_count: int
+    staged_count: int
+    failed_count: int
+    recycle_count: int
+    row_revision: int
+    final_preview_job_id: str | None = None
+
+
 class TargetNativeAlbumDetail(TargetNativeAlbum):
     row_revision: int = 1
     input_revision: str = ""
@@ -51,6 +71,63 @@ class TargetNativeAlbumDetail(TargetNativeAlbum):
     ] = "local_metadata"
     review_id: str | None = None
     review_revision: int | None = None
+    management_identity_readiness: Literal[
+        "not_applicable",
+        "exact_release_required",
+        "track_mapping_required",
+        "custom_manifest_stale",
+        "ready",
+    ] = "not_applicable"
+    mapped_track_count: int = 0
+    management_identity_kind: Literal["exact_release", "custom_edition"] | None = None
+    custom_manifest_id: str | None = None
+    custom_manifest_version: int | None = None
+    custom_manifest_track_count: int = 0
+    custom_manifest_recognized_track_count: int = 0
+    custom_manifest_stale: bool = False
+    management_excluded: bool = False
+    management_exclusion_revision: int | None = None
+    management_excluded_at: float | None = None
+    active_edition_conversion: ActiveEditionConversionSummary | None = None
+
+
+class ManagementReenableRequest(AppStruct):
+    expected_exclusion_revision: int
+
+
+class ManagementReenableResponse(AppStruct):
+    reenabled: bool
+
+
+class ReleaseEditionResult(AppStruct):
+    release_mbid: str
+    release_group_mbid: str
+    artist_name: str
+    title: str
+    musicbrainz_url: str
+    date: str | None = None
+    country: str | None = None
+    status: str | None = None
+    packaging: str | None = None
+    media_formats: list[str] = msgspec.field(default_factory=list)
+    disc_count: int = 0
+    track_count: int = 0
+    label: str | None = None
+    catalogue_number: str | None = None
+    barcode: str | None = None
+    disambiguation: str | None = None
+    score: int = 0
+    belongs_to_current_release_group: bool = False
+    is_current_release: bool = False
+
+
+class ReleaseEditionSearchResponse(AppStruct):
+    title_query: str
+    artist_query: str
+    items: list[ReleaseEditionResult] = msgspec.field(default_factory=list)
+    total: int = 0
+    offset: int = 0
+    limit: int = 12
 
 
 class TargetNativeTrack(AppStruct):
@@ -91,6 +168,21 @@ class TargetNativeAlbumsResponse(AppStruct):
 class TargetNativeArtistsResponse(AppStruct):
     items: list[TargetNativeArtist] = []
     total: int = 0
+    album_artist_total: int = 0
+    contributor_total: int = 0
+
+
+class TargetNativeArtistAppearance(AppStruct):
+    album: TargetNativeAlbum
+    tracks: list[TargetNativeTrack] = []
+
+
+class TargetNativeArtistAppearancesResponse(AppStruct):
+    items: list[TargetNativeArtistAppearance] = []
+    total: int = 0
+    total_tracks: int = 0
+    offset: int = 0
+    limit: int = 0
 
 
 class TargetNativeTracksResponse(AppStruct):

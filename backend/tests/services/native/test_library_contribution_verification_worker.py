@@ -86,6 +86,8 @@ async def test_verified_result_persists_evidence_and_attaches_all_identities_ato
     tmp_path,
 ) -> None:
     service, musicbrainz, path, contribution_id = await _returned_contribution(tmp_path)
+    on_identified = AsyncMock()
+    service._on_identified = on_identified
     worker = LibraryContributionVerificationWorker(service._store, service, musicbrainz)
 
     assert await worker.run_once("worker-1", now=time.time() + 1) == "linked"
@@ -93,6 +95,9 @@ async def test_verified_result_persists_evidence_and_attaches_all_identities_ato
 
     assert linked.state == "linked"
     assert linked.result_release_mbid == _RELEASE_MBID
+    on_identified.assert_awaited_once()
+    assert on_identified.await_args.args[0] == "album-1"
+    assert on_identified.await_args.args[1]
     with sqlite3.connect(path) as connection:
         album_identity = connection.execute(
             "SELECT release_group_mbid, release_mbid, decision_source, attempt_id "

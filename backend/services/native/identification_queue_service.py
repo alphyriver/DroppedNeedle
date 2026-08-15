@@ -199,7 +199,9 @@ class IdentificationQueueService:
         return await self._store.get_identification_activity_snapshot()
 
     async def stream_revisions(self) -> dict[str, int]:
-        return {
+        revisions = {
             kind: await self._store.get_stream_revision(kind)
             for kind in ("scan", "identification", "operation")
         }
+        revisions["catalog"] = await self._store.get_catalog_revision()
+        return revisions

@@ -34,7 +34,7 @@ export function createLibraryRepair() {
 			api.global.post<OperationResponse>(API.library.identityRepairs(), {
 				idempotency_key: createUuid(),
 				root_ids: rootIds,
-				target_matcher_version: 'feedback-fixes-v1'
+				target_matcher_version: 'feedback-fixes-v2'
 			}),
 		onSuccess: async () => {
 			await invalidateRepairs();

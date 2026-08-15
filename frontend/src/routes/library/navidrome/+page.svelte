@@ -417,6 +417,7 @@
 													remoteUrl={artist.image_url}
 													alt={artist.name}
 													size="full"
+													requestSize={250}
 													rounded="full"
 													className="h-full w-full"
 												/>

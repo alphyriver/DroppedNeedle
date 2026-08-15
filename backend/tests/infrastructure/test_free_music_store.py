@@ -21,12 +21,21 @@ def test_ensure_tables_is_idempotent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_create_and_get(store):
-    await store.create("t1", "u1", "album", "rg-1", "Brad Sucks", "Guess Who's a Mess")
+    await store.create(
+        "t1",
+        "u1",
+        "album",
+        "rg-1",
+        "Brad Sucks",
+        "Guess Who's a Mess",
+        track_count=10,
+    )
 
     task = await store.get("t1")
     assert task is not None
     assert task.status == FreeMusicStatus.SEARCHING
     assert task.kind == "album" and task.mbid == "rg-1"
+    assert task.track_count == 10
     assert task.files_total == 0 and task.error is None
 
 
@@ -113,7 +122,33 @@ async def test_restart_terminal_is_atomic_and_resets_previous_attempt(store):
     assert task.files_total == 0 and task.files_completed == 0
     assert task.bytes_total == 0 and task.bytes_downloaded == 0
     assert task.attempts == 0 and task.error is None
+    assert task.track_count == 0
     assert await store.restart_terminal("failed") is False
+
+
+def test_existing_table_gains_durable_track_count_column(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "library.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE free_music_tasks ("
+            "id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL, "
+            "mbid TEXT NOT NULL, artist TEXT NOT NULL DEFAULT '', "
+            "title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, identifier TEXT, "
+            "licence_url TEXT, format TEXT, files_total INTEGER NOT NULL DEFAULT 0, "
+            "files_completed INTEGER NOT NULL DEFAULT 0, bytes_total INTEGER NOT NULL DEFAULT 0, "
+            "bytes_downloaded INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, "
+            "error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+        )
+
+    FreeMusicStore(db_path, threading.Lock())
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(free_music_tasks)")
+        }
+    assert "track_count" in columns
 
 
 @pytest.mark.asyncio

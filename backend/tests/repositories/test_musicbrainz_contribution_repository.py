@@ -98,7 +98,7 @@ async def test_duplicate_search_uses_typed_facts_and_cache(monkeypatch) -> None:
     repo = _Repo()
     facts = MusicBrainzDuplicateFacts(
         title="Goldberg Variations, BWV 988",
-        artist_name="Glenn Gould",
+        artist_name='Glenn "Gould" + Co',
         barcode="5099705264827",
     )
     results = await repo.search_duplicate_releases(
@@ -109,6 +109,7 @@ async def test_duplicate_search_uses_typed_facts_and_cache(monkeypatch) -> None:
     ]
     query = api.await_args.kwargs["params"]["query"]
     assert 'release:"Goldberg Variations, BWV 988"' in query
+    assert 'artist:"Glenn \\"Gould\\" \\+ Co"' in query
     assert 'barcode:"5099705264827"' in query
 
 
@@ -177,6 +178,7 @@ def test_contribution_methods_conform_to_protocol() -> None:
         "resolve_url",
         "get_release_for_verification",
         "search_duplicate_releases",
+        "search_release_groups",
     ):
         assert inspect.signature(
             getattr(MusicBrainzRepositoryProtocol, name)

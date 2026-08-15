@@ -1,6 +1,11 @@
 import { api, ApiError } from '$lib/api/client';
 import { API, CACHE_TTL } from '$lib/constants';
-import type { LyricLine, JellyfinLyricsResponse, NavidromeLyricsResponse } from '$lib/types';
+import type {
+	LyricLine,
+	JellyfinLyricsResponse,
+	LocalLyricsResponse,
+	NavidromeLyricsResponse
+} from '$lib/types';
 import type { NowPlaying } from '$lib/player/types';
 import { createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
@@ -14,6 +19,16 @@ export interface LyricsData {
 
 export async function fetchLyrics(np: NowPlaying, signal: AbortSignal): Promise<LyricsData | null> {
 	try {
+		if (np.sourceType === 'local') {
+			const data = await api.global.get<LocalLyricsResponse>(API.local.lyrics(np.trackSourceId!), {
+				signal
+			});
+			return {
+				text: data.text ?? '',
+				is_synced: data.is_synced ?? false,
+				lines: data.lines ?? []
+			};
+		}
 		if (np.sourceType === 'navidrome') {
 			const url = API.navidromeLibrary.lyrics(np.trackSourceId!, np.artistName, np.trackName ?? '');
 			const data = await api.global.get<NavidromeLyricsResponse>(url, { signal });
@@ -59,6 +74,7 @@ export const getLyricsQuery = (
 			),
 			queryFn: ({ signal }: { signal: AbortSignal }) => fetchLyrics(np!, signal),
 			enabled:
-				!!np?.trackSourceId && (np.sourceType === 'navidrome' || np.sourceType === 'jellyfin')
+				!!np?.trackSourceId &&
+				(np.sourceType === 'local' || np.sourceType === 'navidrome' || np.sourceType === 'jellyfin')
 		};
 	});

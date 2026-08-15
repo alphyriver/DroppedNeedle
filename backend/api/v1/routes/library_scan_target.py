@@ -25,6 +25,7 @@ from api.v1.schemas.library_scan_target import (
 )
 from api.v1.schemas.library import LibraryScanStatusResponse
 from core.dependencies import (
+    LibraryAdministrativeWorkServiceDep,
     LibraryPolicyResolverDep,
     TargetIdentificationQueueDep,
     TargetLibraryScanCoordinatorDep,
@@ -32,7 +33,7 @@ from core.dependencies import (
 from core.exceptions import ValidationError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep, CurrentUserDep
-from models.library_work import ScanRequest, ScanScope
+from models.library_work import LibraryWorkItem, ScanRequest, ScanScope
 from services.native.library_activity_events import activity_events
 
 router = APIRouter(
@@ -111,10 +112,12 @@ def _selected_scopes(
 
 @router.get("/activity", response_model=LibraryActivityResponse)
 async def library_activity(
-    _: CurrentUserDep,
+    current_user: CurrentUserDep,
     coordinator: TargetLibraryScanCoordinatorDep,
     identification: TargetIdentificationQueueDep,
+    administrative_work: LibraryAdministrativeWorkServiceDep,
 ) -> LibraryActivityResponse:
+    revisions = await identification.stream_revisions()
     runs = await coordinator.current()
     recent_history = await coordinator.history(limit=1)
     latest_failure = next(
@@ -128,7 +131,8 @@ async def library_activity(
         None,
     )
     items: list[LibraryActivityItem] = []
-    for run in runs[:1]:
+    work_items: list[LibraryWorkItem] = []
+    for run_index, run in enumerate(runs):
         snapshot = await coordinator.snapshot(run.id)
         discovering = run.state == "discovering"
         total = (
@@ -140,18 +144,75 @@ async def library_activity(
         processed = snapshot.counters.get(
             "discovered_count" if discovering else "inspected_count", 0
         )
-        items.append(
-            LibraryActivityItem(
+        phase = str(getattr(run, "phase", run.state))
+        work_processed = (
+            total if phase == "reconciling" and total is not None else processed
+        )
+        if run_index == 0:
+            items.append(
+                LibraryActivityItem(
+                    kind="scan",
+                    state=run.state,
+                    label="Updating the local library",
+                    processed=processed,
+                    total=total,
+                    indeterminate=discovering or not bool(total),
+                    updated_at=run.updated_at,
+                    started_at=run.started_at,
+                    failure_event_id=latest_failure.id if latest_failure else None,
+                    failure_at=latest_failure.terminal_at if latest_failure else None,
+                )
+            )
+        work_items.append(
+            LibraryWorkItem(
+                id=str(run.id),
                 kind="scan",
-                state=run.state,
-                label="Updating the local library",
-                processed=processed,
-                total=total,
+                state=str(run.state),
+                phase=phase,
+                effect="catalog_only",
+                processed=int(work_processed or 0),
+                total=int(total) if total is not None else None,
+                unit="files",
                 indeterminate=discovering or not bool(total),
-                updated_at=run.updated_at,
                 started_at=run.started_at,
-                failure_event_id=latest_failure.id if latest_failure else None,
-                failure_at=latest_failure.terminal_at if latest_failure else None,
+                updated_at=float(run.updated_at),
+                scope_label=(
+                    "Whole library"
+                    if current_user.role == "admin"
+                    and str(getattr(run, "aggregate_scope", "")) == "all"
+                    else "Selected library scopes"
+                    if current_user.role == "admin"
+                    else None
+                ),
+                new_count=int(snapshot.counters.get("new_count", 0)),
+                changed_count=int(snapshot.counters.get("changed_count", 0)),
+                missing_count=int(snapshot.counters.get("missing_count", 0)),
+                failed_count=int(snapshot.counters.get("errored_count", 0)),
+                priority=20 if run_index == 0 and run.state != "queued" else 70,
+            )
+        )
+    if runs and latest_failure is not None:
+        failed_snapshot = await coordinator.snapshot(latest_failure.id)
+        failed_total = failed_snapshot.counters.get(
+            "total_count"
+        ) or failed_snapshot.counters.get("discovered_count")
+        work_items.append(
+            LibraryWorkItem(
+                id=str(latest_failure.id),
+                kind="scan",
+                state="failed",
+                phase=str(getattr(latest_failure, "phase", "failed")),
+                effect="attention",
+                processed=int(failed_snapshot.counters.get("inspected_count", 0)),
+                total=int(failed_total) if failed_total is not None else None,
+                unit="files",
+                indeterminate=not bool(failed_total),
+                started_at=latest_failure.started_at,
+                updated_at=float(latest_failure.updated_at),
+                failed_count=int(failed_snapshot.counters.get("errored_count", 0)),
+                priority=0,
+                failure_event_id=str(latest_failure.id),
+                failure_at=float(latest_failure.terminal_at),
             )
         )
     if not runs and latest_failure is not None:
@@ -171,6 +232,25 @@ async def library_activity(
                 started_at=latest_failure.started_at,
                 failure_event_id=latest_failure.id,
                 failure_at=latest_failure.terminal_at,
+            )
+        )
+        work_items.append(
+            LibraryWorkItem(
+                id=str(latest_failure.id),
+                kind="scan",
+                state="failed",
+                phase=str(getattr(latest_failure, "phase", "failed")),
+                effect="attention",
+                processed=int(snapshot.counters.get("inspected_count", 0)),
+                total=int(total) if total is not None else None,
+                unit="files",
+                indeterminate=not bool(total),
+                started_at=latest_failure.started_at,
+                updated_at=float(latest_failure.updated_at),
+                failed_count=int(snapshot.counters.get("errored_count", 0)),
+                priority=0,
+                failure_event_id=str(latest_failure.id),
+                failure_at=float(latest_failure.terminal_at),
             )
         )
     identification_snapshot = await identification.activity_snapshot()
@@ -231,7 +311,83 @@ async def library_activity(
                 foreground_operation_count=foreground_operations,
             )
         )
-    return LibraryActivityResponse(items=items)
+        if waiting or identification_snapshot["failure_event_id"] is not None:
+            work_items.append(
+                LibraryWorkItem(
+                    id="identification",
+                    kind="identification",
+                    state=state,
+                    phase="identifying_albums",
+                    mode=(
+                        _IDENTIFICATION_PRIORITY_LABELS.get(
+                            active_priority, "Queued work"
+                        )
+                        if active_priority is not None
+                        else None
+                    ),
+                    effect=(
+                        "attention"
+                        if state == "failed" and not waiting
+                        else "catalog_only"
+                    ),
+                    processed=0,
+                    total=None,
+                    unit="albums",
+                    indeterminate=bool(waiting),
+                    remaining_count=waiting,
+                    started_at=identification_snapshot["started_at"],
+                    updated_at=float(
+                        identification_snapshot["updated_at"]
+                        or identification_snapshot["failure_at"]
+                        or 0.0
+                    ),
+                    warning_count=int(identification_snapshot["deferred_count"]),
+                    failed_count=int(counts.get("failed", 0)),
+                    priority=0 if state == "failed" and not waiting else 90,
+                    failure_event_id=(
+                        identification_snapshot["failure_event_id"]
+                        if state == "failed" and not waiting
+                        else None
+                    ),
+                    failure_at=(
+                        identification_snapshot["failure_at"]
+                        if state == "failed" and not waiting
+                        else None
+                    ),
+                )
+            )
+            if waiting and identification_snapshot["failure_event_id"] is not None:
+                work_items.append(
+                    LibraryWorkItem(
+                        id=(
+                            "identification-failure:"
+                            + str(identification_snapshot["failure_event_id"])
+                        ),
+                        kind="identification",
+                        state="failed",
+                        phase="identifying_albums",
+                        effect="attention",
+                        processed=0,
+                        total=None,
+                        unit="albums",
+                        indeterminate=True,
+                        updated_at=float(
+                            identification_snapshot["failure_at"]
+                            or identification_snapshot["updated_at"]
+                            or 0.0
+                        ),
+                        failed_count=int(counts.get("failed", 0)),
+                        priority=0,
+                        failure_event_id=identification_snapshot["failure_event_id"],
+                        failure_at=identification_snapshot["failure_at"],
+                    )
+                )
+    if current_user.role == "admin":
+        work_items.extend(await administrative_work.active())
+    work_items.sort(key=lambda item: (item.priority, -item.updated_at, item.id))
+    return LibraryActivityResponse(
+        items=items, work_items=work_items, revisions=revisions
+    )
 
 
 @router.get("/activity/stream")

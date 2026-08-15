@@ -1,5 +1,5 @@
 import { createMutation } from '@tanstack/svelte-query';
-import { api } from '$lib/api/client';
+import { api, ApiError } from '$lib/api/client';
 import { API } from '$lib/constants';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { toastStore } from '$lib/stores/toast';
@@ -7,6 +7,7 @@ import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import type {
 	LibraryPolicyApplyPreviewResponse,
 	LibraryPolicyImpactResponse,
+	LibraryRestoreRootsRequest,
 	TargetLibrarySettingsResponse,
 	TypedLibrarySettings
 } from './LibraryOperationsTypes';
@@ -17,6 +18,11 @@ async function invalidatePolicies(): Promise<void> {
 		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.operationsPrefix() }),
 		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.activityPrefix() })
 	]);
+}
+
+function serverErrorMessage(error: unknown, fallback: string): string {
+	if (error instanceof ApiError && error.message) return error.message;
+	return fallback;
 }
 
 export function previewLibraryPolicyImpact() {
@@ -36,7 +42,27 @@ export function saveTargetLibrarySettings() {
 			await invalidatePolicies();
 			toastStore.show({ message: 'Library policies saved', type: 'success' });
 		},
-		onError: () => toastStore.show({ message: 'Could not save library policies', type: 'error' })
+		onError: (error) =>
+			toastStore.show({
+				message: serverErrorMessage(error, 'Could not save library policies'),
+				type: 'error'
+			})
+	}));
+}
+
+export function restoreLibraryRoots() {
+	return createMutation(() => ({
+		mutationFn: (input: LibraryRestoreRootsRequest) =>
+			api.global.post<TargetLibrarySettingsResponse>(API.library.restoreRoots(), input),
+		onSuccess: async () => {
+			await invalidatePolicies();
+			toastStore.show({ message: 'Library roots restored', type: 'success' });
+		},
+		onError: (error) =>
+			toastStore.show({
+				message: serverErrorMessage(error, 'Could not restore library roots'),
+				type: 'error'
+			})
 	}));
 }
 

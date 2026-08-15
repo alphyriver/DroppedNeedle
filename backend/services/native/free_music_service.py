@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.exceptions import ResourceNotFoundError, ValidationError
+from models.download_manifest import DownloadManifest, ExpectedTrack
 from models.free_music import FreeMusicCandidate, FreeMusicStatus, FreeMusicTask
 from services.native.quality_tiers import tier_for, tier_rank
 from services.native.title_match import title_containment_score
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from infrastructure.sse_publisher import SSEPublisher
     from repositories.archive_repository import ArchiveRepository
     from services.native.drop_import_service import DropImportService
+    from services.native.file_processor import FileProcessor
     from services.preferences_service import PreferencesService
 
 logger = logging.getLogger(__name__)
@@ -51,12 +53,14 @@ class FreeMusicService:
         drop_import: "DropImportService",
         preferences_service: "PreferencesService",
         sse_publisher: "SSEPublisher",
+        file_processor: "FileProcessor | None" = None,
     ) -> None:
         self._store = store
         self._archive = archive
         self._drop_import = drop_import
         self._prefs = preferences_service
         self._sse = sse_publisher
+        self._file_processor = file_processor
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancels: dict[str, asyncio.Event] = {}
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}
@@ -91,6 +95,14 @@ class FreeMusicService:
         recording_mbid: str,
         artist_name: str,
         track_title: str,
+        origin: str = "user",
+        release_group_mbid: str | None = None,
+        release_mbid: str | None = None,
+        release_track_mbid: str | None = None,
+        duration_seconds: float | None = None,
+        album_title: str | None = None,
+        track_number: int | None = None,
+        disc_number: int | None = None,
     ) -> str:
         return await self._start(
             user_id=user_id,
@@ -98,6 +110,15 @@ class FreeMusicService:
             mbid=recording_mbid,
             artist=artist_name,
             title=track_title,
+            origin=origin,
+            release_group_mbid=release_group_mbid,
+            release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
+            recording_mbid=recording_mbid,
+            duration_seconds=duration_seconds,
+            album_title=album_title,
+            track_number=track_number,
+            disc_number=disc_number,
         )
 
     async def list_tasks(
@@ -150,9 +171,9 @@ class FreeMusicService:
             raise ValidationError("Wait for this download to stop before retrying")
         if not await self._store.restart_terminal(task_id):
             raise ValidationError("That download is no longer available to retry")
-        self._spawn(task_id, task)
         refreshed = await self._store.get(task_id)
         assert refreshed is not None
+        self._spawn(task_id, refreshed)
         return refreshed
 
     async def remove(self, task_id: str, *, user_id: str, is_admin: bool) -> None:
@@ -190,6 +211,15 @@ class FreeMusicService:
         artist: str,
         title: str,
         track_count: int = 0,
+        origin: str = "user",
+        release_group_mbid: str | None = None,
+        release_mbid: str | None = None,
+        release_track_mbid: str | None = None,
+        recording_mbid: str | None = None,
+        duration_seconds: float | None = None,
+        album_title: str | None = None,
+        track_number: int | None = None,
+        disc_number: int | None = None,
     ) -> str:
         if not self.is_ready():
             raise ValidationError("Free Music is not enabled")
@@ -204,19 +234,46 @@ class FreeMusicService:
             status=FreeMusicStatus.SEARCHING,
             created_at=time.time(),
             updated_at=time.time(),
+            track_count=max(0, track_count),
+            origin=origin,
+            release_group_mbid=release_group_mbid,
+            release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
+            recording_mbid=recording_mbid,
+            duration_seconds=duration_seconds,
+            album_title=album_title,
+            track_number=track_number,
+            disc_number=disc_number,
         )
         # the row exists before we return: the caller links the request to this id
-        await self._store.create(task_id, user_id, kind, mbid, artist, title)
-        self._spawn(task_id, task, track_count)
+        await self._store.create(
+            task_id,
+            user_id,
+            kind,
+            mbid,
+            artist,
+            title,
+            track_count=max(0, track_count),
+            origin=origin,
+            release_group_mbid=release_group_mbid,
+            release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
+            recording_mbid=recording_mbid,
+            duration_seconds=duration_seconds,
+            album_title=album_title,
+            track_number=track_number,
+            disc_number=disc_number,
+        )
+        self._spawn(task_id, task)
         return task_id
 
-    def _spawn(self, task_id: str, task: FreeMusicTask, track_count: int = 0) -> None:
+    def _spawn(self, task_id: str, task: FreeMusicTask) -> None:
         cancel = asyncio.Event()
         lifecycle_lock = asyncio.Lock()
         self._cancels[task_id] = cancel
         self._lifecycle_locks[task_id] = lifecycle_lock
         handle = asyncio.create_task(
-            self._run_guarded(task_id, task, track_count, cancel, lifecycle_lock)
+            self._run_guarded(task_id, task, cancel, lifecycle_lock)
         )
         self._tasks[task_id] = handle
         handle.add_done_callback(lambda t, tid=task_id: self._on_done(tid, t))
@@ -235,12 +292,11 @@ class FreeMusicService:
         self,
         task_id: str,
         task: FreeMusicTask,
-        track_count: int,
         cancel: asyncio.Event,
         lifecycle_lock: asyncio.Lock,
     ) -> None:
         try:
-            await self._run(task_id, task, track_count, cancel, lifecycle_lock)
+            await self._run(task_id, task, cancel, lifecycle_lock)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -251,12 +307,11 @@ class FreeMusicService:
         self,
         task_id: str,
         task: FreeMusicTask,
-        track_count: int,
         cancel: asyncio.Event,
         lifecycle_lock: asyncio.Lock,
     ) -> None:
         try:
-            candidates = await self._find_candidates(task, track_count)
+            candidates = await self._find_candidates(task, task.track_count)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             logger.warning("free_music.search_failed mbid=%s: %s", task.mbid, exc)
             await self._fail(
@@ -318,13 +373,56 @@ class FreeMusicService:
             return
         await self._publish(task.user_id, task_id, FreeMusicStatus.IMPORTING)
         try:
-            # the drop importer identifies, tags, organises, resolves the request,
-            # and notifies the requester - the same path a dropped Bandcamp zip takes
-            await self._drop_import.create_job(
-                user_id=task.user_id,
-                user_name="Free Music",
-                uploads=[(f.name, f) for f in files],
-            )
+            if task.origin == "edition_conversion":
+                if (
+                    self._file_processor is None
+                    or not task.release_group_mbid
+                    or not task.release_mbid
+                    or not task.release_track_mbid
+                    or not task.recording_mbid
+                ):
+                    raise ValidationError(
+                        "The exact-edition conversion target is incomplete."
+                    )
+                result = await self._file_processor.process_downloaded_folder(
+                    DownloadManifest(
+                        task_id=task.id,
+                        release_group_mbid=task.release_group_mbid,
+                        release_mbid=task.release_mbid,
+                        artist_name=task.artist,
+                        album_title=task.album_title or task.title,
+                        naming_template=(
+                            self._prefs.get_download_policy().naming_template
+                        ),
+                        target_files=[],
+                        expected_tracks=[
+                            ExpectedTrack(
+                                track_number=task.track_number or 1,
+                                disc_number=task.disc_number or 1,
+                                duration_seconds=task.duration_seconds,
+                                recording_mbid=task.recording_mbid,
+                                title=task.title,
+                                release_track_mbid=task.release_track_mbid,
+                            )
+                        ],
+                        is_track=True,
+                        origin="edition_conversion",
+                        requested_by_user_id=task.user_id,
+                    ),
+                    files,
+                )
+                if not result.succeeded:
+                    raise ValidationError(
+                        "Free Music could not verify the requested recording."
+                    )
+            else:
+                # The drop importer identifies, tags, organises, resolves the request,
+                # and notifies the requester, as it does for a dropped Bandcamp zip.
+                await self._drop_import.create_job(
+                    user_id=task.user_id,
+                    user_name="Free Music",
+                    uploads=[(f.name, f) for f in files],
+                )
         finally:
             await asyncio.to_thread(shutil.rmtree, dest, True)
 

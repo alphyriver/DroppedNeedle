@@ -11,9 +11,20 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.exceptions import ConflictError, ResourceNotFoundError, ValidationError
+from core.exceptions import (
+    ConflictError,
+    ExternalServiceError,
+    ResourceNotFoundError,
+    ValidationError,
+)
+from infrastructure.cache.cache_keys import (
+    ALBUM_INFO_PREFIX,
+    ALBUM_TRACKS_INFO_PREFIX,
+    LIBRARY_ALBUM_DETAILS_PREFIX,
+)
 from infrastructure.persistence.album_release_pin_store import AlbumReleasePinStore
 from infrastructure.persistence.library_db import LibraryDB
+from infrastructure.queue.priority_queue import RequestPriority
 from models.album import Track
 from services.album_service import AlbumService
 
@@ -28,13 +39,21 @@ def _rg_payload() -> dict:
         "title": "OK Computer",
         "releases": [
             {
-                "id": REL_STD, "title": "OK Computer", "status": "Official",
-                "date": "1997-06-16", "country": "GB", "packaging": "Jewel Case",
+                "id": REL_STD,
+                "title": "OK Computer",
+                "status": "Official",
+                "date": "1997-06-16",
+                "country": "GB",
+                "packaging": "Jewel Case",
                 "media": [{"track-count": 12}],
             },
             {
-                "id": REL_DELUXE, "title": "OK Computer", "disambiguation": "deluxe",
-                "status": "Official", "date": "2009-03-24", "country": "XW",
+                "id": REL_DELUXE,
+                "title": "OK Computer",
+                "disambiguation": "deluxe",
+                "status": "Official",
+                "date": "2009-03-24",
+                "country": "XW",
                 "media": [{"track-count": 12}, {"track-count": 8}],
             },
         ],
@@ -44,10 +63,19 @@ def _rg_payload() -> dict:
 async def _seed_owned_file(library_db: LibraryDB) -> None:
     await library_db.upsert_library_file(
         {
-            "release_group_mbid": RG, "release_mbid": REL_STD, "track_number": 1,
-            "disc_number": 1, "track_title": "Airbag", "album_title": "OK Computer",
-            "file_path": "/m/a/01.flac", "file_size_bytes": 1, "file_mtime": 0.0,
-            "file_format": "flac", "source": "scan", "confidence": 1.0, "is_compilation": 0,
+            "release_group_mbid": RG,
+            "release_mbid": REL_STD,
+            "track_number": 1,
+            "disc_number": 1,
+            "track_title": "Airbag",
+            "album_title": "OK Computer",
+            "file_path": "/m/a/01.flac",
+            "file_size_bytes": 1,
+            "file_mtime": 0.0,
+            "file_format": "flac",
+            "source": "scan",
+            "confidence": 1.0,
+            "is_compilation": 0,
         }
     )
 
@@ -63,15 +91,24 @@ def _make_album_service(tmp_path: Path):
     disk_cache = AsyncMock()
     disk_cache.get_album.return_value = None
     service = AlbumService(
-        MagicMock(), mb_repo, library_db, memory_cache, disk_cache,
-        MagicMock(), None, None, release_pin_store=pins,
+        MagicMock(),
+        mb_repo,
+        library_db,
+        memory_cache,
+        disk_cache,
+        MagicMock(),
+        None,
+        None,
+        release_pin_store=pins,
     )
     return service, library_db, pins, memory_cache, disk_cache
 
 
 @pytest.mark.asyncio
 async def test_pin_store_roundtrip(tmp_path: Path):
-    pins = AlbumReleasePinStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    pins = AlbumReleasePinStore(
+        db_path=tmp_path / "library.db", write_lock=threading.Lock()
+    )
     assert await pins.get(RG) is None
     await pins.set(RG, REL_DELUXE, "admin-1")
     assert await pins.get(RG) == REL_DELUXE
@@ -114,6 +151,65 @@ async def test_pin_overrides_owned_and_clearing_reverts(tmp_path: Path):
 
     await pins.clear(RG)
     assert (await service._effective_release_id(RG, _rg_payload()))[0] == REL_STD
+
+
+@pytest.mark.asyncio
+async def test_exact_edition_tracklist_returns_only_requested_release(tmp_path: Path):
+    service, *_ = _make_album_service(tmp_path)
+    service._mb_repo.get_release_by_id = AsyncMock(
+        return_value={
+            "id": REL_DELUXE,
+            "release-group": {"id": RG},
+            "media": [
+                {
+                    "position": 1,
+                    "tracks": [
+                        {
+                            "id": "66666666-6666-4666-8666-666666666666",
+                            "position": 1,
+                            "title": "Airbag",
+                            "length": 276_000,
+                            "recording": {"id": "77777777-7777-4777-8777-777777777777"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    info = await service.get_exact_edition_tracks_info(RG, REL_DELUXE)
+
+    assert info.selected_release_mbid == REL_DELUXE
+    assert info.tracks[0].release_track_id == "66666666-6666-4666-8666-666666666666"
+    service._mb_repo.get_release_by_id.assert_awaited_once_with(
+        REL_DELUXE,
+        includes=["recordings", "labels"],
+        priority=RequestPriority.USER_INITIATED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_edition_lookup_never_falls_back(tmp_path: Path):
+    service, *_ = _make_album_service(tmp_path)
+    service._mb_repo.get_release_by_id = AsyncMock(return_value=None)
+
+    with pytest.raises(ResourceNotFoundError, match="exact edition"):
+        await service.get_exact_edition_tracks_info(RG, REL_DELUXE)
+
+    service._mb_repo.get_release_group_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_edition_lookup_preserves_provider_failure(tmp_path: Path):
+    service, *_ = _make_album_service(tmp_path)
+    service._mb_repo.get_release_by_id = AsyncMock(
+        side_effect=ExternalServiceError("MusicBrainz unavailable")
+    )
+
+    with pytest.raises(ExternalServiceError, match="MusicBrainz unavailable"):
+        await service.get_exact_edition_tracks_info(RG, REL_DELUXE)
+
+    service._mb_repo.get_release_group_by_id.assert_not_awaited()
 
 
 REL_AUTO_11 = "44444444-4444-4444-8444-444444444444"
@@ -196,7 +292,7 @@ async def _seed_unidentified_files(library_db: LibraryDB, count: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_twenty_unidentified_files_select_twenty_track_edition_everywhere(
+async def test_twenty_unidentified_files_render_locally_without_changing_acquisition_edition(
     tmp_path: Path,
 ):
     service, library_db, _pins, *_ = _make_album_service(tmp_path)
@@ -220,7 +316,9 @@ async def test_twenty_unidentified_files_select_twenty_track_edition_everywhere(
 
     assert full.selected_release_mbid == REL_AUTO_20
     assert full.total_tracks == 20
-    assert tracks.selected_release_mbid == REL_AUTO_20
+    # Display tracks are native and therefore do not invent an edition identity.
+    # The edition query and acquisition resolver still agree on the 20-track target.
+    assert tracks.selected_release_mbid is None
     assert tracks.total_tracks == 20
     assert editions["selected_release_mbid"] == REL_AUTO_20
     assert editions["owned_release_mbid"] is None
@@ -294,10 +392,13 @@ def test_closest_release_preserves_ranking_on_ties_and_ignores_unknown_counts():
         {"id": "ranked-second", "media": [{"track-count": 21}]},
     ]
     assert AlbumService._closest_release_id(ranked, 16) == "ranked-first"
-    assert AlbumService._closest_release_id(
-        [{"id": "missing"}, {"id": "invalid", "media": [{"track-count": "?"}]}],
-        16,
-    ) is None
+    assert (
+        AlbumService._closest_release_id(
+            [{"id": "missing"}, {"id": "invalid", "media": [{"track-count": "?"}]}],
+            16,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -306,10 +407,14 @@ async def test_partial_collection_and_no_library_use_expected_fallbacks(tmp_path
     service._library_db.get_library_files_for_album = AsyncMock(
         return_value=[{"release_group_mbid": "local-a"} for _ in range(18)]
     )
-    assert (await service._effective_release_id(RG, _avalon_payload()))[0] == REL_AUTO_20
+    assert (await service._effective_release_id(RG, _avalon_payload()))[
+        0
+    ] == REL_AUTO_20
 
     service._library_db.get_library_files_for_album.return_value = []
-    assert (await service._effective_release_id(RG, _avalon_payload()))[0] == REL_AUTO_11
+    assert (await service._effective_release_id(RG, _avalon_payload()))[
+        0
+    ] == REL_AUTO_11
 
 
 @pytest.mark.asyncio
@@ -317,13 +422,19 @@ async def test_set_pin_validates_edition_and_busts_caches(tmp_path: Path):
     service, _db, pins, memory_cache, disk_cache = _make_album_service(tmp_path)
 
     with pytest.raises(ResourceNotFoundError):
-        await service.set_edition_pin(RG, "44444444-4444-4444-8444-444444444444", "admin-1")
+        await service.set_edition_pin(
+            RG, "44444444-4444-4444-8444-444444444444", "admin-1"
+        )
     assert await pins.get(RG) is None
 
     await service.set_edition_pin(RG, REL_DELUXE, "admin-1")
     assert await pins.get(RG) == REL_DELUXE
     disk_cache.delete_album.assert_awaited_with(RG)
-    assert memory_cache.delete.await_count >= 2  # album info + library details keys
+    assert {item.args[0] for item in memory_cache.delete.await_args_list} == {
+        f"{ALBUM_INFO_PREFIX}{RG}",
+        f"{ALBUM_TRACKS_INFO_PREFIX}{RG}",
+        f"{LIBRARY_ALBUM_DETAILS_PREFIX}{RG}",
+    }
 
     memory_cache.delete.reset_mock()
     disk_cache.delete_album.reset_mock()
@@ -335,7 +446,9 @@ async def test_set_pin_validates_edition_and_busts_caches(tmp_path: Path):
 
 
 def _mb_track(pos: int, rec: str | None, title: str, disc: int = 1) -> Track:
-    return Track(position=pos, title=title, disc_number=disc, length=200_000, recording_id=rec)
+    return Track(
+        position=pos, title=title, disc_number=disc, length=200_000, recording_id=rec
+    )
 
 
 def _make_download_service(*, rows, tracks, upgrade_allowed=True, cutoff="lossless"):
@@ -353,9 +466,17 @@ def _make_download_service(*, rows, tracks, upgrade_allowed=True, cutoff="lossle
     meta.title = "OK Computer"
     mb.get_release_group = AsyncMock(return_value=meta)
     service = DownloadService(
-        AsyncMock(), AsyncMock(), AsyncMock(), library, AsyncMock(), AsyncMock(),
-        MagicMock(), musicbrainz=mb, album_service=album_service,
-        upgrade_allowed=upgrade_allowed, quality_cutoff=cutoff,
+        AsyncMock(),
+        AsyncMock(),
+        AsyncMock(),
+        library,
+        AsyncMock(),
+        AsyncMock(),
+        MagicMock(),
+        musicbrainz=mb,
+        album_service=album_service,
+        upgrade_allowed=upgrade_allowed,
+        quality_cutoff=cutoff,
     )
     service.request_track = AsyncMock(return_value="task-fill")
     service.request_upgrade_track = AsyncMock(return_value="task-upg")
@@ -370,11 +491,21 @@ def _make_download_service(*, rows, tracks, upgrade_allowed=True, cutoff="lossle
 async def test_acquire_edition_fills_missing_and_upgrades_below_cutoff(tmp_path: Path):
     rows = [
         # rec-1 held at lossless (at cutoff): untouched
-        {"recording_mbid": "rec-1", "disc_number": 1, "track_number": 1,
-         "file_format": "flac", "bit_rate": 900},
+        {
+            "recording_mbid": "rec-1",
+            "disc_number": 1,
+            "track_number": 1,
+            "file_format": "flac",
+            "bit_rate": 900,
+        },
         # rec-2 held at mp3_192 (below cutoff): upgraded
-        {"recording_mbid": "rec-2", "disc_number": 1, "track_number": 2,
-         "file_format": "mp3", "bit_rate": 192},
+        {
+            "recording_mbid": "rec-2",
+            "disc_number": 1,
+            "track_number": 2,
+            "file_format": "mp3",
+            "bit_rate": 192,
+        },
     ]
     tracks = [
         _mb_track(1, "rec-1", "Airbag"),
@@ -390,8 +521,11 @@ async def test_acquire_edition_fills_missing_and_upgrades_below_cutoff(tmp_path:
         album_utils.extract_tracks = original
 
     assert result == {
-        "release_mbid": REL_DELUXE, "total_tracks": 3,
-        "requested": 1, "upgrades": 1, "skipped": 0,
+        "release_mbid": REL_DELUXE,
+        "total_tracks": 3,
+        "requested": 1,
+        "upgrades": 1,
+        "skipped": 0,
     }
     fill = service.request_track.await_args.kwargs
     assert fill["recording_mbid"] == "rec-3"
@@ -405,11 +539,21 @@ async def test_acquire_edition_is_edition_scoped(tmp_path: Path):
     """A low-tier BONUS track outside the pinned edition's tracklist must not
     trigger anything (the peer-review scoping trap)."""
     rows = [
-        {"recording_mbid": "rec-1", "disc_number": 1, "track_number": 1,
-         "file_format": "flac", "bit_rate": 900},
+        {
+            "recording_mbid": "rec-1",
+            "disc_number": 1,
+            "track_number": 1,
+            "file_format": "flac",
+            "bit_rate": 900,
+        },
         # a bonus track the edition doesn't contain, at a terrible tier
-        {"recording_mbid": "rec-bonus", "disc_number": 1, "track_number": 99,
-         "file_format": "mp3", "bit_rate": 96},
+        {
+            "recording_mbid": "rec-bonus",
+            "disc_number": 1,
+            "track_number": 99,
+            "file_format": "mp3",
+            "bit_rate": 96,
+        },
     ]
     tracks = [_mb_track(1, "rec-1", "Airbag")]  # the edition = this one track
     service, original = _make_download_service(rows=rows, tracks=tracks)

@@ -81,6 +81,7 @@
 				requesting={state.requesting}
 				refreshing={state.refreshing}
 				headerDownloadTask={state.headerDownloadTask}
+				managementHeld={state.headerManagementHeld}
 				downloadClientConfigured={$integrationStore.download_client}
 				libraryInLibrary={state.libraryInLibrary}
 				libraryTrackCount={state.libraryTrackCount}
@@ -89,6 +90,7 @@
 				coverageCovered={state.coverageCovered}
 				mbTrackCount={state.tracksInfo?.total_tracks ?? 0}
 				releaseGroupMbid={album.musicbrainz_id}
+				{localCopies}
 				onrequest={state.handleRequest}
 				ondelete={state.handleDeleteClick}
 				onrefresh={state.refreshAll}

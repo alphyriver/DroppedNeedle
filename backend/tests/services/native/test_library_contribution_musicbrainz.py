@@ -121,8 +121,12 @@ async def test_attach_existing_uses_evidence_gate_and_atomically_links_album_and
     tmp_path,
 ) -> None:
     base, path = _service(tmp_path)
+    on_identified = AsyncMock()
     service = LibraryContributionService(
-        base._store, musicbrainz_repository=_musicbrainz(), cache=InMemoryCache()
+        base._store,
+        musicbrainz_repository=_musicbrainz(),
+        cache=InMemoryCache(),
+        on_identified=on_identified,
     )
     created = await service.create("album-1", "curator-1")
     ready = await service.update(
@@ -173,6 +177,9 @@ async def test_attach_existing_uses_evidence_gate_and_atomically_links_album_and
     )
     assert attempt_count == 1
     assert evidence_count == 1
+    on_identified.assert_awaited_once()
+    assert on_identified.await_args.args[0] == "album-1"
+    assert on_identified.await_args.args[1]
 
 
 @pytest.mark.asyncio
