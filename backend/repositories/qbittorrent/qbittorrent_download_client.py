@@ -152,15 +152,7 @@ class QbittorrentDownloadClient:
         incomplete torrent is removed, WITH its partial data. A torrent that is
         already gone leaves nothing to stop, so that is success - returning False
         would wedge the cleanup journal in a retry loop."""
-        info = await self._find(handle)
-        if info is None:
-            return True
-        if info.progress >= 1.0:
-            logger.info(
-                "qbittorrent: leaving completed torrent %s seeding (no delete)", info.hash
-            )
-            return True
-        return await self._client.delete_torrents(info.hash, delete_files=True)
+        return await self._remove_unless_seeding(handle, action="abort")
 
     async def inspect_materialization(
         self, handle: TaskHandle
@@ -201,16 +193,10 @@ class QbittorrentDownloadClient:
         For qBittorrent the "record" IS the live seeding session, so a completed
         torrent is retained on purpose and reported as success - there is nothing
         left that the attempt owns. An incomplete torrent has no seeding value, so
-        it is removed with its partial data (same rule as ``abort``)."""
-        info = await self._find(handle)
-        if info is None:
-            return True
-        if info.progress >= 1.0:
-            logger.info(
-                "qbittorrent: retaining completed torrent %s for seeding", info.hash
-            )
-            return True
-        return await self._client.delete_torrents(info.hash, delete_files=True)
+        it is removed with its partial data (same rule as ``abort``). A FAILED
+        torrent reaches this without an ``abort`` first - the cleanup service only
+        aborts an ``active`` one - so the removal branch is load-bearing here."""
+        return await self._remove_unless_seeding(handle, action="discard")
 
     async def list_completed_files(self, handle: TaskHandle) -> list[Path]:
         info = await self._find(handle)
@@ -280,6 +266,22 @@ class QbittorrentDownloadClient:
         return await asyncio.to_thread(_ok)
 
     # --- internals --------------------------------------------------------------
+
+    async def _remove_unless_seeding(self, handle: TaskHandle, *, action: str) -> bool:
+        """Shared body of ``abort``/``discard_client_artifacts`` (mirrors slskd's
+        ``_remove_transfer_records``): remove an incomplete torrent WITH its partial
+        data, never touch a completed one, and treat "already gone" as success."""
+        info = await self._find(handle)
+        if info is None:
+            return True
+        if info.progress >= 1.0:
+            logger.info(
+                "qbittorrent: %s left completed torrent %s seeding (no delete)",
+                action,
+                info.hash,
+            )
+            return True
+        return await self._client.delete_torrents(info.hash, delete_files=True)
 
     async def _recover(
         self, request: EnqueueRequest, correlation_id: str
