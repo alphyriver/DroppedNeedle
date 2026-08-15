@@ -25,6 +25,11 @@ concurrency:
   group: fork-image-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Same upstream as fork-upstream-sync.yml. Needed here for its release TAGS,
+  # which decide the base version - see the version job.
+  UPSTREAM_REPO: https://github.com/DroppedNeedle/DroppedNeedle.git
+
 jobs:
   backend:
     if: github.repository == 'alphyriver/DroppedNeedle'
@@ -83,6 +88,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # next-fork-version.sh derives the base from the nearest reachable PLAIN
+      # upstream tag, but checkout only brings the FORK's tags and
+      # fork-upstream-sync.yml fetches upstream's branch without --tags. Upstream
+      # release tags therefore never exist here, so the base silently froze at the
+      # newest one that happened to be in the fork (v2.3.0) and every build minted
+      # another v2.3.0.postN while upstream had moved to 2.4.x. Fetch them so the
+      # base tracks what was actually merged. Tags land only in this ephemeral
+      # runner - the release job pushes the single computed tag, never --tags - so
+      # the fork's own tag namespace and its `tags: ["v*"]` trigger are untouched.
+      - name: Fetch upstream release tags
+        run: git fetch --tags --quiet "$UPSTREAM_REPO"
       - name: Compute next fork tag
         id: compute
         shell: bash

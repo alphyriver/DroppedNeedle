@@ -954,3 +954,128 @@ async def test_reconciliation_refuses_unsafe_mounts(tmp_path: Path, mount: Path)
     )
 
     assert await service.reconcile_legacy_mount() == 0
+
+
+@pytest.mark.asyncio
+async def test_real_qbittorrent_client_drives_cleanup_without_touching_seeded_bytes(
+    tmp_path: Path,
+):
+    """Integration: the REAL QbittorrentDownloadClient through the real cleanup
+    service. Proves the abort/inspect/discard contract wired end to end, not a
+    fake standing in for it - a completed torrent keeps both its files and its
+    qBittorrent record, and the attempt still reaches 'complete'."""
+    from unittest.mock import AsyncMock
+
+    from repositories.qbittorrent.qbittorrent_download_client import (
+        QbittorrentDownloadClient,
+    )
+    from repositories.qbittorrent.qbittorrent_models import QbtTorrentInfo
+
+    mount = tmp_path / "qbittorrent-downloads"
+    album = mount / "Album"
+    album.mkdir(parents=True)
+    seeded = album / "01.flac"
+    seeded.write_bytes(b"seeded-bytes")
+
+    api = AsyncMock()
+    api.torrents_info.return_value = [
+        QbtTorrentInfo(
+            hash="abc123",
+            name="droppedneedle-t1-0",
+            state="uploading",
+            progress=1.0,
+            size=12,
+            downloaded=12,
+            category="droppedneedle",
+            tags="droppedneedle-t1-0",
+            content_path="/data/torrents/droppedneedle/Album",
+            save_path="/data/torrents/droppedneedle",
+        )
+    ]
+    api.delete_torrents.return_value = True
+    client = QbittorrentDownloadClient(api, "http://qbt:8080", "key", mount)
+
+    store = _store(tmp_path)
+    attempt = await store.create_download_attempt(
+        task_id="b" * 32,
+        source="torrent",
+        candidate_index=0,
+        job_name="",
+        handle=TaskHandle(source="torrent", torrent_hash="abc123"),
+        now=1.0,
+    )
+    attempt = await store.schedule_download_attempt_cleanup(
+        attempt.id, disposition="discard", publisher_bundle_ids=[], now=2.0
+    )
+
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: mount
+    )
+    await service.cleanup_now(attempt.id, worker_id="test")
+
+    # The seeding torrent keeps its bytes AND its client record.
+    assert seeded.read_bytes() == b"seeded-bytes"
+    api.delete_torrents.assert_not_awaited()
+    # ...and the cleanup debt is still discharged rather than retried forever.
+    final = await store.get_download_attempt(attempt.id)
+    assert final is not None
+    assert final.state == "complete"
+    # Evidence was recorded from the remapped local path, not qBittorrent's namespace.
+    assert final.workspace_path == str(album)
+    assert final.materialized_paths == []
+
+
+@pytest.mark.asyncio
+async def test_failed_torrent_is_removed_with_its_partial_data(tmp_path: Path):
+    """A FAILED torrent never reaches ``abort`` (the service aborts only 'active'),
+    so ``discard_client_artifacts`` is what removes it and its partial bytes."""
+    from unittest.mock import AsyncMock
+
+    from repositories.qbittorrent.qbittorrent_download_client import (
+        QbittorrentDownloadClient,
+    )
+    from repositories.qbittorrent.qbittorrent_models import QbtTorrentInfo
+
+    mount = tmp_path / "qbittorrent-downloads"
+    mount.mkdir(parents=True)
+
+    api = AsyncMock()
+    api.torrents_info.return_value = [
+        QbtTorrentInfo(
+            hash="dead01",
+            name="droppedneedle-t2-0",
+            state="error",
+            progress=0.3,
+            size=100,
+            downloaded=30,
+            category="droppedneedle",
+            tags="droppedneedle-t2-0",
+            content_path="/data/torrents/droppedneedle/Broken",
+            save_path="/data/torrents/droppedneedle",
+        )
+    ]
+    api.delete_torrents.return_value = True
+    client = QbittorrentDownloadClient(api, "http://qbt:8080", "key", mount)
+
+    store = _store(tmp_path)
+    attempt = await store.create_download_attempt(
+        task_id="c" * 32,
+        source="torrent",
+        candidate_index=0,
+        job_name="",
+        handle=TaskHandle(source="torrent", torrent_hash="dead01"),
+        now=1.0,
+    )
+    attempt = await store.schedule_download_attempt_cleanup(
+        attempt.id, disposition="discard", publisher_bundle_ids=[], now=2.0
+    )
+
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: mount
+    )
+    await service.cleanup_now(attempt.id, worker_id="test")
+
+    api.delete_torrents.assert_awaited_once_with("dead01", delete_files=True)
+    final = await store.get_download_attempt(attempt.id)
+    assert final is not None
+    assert final.state == "complete"

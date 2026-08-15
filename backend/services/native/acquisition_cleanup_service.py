@@ -315,20 +315,10 @@ class AcquisitionCleanupService:
             )
             return
 
-        if attempt.source == "torrent":
-            # A seeding torrent owns its bytes - the import COPIED them out, so the
-            # attempt has no local source to remove and must never reach the slskd
-            # unlink path below. discard_client_artifacts retains a completed torrent
-            # (seeding is a tracker obligation) and removes an incomplete one.
-            try:
-                discarded = await client.discard_client_artifacts(handle)
-            except Exception as error:  # noqa: BLE001 - repository errors stay internal
-                raise _RetryableCleanup("client_artifact_discard_failed") from error
-            if not discarded:
-                raise _RetryableCleanup("client_artifact_discard_failed")
-            await self._mark_complete(attempt)
-            return
-
+        # Every other source is evidence-driven: remove exactly the local paths the
+        # client reported as attempt-owned, then discard its records. A torrent
+        # reports none (see QbittorrentDownloadClient._materialization), so its
+        # seeded bytes are left in place without needing a source special-case here.
         await self._cleanup_slskd_files(
             attempt,
             mount_healthy=materialization.mount_healthy,
