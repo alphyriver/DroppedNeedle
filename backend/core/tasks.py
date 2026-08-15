@@ -319,6 +319,42 @@ def start_download_resume_task(orchestrator: "DownloadOrchestrator") -> asyncio.
     return task
 
 
+async def run_acquisition_cleanup_periodically(
+    get_cleanup_service, interval: float = 30.0
+) -> None:
+    """Drain cleanup debt with freshly resolved clients."""
+
+    worker_id = "acquisition-cleanup-worker"
+    while True:
+        try:
+            service = get_cleanup_service()
+            await service.reconcile_legacy_mount()
+            await service.run_once(worker_id)
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable cleanup survives one failed sweep
+            logger.exception("Acquisition cleanup sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_acquisition_cleanup_task(get_cleanup_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        run_acquisition_cleanup_periodically(get_cleanup_service)
+    )
+    TaskRegistry.get_instance().register("acquisition-cleanup", task)
+    task.add_done_callback(
+        lambda value: logger.error(
+            "Acquisition cleanup task error: %s", value.exception()
+        )
+        if not value.cancelled() and value.exception()
+        else None
+    )
+    return task
+
+
 async def warm_library_cache(
     library_service: LibraryService,
     album_service: "AlbumService",
@@ -435,12 +471,19 @@ async def warm_artist_discovery_cache_periodically(
 
                 artist_cursor = page[-1]
                 mbids = [mbid for mbid in page if is_valid_mbid(mbid)]
-                for offset in range(0, len(mbids), 5):
+                for mbid in mbids:
                     if workload_gate is not None:
-                        await workload_gate.wait_until_available()
-                    await artist_discovery_service_getter().precache_artist_discovery(
-                        mbids[offset : offset + 5], delay=delay
-                    )
+                        await workload_gate.run_warmer_unit(
+                            lambda mbid=mbid: artist_discovery_service_getter().precache_artist_discovery(
+                                [mbid], delay=delay
+                            )
+                        )
+                    else:
+                        await (
+                            artist_discovery_service_getter().precache_artist_discovery(
+                                [mbid], delay=delay
+                            )
+                        )
 
                 if len(page) < 500:
                     break
@@ -641,15 +684,28 @@ async def warm_discover_home_periodically(
                     eligible, last_warmed, attempts, now, get_discover_service()
                 )
                 if uid is not None:
-                    await _warm_one_user(
-                        uid,
-                        get_discover_service(),
-                        get_home_service(),
-                        last_warmed,
-                        attempts,
-                        get_queue_manager() if get_queue_manager else None,
-                        workload_gate,
-                    )
+                    if workload_gate is not None:
+                        await workload_gate.run_warmer_unit(
+                            lambda: _warm_one_user(
+                                uid,
+                                get_discover_service(),
+                                get_home_service(),
+                                last_warmed,
+                                attempts,
+                                get_queue_manager() if get_queue_manager else None,
+                                workload_gate,
+                            )
+                        )
+                    else:
+                        await _warm_one_user(
+                            uid,
+                            get_discover_service(),
+                            get_home_service(),
+                            last_warmed,
+                            attempts,
+                            get_queue_manager() if get_queue_manager else None,
+                            workload_gate,
+                        )
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -964,6 +1020,35 @@ def start_download_auto_retry_task(get_orchestrator) -> asyncio.Task:
         auto_retry_failed_downloads_periodically(get_orchestrator)
     )
     TaskRegistry.get_instance().register("download-auto-retry", task)
+    return task
+
+
+_MANAGEMENT_HOLD_AUTO_RETRY_INTERVAL = 60
+_MANAGEMENT_HOLD_AUTO_RETRY_INITIAL_DELAY = 60
+
+
+async def auto_retry_management_holds_periodically(
+    get_download_service, interval: int = _MANAGEMENT_HOLD_AUTO_RETRY_INTERVAL
+) -> None:
+    await asyncio.sleep(_MANAGEMENT_HOLD_AUTO_RETRY_INITIAL_DELAY)
+    while True:
+        try:
+            await get_download_service().retry_due_management_holds()
+        except asyncio.CancelledError:
+            break
+        except Exception as error:  # noqa: BLE001 - durable retry loop survives one sweep
+            logger.error("Organizer auto-retry sweep failed: %s", error, exc_info=True)
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_management_hold_auto_retry_task(get_download_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        auto_retry_management_holds_periodically(get_download_service)
+    )
+    TaskRegistry.get_instance().register("management-hold-auto-retry", task)
     return task
 
 

@@ -158,11 +158,6 @@
 			<p class="text-[11px] text-base-content/40">
 				Buy it once, own it forever - your purchase supports the artist.
 			</p>
-			{#if options.disclosure}
-				<p class="text-[11px] text-base-content/40">
-					Some links earn DroppedNeedle a commission at no cost to you.
-				</p>
-			{/if}
 		</div>
 	{/if}
 </section>

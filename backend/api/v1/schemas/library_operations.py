@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal
+import uuid
 
 import msgspec
 
@@ -191,6 +192,11 @@ class RepairReportSummary(AppStruct):
     album_counts_by_root: dict[str, int] = msgspec.field(default_factory=dict)
     provider_deferred_count: int = 0
     failed_evidence_count: int = 0
+    purpose: str = "existing_matches"
+    ready_album_count: int = 0
+    mapping_candidate_count: int = 0
+    exact_release_required_count: int = 0
+    needs_review_count: int = 0
 
 
 class OperationResponse(AppStruct):
@@ -214,6 +220,7 @@ class OperationResponse(AppStruct):
     reidentification_candidates: list[ReviewCandidateDetail] = msgspec.field(
         default_factory=list
     )
+    selected_reidentification_candidate_key: str | None = None
 
 
 class OperationListResponse(AppStruct):
@@ -223,6 +230,7 @@ class OperationListResponse(AppStruct):
 
 class OperationControlRequest(AppStruct):
     expected_row_revision: int
+    idempotency_key: str | None = None
 
 
 class ReidentificationRequest(AppStruct):
@@ -230,12 +238,24 @@ class ReidentificationRequest(AppStruct):
     expected_input_revision: str
     idempotency_key: str
     one_off_local_metadata: bool = False
+    release_mbid: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.release_mbid is None:
+            return
+        try:
+            self.release_mbid = str(uuid.UUID(self.release_mbid))
+        except (ValueError, AttributeError) as error:
+            raise ValueError("release_mbid must be a MusicBrainz UUID") from error
 
 
 class ReidentificationCandidateRequest(AppStruct):
     expected_row_revision: int
-    candidate_key: str
+    candidate_key: str = ""
     confirmation: bool = False
+    decision_mode: Literal["exact_release", "custom_edition", "leave_unmanaged"] = (
+        "exact_release"
+    )
 
 
 class MembershipPreviewRequest(AppStruct):
@@ -299,13 +319,27 @@ class RepairCreateRequest(AppStruct):
     idempotency_key: str
     root_ids: list[str] = msgspec.field(default_factory=list)
     source_matcher_version: str | None = None
-    target_matcher_version: str = "feedback-fixes-v1"
+    target_matcher_version: str = "feedback-fixes-v2"
 
 
 class RepairEstimateResponse(AppStruct):
     identity_count: int
     selected_root_count: int
     queued_repair_count: int
+
+
+class IdentityPreparationCreateRequest(AppStruct):
+    idempotency_key: str
+    root_ids: list[str] = msgspec.field(default_factory=list)
+
+
+class IdentityPreparationEstimateResponse(AppStruct):
+    album_count: int
+    ready_album_count: int
+    mapping_required_count: int
+    exact_release_required_count: int
+    selected_root_count: int
+    queued_preparation_count: int
 
 
 class RepairApplyRequest(AppStruct):
@@ -316,6 +350,10 @@ class RepairApplyRequest(AppStruct):
 class RepairFindingResponse(AppStruct):
     id: str
     local_album_id: str
+    album_title: str
+    album_artist_name: str | None
+    album_year: int | None
+    cover_available: bool
     evidence_id: str | None
     review_id: str | None
     finding_code: str
@@ -332,3 +370,5 @@ class RepairFindingListResponse(AppStruct):
     items: list[RepairFindingResponse]
     next_cursor: str | None = None
     has_more: bool = False
+    current_counts_by_finding: dict[str, int] = msgspec.field(default_factory=dict)
+    refresh_required: bool = False

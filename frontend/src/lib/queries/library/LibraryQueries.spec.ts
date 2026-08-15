@@ -3,7 +3,8 @@ import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 
 vi.mock('@tanstack/svelte-query', () => ({
 	createQuery: vi.fn((factory: () => Record<string, unknown>) => factory()),
-	queryOptions: vi.fn((opts: Record<string, unknown>) => opts)
+	queryOptions: vi.fn((opts: Record<string, unknown>) => opts),
+	keepPreviousData: vi.fn((data: unknown) => data)
 }));
 
 vi.mock('$lib/api/client', () => ({
@@ -92,6 +93,7 @@ describe('library query endpoints', () => {
 		const url = mockGet.mock.calls[0][0] as string;
 		expect(url).not.toContain('q=');
 		expect(url).not.toContain('format=');
+		expect(opts.placeholderData).toBeDefined();
 	});
 
 	it('stats query hits /library/stats', async () => {

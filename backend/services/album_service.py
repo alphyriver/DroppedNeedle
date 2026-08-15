@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import math
+import time
 from typing import Optional, TYPE_CHECKING
 import msgspec
 from api.v1.schemas.album import AlbumInfo, AlbumBasicInfo, AlbumTracksInfo, Track
@@ -20,18 +22,20 @@ from services.album_utils import (
 from infrastructure.persistence import LibraryDB
 from infrastructure.cache.cache_keys import (
     ALBUM_INFO_PREFIX,
+    ALBUM_TRACKS_INFO_PREFIX,
     LIBRARY_ALBUM_DETAILS_PREFIX,
 )
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.validators import validate_mbid
 from infrastructure.queue.priority_queue import RequestPriority
-from core.exceptions import ResourceNotFoundError
+from core.exceptions import ExternalServiceError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBAlbumImages
 
 if TYPE_CHECKING:
     from infrastructure.persistence.album_release_pin_store import AlbumReleasePinStore
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
     from services.audiodb_browse_queue import AudioDBBrowseQueue
     from services.native.library_ownership_service import LibraryOwnershipService
 
@@ -51,6 +55,7 @@ class AlbumService:
         audiodb_browse_queue: "AudioDBBrowseQueue | None" = None,
         release_pin_store: "AlbumReleasePinStore | None" = None,
         ownership_service: "LibraryOwnershipService | None" = None,
+        native_library_store: "NativeLibraryStore | None" = None,
     ):
         self._library_repo = library_repo
         self._mb_repo = mb_repo
@@ -64,7 +69,9 @@ class AlbumService:
         # constructions that predate the feature (tests) -> pure auto behaviour.
         self._release_pins = release_pin_store
         self._ownership = ownership_service
+        self._native_library_store = native_library_store
         self._album_in_flight: dict[str, asyncio.Future[AlbumInfo]] = {}
+        self._tracks_in_flight: dict[str, asyncio.Future[AlbumTracksInfo]] = {}
 
     async def _provider_album_id(self, identifier: str) -> str:
         if self._ownership is None:
@@ -124,7 +131,7 @@ class AlbumService:
                         name=album_name,
                         artist_name=artist_name,
                     )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - normalize unexpected track composition failures
             logger.warning(
                 "Failed to get AudioDB album thumb for %s: %s", release_group_id[:8], e
             )
@@ -253,9 +260,11 @@ class AlbumService:
         release_group_id = validate_mbid(release_group_id, "album")
 
         await self._cache.delete(f"{ALBUM_INFO_PREFIX}{release_group_id}")
+        await self._cache.delete(f"{ALBUM_TRACKS_INFO_PREFIX}{release_group_id}")
         await self._cache.delete(f"{LIBRARY_ALBUM_DETAILS_PREFIX}{release_group_id}")
         await self._disk_cache.delete_album(release_group_id)
         self._album_in_flight.pop(release_group_id, None)
+        self._tracks_in_flight.pop(release_group_id, None)
 
         return await self.get_album_info(release_group_id)
 
@@ -305,9 +314,14 @@ class AlbumService:
                 if not future.done():
                     future.set_result(album_info)
                 return album_info
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.cancel()
+                raise
             except BaseException as exc:
                 if not future.done():
                     future.set_exception(exc)
+                    future.exception()
                 raise
             finally:
                 self._album_in_flight.pop(release_group_id, None)
@@ -434,12 +448,78 @@ class AlbumService:
             raise
 
         try:
-            cache_key = f"{ALBUM_INFO_PREFIX}{release_group_id}"
-            cached_album_info = await self._get_cached_album_info(
-                release_group_id, cache_key
+            tracks_cache_key = f"{ALBUM_TRACKS_INFO_PREFIX}{release_group_id}"
+            cached_tracks = await self._cache.get(tracks_cache_key)
+            if cached_tracks is not None:
+                return cached_tracks
+
+            if release_group_id in self._tracks_in_flight:
+                return await asyncio.shield(self._tracks_in_flight[release_group_id])
+
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[AlbumTracksInfo] = loop.create_future()
+            self._tracks_in_flight[release_group_id] = future
+            try:
+                result, is_local = await self._build_album_tracks_info(
+                    release_group_id, priority
+                )
+                if result.tracks:
+                    settings = self._preferences_service.get_advanced_settings()
+                    ttl = (
+                        settings.cache_ttl_album_library
+                        if is_local
+                        else settings.cache_ttl_album_non_library
+                    )
+                    await self._cache.set(tracks_cache_key, result, ttl_seconds=ttl)
+                if not future.done():
+                    future.set_result(result)
+                return result
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.cancel()
+                raise
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                    future.exception()
+                raise
+            finally:
+                self._tracks_in_flight.pop(release_group_id, None)
+
+        except ValueError:
+            raise
+        except ExternalServiceError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to get album tracks for {release_group_id}: {e}")
+            raise ResourceNotFoundError(f"Failed to get album tracks: {e}")
+
+    async def _build_album_tracks_info(
+        self, release_group_id: str, priority: RequestPriority
+    ) -> tuple[AlbumTracksInfo, bool]:
+        started = time.perf_counter()
+        local = await self._local_album_tracks_info(release_group_id)
+        if local is not None:
+            logger.info(
+                "Album tracks album=%s source=local outcome=success tracks=%d elapsed_ms=%.1f",
+                release_group_id[:8],
+                local.total_tracks,
+                (time.perf_counter() - started) * 1000,
             )
-            if cached_album_info:
-                return AlbumTracksInfo(
+            return local, True
+
+        cached_album_info = await self._get_cached_album_info(
+            release_group_id, f"{ALBUM_INFO_PREFIX}{release_group_id}"
+        )
+        if cached_album_info and cached_album_info.tracks:
+            logger.info(
+                "Album tracks album=%s source=album-cache outcome=success tracks=%d elapsed_ms=%.1f",
+                release_group_id[:8],
+                cached_album_info.total_tracks,
+                (time.perf_counter() - started) * 1000,
+            )
+            return (
+                AlbumTracksInfo(
                     tracks=cached_album_info.tracks,
                     total_tracks=cached_album_info.total_tracks,
                     total_length=cached_album_info.total_length,
@@ -447,75 +527,223 @@ class AlbumService:
                     barcode=cached_album_info.barcode,
                     country=cached_album_info.country,
                     selected_release_mbid=cached_album_info.selected_release_mbid,
-                )
+                ),
+                False,
+            )
 
+        group_started = time.perf_counter()
+        try:
             release_group = await self._fetch_release_group(
                 release_group_id, priority=priority
             )
-            ranked_releases = get_ranked_releases(release_group)
-
-            if not ranked_releases:
-                return AlbumTracksInfo(tracks=[], total_tracks=0)
-
-            tracks: list[Track] = []
-            total_length = 0
-            release_data = None
-
-            canonical_rg_id = release_group.get("id") or release_group_id
-            selected_release_id, _owned, _pinned = await self._effective_release_id(
-                canonical_rg_id, release_group
+        except Exception:
+            logger.warning(
+                "Album tracks album=%s source=release-group outcome=error elapsed_ms=%.1f",
+                release_group_id[:8],
+                (time.perf_counter() - group_started) * 1000,
             )
-            ranked_ids = [r.get("id") for r in ranked_releases[:3] if r.get("id")]
-            candidate_ids = list(
-                dict.fromkeys(rid for rid in (selected_release_id, *ranked_ids) if rid)
-            )
-            resolved_release_id = None
-            if candidate_ids:
-                release_results = await asyncio.gather(
-                    *(
-                        self._mb_repo.get_release_by_id(
-                            rid, includes=["recordings", "labels"], priority=priority
-                        )
-                        for rid in candidate_ids
-                    ),
-                    return_exceptions=True,
-                )
-                failures = [r for r in release_results if isinstance(r, Exception)]
-                if failures:
-                    logger.warning(
-                        f"Album {release_group_id[:8]}: {len(failures)}/{len(candidate_ids)} release fetches failed"
-                    )
-                for candidate_id, result in zip(candidate_ids, release_results):
-                    if isinstance(result, Exception) or not result:
-                        continue
-                    found_tracks, found_length = extract_tracks(result)
-                    if found_tracks:
-                        tracks = found_tracks
-                        total_length = found_length
-                        release_data = result
-                        resolved_release_id = candidate_id
-                        break
-
-            if not release_data:
-                return AlbumTracksInfo(tracks=[], total_tracks=0)
-
-            label = extract_label(release_data)
-
-            return AlbumTracksInfo(
-                tracks=tracks,
-                total_tracks=len(tracks),
-                total_length=total_length if total_length > 0 else None,
-                label=label,
-                barcode=release_data.get("barcode"),
-                country=release_data.get("country"),
-                selected_release_mbid=resolved_release_id,
-            )
-
-        except ValueError:
             raise
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to get album tracks for {release_group_id}: {e}")
-            raise ResourceNotFoundError(f"Failed to get album tracks: {e}")
+        logger.info(
+            "Album tracks album=%s source=release-group outcome=success elapsed_ms=%.1f",
+            release_group_id[:8],
+            (time.perf_counter() - group_started) * 1000,
+        )
+
+        ranked_releases = get_ranked_releases(release_group)
+        if not ranked_releases:
+            return AlbumTracksInfo(tracks=[], total_tracks=0), False
+
+        canonical_rg_id = release_group.get("id") or release_group_id
+        selected_release_id, _owned, _pinned = await self._effective_release_id(
+            canonical_rg_id, release_group
+        )
+        ranked_ids = [r.get("id") for r in ranked_releases[:3] if r.get("id")]
+        candidate_ids = list(
+            dict.fromkeys(rid for rid in (selected_release_id, *ranked_ids) if rid)
+        )
+        fallback_number = 0
+        for index, candidate_id in enumerate(candidate_ids):
+            role = "selected"
+            if index > 0:
+                fallback_number += 1
+                role = f"fallback-{fallback_number}"
+            lookup_started = time.perf_counter()
+            try:
+                release_data = await self._mb_repo.get_release_by_id(
+                    candidate_id,
+                    includes=["recordings", "labels"],
+                    priority=priority,
+                )
+            except Exception:
+                logger.warning(
+                    "Album tracks album=%s release=%s role=%s outcome=error elapsed_ms=%.1f",
+                    release_group_id[:8],
+                    str(candidate_id)[:8],
+                    role,
+                    (time.perf_counter() - lookup_started) * 1000,
+                )
+                raise
+            if not release_data:
+                outcome = "missing"
+                tracks: list[Track] = []
+                total_length = 0
+            else:
+                tracks, total_length = extract_tracks(release_data)
+                outcome = "success" if tracks else "empty"
+            logger.info(
+                "Album tracks album=%s release=%s role=%s outcome=%s tracks=%d elapsed_ms=%.1f",
+                release_group_id[:8],
+                str(candidate_id)[:8],
+                role,
+                outcome,
+                len(tracks),
+                (time.perf_counter() - lookup_started) * 1000,
+            )
+            if not tracks:
+                continue
+            return (
+                AlbumTracksInfo(
+                    tracks=tracks,
+                    total_tracks=len(tracks),
+                    total_length=total_length if total_length > 0 else None,
+                    label=extract_label(release_data),
+                    barcode=release_data.get("barcode"),
+                    country=release_data.get("country"),
+                    selected_release_mbid=candidate_id,
+                ),
+                False,
+            )
+        return AlbumTracksInfo(tracks=[], total_tracks=0), False
+
+    async def _local_album_tracks_info(
+        self, release_group_id: str
+    ) -> AlbumTracksInfo | None:
+        if self._native_library_store is not None:
+            ownership = await self._native_library_store.target_album_ownership_rows(
+                provider_ids={release_group_id.casefold()}
+            )
+            if len(ownership) != 1:
+                return None
+            local_album_id = str(ownership[0]["local_album_id"])
+            rows = await self._native_library_store.get_target_album_tracks(
+                local_album_id
+            )
+        else:
+            rows = await self._library_db.get_library_files_for_album(release_group_id)
+        if not rows:
+            return None
+
+        local_album_ids = {
+            str(row.get("local_album_id") or row.get("release_group_mbid") or "")
+            for row in rows
+        }
+        if len(local_album_ids) != 1:
+            return None
+
+        release_ids = {
+            str(row.get("provider_release_mbid") or row.get("release_mbid"))
+            for row in rows
+            if row.get("provider_release_mbid") or row.get("release_mbid")
+        }
+        if len(release_ids) > 1:
+            return None
+        local_release_id = next(iter(release_ids), None)
+        pinned_release_id = await self._pinned_release_id(release_group_id)
+        if pinned_release_id and pinned_release_id != local_release_id:
+            return None
+
+        tracks: list[Track] = []
+        total_length = 0
+        for row in rows:
+            duration = row.get("duration_seconds")
+            length = None
+            if duration is not None:
+                try:
+                    seconds = float(duration)
+                    if math.isfinite(seconds) and seconds > 0:
+                        length = round(seconds * 1000)
+                except (TypeError, ValueError):
+                    pass
+            if length is not None:
+                total_length += length
+            tracks.append(
+                Track(
+                    position=int(row.get("track_number") or 0),
+                    disc_number=int(row.get("disc_number") or 1),
+                    title=str(row.get("track_title") or row.get("title") or ""),
+                    length=length,
+                    recording_id=(
+                        str(row["recording_mbid"])
+                        if row.get("recording_mbid")
+                        else None
+                    ),
+                    release_track_id=(
+                        str(row["release_track_mbid"])
+                        if row.get("release_track_mbid")
+                        else None
+                    ),
+                )
+            )
+        return AlbumTracksInfo(
+            tracks=tracks,
+            total_tracks=len(tracks),
+            total_length=total_length if total_length > 0 else None,
+            selected_release_mbid=local_release_id,
+        )
+
+    async def get_exact_edition_tracks_info(
+        self,
+        release_group_id: str,
+        release_mbid: str,
+        priority: RequestPriority = RequestPriority.USER_INITIATED,
+    ) -> AlbumTracksInfo:
+        """Fetch one explicit edition without falling back to another release.
+
+        Acquisition identity is unsafe if a selected release silently drifts when
+        MusicBrainz cannot return it. This internal lookup therefore returns only the
+        requested release's tracklist or fails as a unit.
+        """
+
+        release_group_id = validate_mbid(
+            await self._provider_album_id(release_group_id), "album"
+        )
+        release_mbid = validate_mbid(release_mbid, "release")
+        release_data = await self._mb_repo.get_release_by_id(
+            release_mbid,
+            includes=["recordings", "labels"],
+            priority=priority,
+        )
+        if not release_data:
+            raise ResourceNotFoundError("The selected exact edition is unavailable")
+
+        linked_group = release_data.get("release-group") or release_data.get(
+            "release_group"
+        )
+        linked_group_id = (
+            str(linked_group.get("id"))
+            if isinstance(linked_group, dict) and linked_group.get("id")
+            else None
+        )
+        if (
+            linked_group_id
+            and linked_group_id.casefold() != release_group_id.casefold()
+        ):
+            raise ResourceNotFoundError(
+                "The selected exact edition does not belong to this album"
+            )
+
+        tracks, total_length = extract_tracks(release_data)
+        if not tracks:
+            raise ResourceNotFoundError("The selected exact edition has no tracklist")
+        return AlbumTracksInfo(
+            tracks=tracks,
+            total_tracks=len(tracks),
+            total_length=total_length if total_length > 0 else None,
+            label=extract_label(release_data),
+            barcode=release_data.get("barcode"),
+            country=release_data.get("country"),
+            selected_release_mbid=release_mbid,
+        )
 
     async def annotate_album_coverage(self, release_group_id: str, status):  # noqa: ANN001
         """Fill a ``LibraryAlbumStatus``'s coverage fields (P5, 2026-07-05 incident):
@@ -765,9 +993,11 @@ class AlbumService:
         """The pin changes the served tracklist/disambiguation, so the cached album
         payloads must go (mirrors refresh_album/_build_scan_invalidation)."""
         await self._cache.delete(f"{ALBUM_INFO_PREFIX}{release_group_id}")
+        await self._cache.delete(f"{ALBUM_TRACKS_INFO_PREFIX}{release_group_id}")
         await self._cache.delete(f"{LIBRARY_ALBUM_DETAILS_PREFIX}{release_group_id}")
         await self._disk_cache.delete_album(release_group_id)
         self._album_in_flight.pop(release_group_id, None)
+        self._tracks_in_flight.pop(release_group_id, None)
 
     async def set_edition_pin(
         self, release_group_id: str, release_mbid: str, user_id: str | None

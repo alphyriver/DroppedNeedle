@@ -138,23 +138,26 @@ def _album_identity_text(
     )
 
 
-def _availability_key(candidate: ScoredCandidate) -> tuple[int, int, int, int]:
+def _availability_key(candidate: ScoredCandidate) -> tuple[int, int, int, int, int]:
     queue_lengths = [
         file.queue_length for file in candidate.files if file.queue_length is not None
     ]
-    best_queue = min(queue_lengths) if queue_lengths else 2**31 - 1
+    complete_queue = max(queue_lengths) if queue_lengths else 2**31 - 1
     return (
-        int(any(file.has_free_slot for file in candidate.files)),
-        int(bool(queue_lengths)),
-        -best_queue,
-        max((file.upload_speed for file in candidate.files), default=0),
+        int(
+            bool(candidate.files)
+            and all(file.has_free_slot for file in candidate.files)
+        ),
+        int(len(queue_lengths) == len(candidate.files)),
+        -complete_queue,
+        min((file.upload_speed for file in candidate.files), default=0),
+        -sum(file.size for file in candidate.files),
     )
 
 
 def _candidate_rank_key(candidate: ScoredCandidate) -> tuple[int | float, ...]:
     return (
         _ACCEPTANCE_RANK.get(candidate.tier, 0),
-        int(candidate.final_score * 20 + 1e-9),
         tier_rank(candidate_tier(candidate.files)),
         *folder_hires_key(candidate.files),
         *_availability_key(candidate),
@@ -459,10 +462,9 @@ class AlbumPreflightScorer:
             )
 
         # Eligibility is absolute: a rejected/manual hi-res folder must never hide a
-        # safe automatic result. Within an eligibility tier, the 0.05 identity band
-        # comes before format, so Review starts with genuine matches rather than a
-        # weak 24-bit folder. Quality and hi-res preferences remain within that band;
-        # peer free-slot, shortest queue and real (unsaturated) speed then break ties.
+        # safe automatic result. Once candidates pass the same safety tier, quality
+        # and resolution are absolute. Complete-folder availability (free slot,
+        # slowest queue, slowest advertised speed, then size) breaks quality ties.
         scored.sort(key=_candidate_rank_key, reverse=True)
         ranked = scored[:50]
         logger.info(

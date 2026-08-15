@@ -140,7 +140,9 @@ class DiscoverQueueManager:
         return DiscoverQueueStatusResponse(status=state.status.value)
 
     @staticmethod
-    def _build_generate_response(action: str, status: DiscoverQueueStatusResponse) -> QueueGenerateResponse:
+    def _build_generate_response(
+        action: str, status: DiscoverQueueStatusResponse
+    ) -> QueueGenerateResponse:
         return QueueGenerateResponse(
             action=action,
             status=status.status,
@@ -153,20 +155,34 @@ class DiscoverQueueManager:
 
     def get_queue(self, user_id: str) -> DiscoverQueueResponse | None:
         state = self._get_state(user_id)
-        if state.status == QueueBuildStatus.READY and state.queue and not self._is_stale(state):
+        if (
+            state.status == QueueBuildStatus.READY
+            and state.queue
+            and not self._is_stale(state)
+        ):
             return state.queue
         return None
 
-    async def start_build(self, user_id: str, *, force: bool = False) -> QueueGenerateResponse:
+    async def start_build(
+        self, user_id: str, *, force: bool = False
+    ) -> QueueGenerateResponse:
         await self.ensure_loaded(user_id)
         async with self._lock:
             state = self._get_state(user_id)
 
             if state.status == QueueBuildStatus.BUILDING:
-                return self._build_generate_response("already_building", self.get_status(user_id))
+                return self._build_generate_response(
+                    "already_building", self.get_status(user_id)
+                )
 
-            if not force and state.status == QueueBuildStatus.READY and not self._is_stale(state):
-                return self._build_generate_response("already_ready", self.get_status(user_id))
+            if (
+                not force
+                and state.status == QueueBuildStatus.READY
+                and not self._is_stale(state)
+            ):
+                return self._build_generate_response(
+                    "already_ready", self.get_status(user_id)
+                )
 
             if state.task and not state.task.done():
                 state.task.cancel()
@@ -175,8 +191,11 @@ class DiscoverQueueManager:
             state.error = None
             state.task = asyncio.create_task(self._do_build(user_id))
             from core.task_registry import TaskRegistry
+
             try:
-                TaskRegistry.get_instance().register(f"discover-build-{user_id}", state.task)
+                TaskRegistry.get_instance().register(
+                    f"discover-build-{user_id}", state.task
+                )
             except RuntimeError:
                 pass
 
@@ -208,7 +227,9 @@ class DiscoverQueueManager:
                 return item
             try:
                 async with semaphore:
-                    enrichment = await self._discover.enrich_queue_item(item.release_group_mbid)
+                    enrichment = await self._discover.enrich_queue_item(
+                        item.release_group_mbid
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Queue item enrichment failed (release_group_mbid=%s): %s",
@@ -221,7 +242,9 @@ class DiscoverQueueManager:
             item_data["enrichment"] = enrichment
             return DiscoverQueueItemFull(**item_data)
 
-        hydrated_items = await asyncio.gather(*(hydrate_item(item) for item in queue.items))
+        hydrated_items = await asyncio.gather(
+            *(hydrate_item(item) for item in queue.items)
+        )
         return clone_with_updates(queue, {"items": hydrated_items})
 
     async def _do_build(self, user_id: str) -> None:
@@ -246,8 +269,11 @@ class DiscoverQueueManager:
             task = asyncio.create_task(self._prewarm_covers(queue))
             task.add_done_callback(_log_queue_task_error)
             from core.task_registry import TaskRegistry
+
             try:
-                TaskRegistry.get_instance().register(f"discover-cover-prewarm-{user_id}", task)
+                TaskRegistry.get_instance().register(
+                    f"discover-cover-prewarm-{user_id}", task
+                )
             except RuntimeError:
                 pass
         except asyncio.CancelledError:
@@ -279,11 +305,13 @@ class DiscoverQueueManager:
             async with semaphore:
                 try:
                     result = await self._cover_repo.get_release_group_cover(
-                        mbid, size="500", priority=RequestPriority.BACKGROUND_SYNC
+                        mbid, size="250", priority=RequestPriority.BACKGROUND_SYNC
                     )
                     return result is not None
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("Discover queue cover pre-warm failed for %s: %s", mbid[:8], exc)
+                    logger.debug(
+                        "Discover queue cover pre-warm failed for %s: %s", mbid[:8], exc
+                    )
                     return False
 
         await asyncio.gather(*(warm_one(m) for m in mbids), return_exceptions=True)

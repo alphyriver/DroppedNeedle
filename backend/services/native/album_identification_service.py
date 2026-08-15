@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -29,10 +30,16 @@ from services.native.conditional_fingerprint_service import (
     ConditionalFingerprintService,
 )
 from services.native.identification_queue_service import IdentificationQueueService
-from services.native.identification_revisions import album_input_revisions
+from services.native.identification_revisions import (
+    album_identity_revision,
+    album_input_revisions,
+)
 
 CacheInvalidator = Callable[[set[str]], Awaitable[None]]
+PostIdentificationCallback = Callable[[str, str], Awaitable[object]]
 MAX_NEW_FINGERPRINTS_PER_ATTEMPT = 2
+
+logger = logging.getLogger(__name__)
 
 
 def _valid_mbid(value: str | None) -> bool:
@@ -63,9 +70,12 @@ def _to_grouping_track(row: dict) -> GroupingTrack:
         track_number=int(row["track_number"] or 0),
         disc_number=int(row["disc_number"] or 1),
         duration_seconds=row["duration_seconds"],
-        recording_mbid=row["embedded_recording_mbid"],
+        recording_mbid=row["embedded_recording_mbid"] or row.get("recording_mbid"),
         release_mbid=row["embedded_release_mbid"],
         release_group_mbid=row["embedded_release_group_mbid"],
+        release_track_mbid=(
+            row["embedded_release_track_mbid"] or row.get("release_track_mbid")
+        ),
         is_compilation=bool(row["is_compilation"]),
         tags_readable=not bool(row["metadata_incomplete"]),
         membership_locked=bool(row["membership_locked"]),
@@ -83,6 +93,7 @@ def _embedded_decision(
             row["embedded_release_group_mbid"],
             row["embedded_release_mbid"],
             row["embedded_recording_mbid"],
+            row["embedded_release_track_mbid"],
             row["embedded_artist_mbid"],
             row["embedded_album_artist_mbid"],
         )
@@ -100,12 +111,22 @@ def _embedded_decision(
         for row in raw_tracks
         if row["embedded_album_artist_mbid"]
     }
-    recordings = [track.recording_mbid for track in tracks if track.recording_mbid]
+    recordings = [
+        str(row["embedded_recording_mbid"])
+        for row in raw_tracks
+        if row["embedded_recording_mbid"]
+    ]
+    release_tracks = [
+        str(row["embedded_release_track_mbid"])
+        for row in raw_tracks
+        if row["embedded_release_track_mbid"]
+    ]
     if (
         len(groups) > 1
         or len(releases) > 1
         or len(artist_ids) > 1
         or len(recordings) != len(set(recordings))
+        or len(release_tracks) != len(set(release_tracks))
     ):
         return IdentificationDecision(
             outcome="contradictory",
@@ -128,15 +149,27 @@ def _embedded_decision(
         track_evidence=[
             TrackEvidence(
                 local_track_id=track.local_track_id,
-                classification=("supported" if track.recording_mbid else "unknown"),
+                classification=(
+                    "supported" if row["embedded_recording_mbid"] else "unknown"
+                ),
                 evidence_kinds=(
-                    ["embedded_recording_mbid"]
-                    if track.recording_mbid
+                    [
+                        "embedded_recording_mbid",
+                        *(
+                            ["embedded_release_track_mbid"]
+                            if row["embedded_release_track_mbid"]
+                            else []
+                        ),
+                    ]
+                    if row["embedded_recording_mbid"]
                     else ["embedded_album_identity_only"]
                 ),
-                recording_mbid=track.recording_mbid,
+                recording_mbid=row["embedded_recording_mbid"],
+                release_track_mbid=row["embedded_release_track_mbid"],
+                candidate_disc_number=track.disc_number,
+                candidate_track_position=track.track_number,
             )
-            for track in tracks
+            for track, row in zip(tracks, raw_tracks, strict=True)
         ],
         score=1.0,
         margin=1.0,
@@ -151,6 +184,163 @@ def _embedded_decision(
     )
 
 
+def _stored_track_identity_decision(
+    raw_tracks: list[dict],
+) -> IdentificationDecision | None:
+    for row in raw_tracks:
+        for embedded_key, current_key in (
+            ("embedded_recording_mbid", "recording_mbid"),
+            ("embedded_release_track_mbid", "release_track_mbid"),
+        ):
+            embedded = row[embedded_key]
+            current = row[current_key]
+            if embedded and current and embedded != current:
+                return IdentificationDecision(
+                    outcome="contradictory",
+                    reason_code="CONFLICTING_EMBEDDED_IDS",
+                )
+    return None
+
+
+def _embedded_release_decision(
+    tracks: list[GroupingTrack],
+) -> IdentificationDecision | None:
+    release_ids = [track.release_mbid for track in tracks]
+    populated = [release_id for release_id in release_ids if release_id]
+    if not populated:
+        return None
+    if len(populated) != len(release_ids):
+        return IdentificationDecision(
+            outcome="insufficient_evidence",
+            reason_code="INCOMPLETE_EMBEDDED_RELEASE_IDS",
+        )
+    if len(set(populated)) != 1:
+        return IdentificationDecision(
+            outcome="contradictory",
+            reason_code="CONFLICTING_EMBEDDED_IDS",
+        )
+    return None
+
+
+def _enforce_existing_album_identity(
+    decision: IdentificationDecision,
+    identity: dict | None,
+    raw_tracks: list[dict],
+) -> None:
+    if identity is None or identity["decision_source"] not in {
+        "manual",
+        "legacy_import",
+    }:
+        return
+    current_group = str(identity["release_group_mbid"] or "")
+    current_release = str(identity["release_mbid"] or "")
+    embedded_releases = {
+        str(row["embedded_release_mbid"])
+        for row in raw_tracks
+        if row["embedded_release_mbid"]
+    }
+    provider_canonicalized_current_release = (
+        bool(current_release)
+        and len(embedded_releases) == 1
+        and current_release in embedded_releases
+        and all(row["embedded_release_mbid"] for row in raw_tracks)
+    )
+    selected_conflicts = False
+    for candidate in decision.candidates:
+        conflicts = bool(current_group) and (
+            candidate.release_group_mbid != current_group
+        )
+        if current_release and candidate.release_mbid != current_release:
+            conflicts = conflicts or not provider_canonicalized_current_release
+        if not conflicts:
+            continue
+        candidate.reason_code = "CONFLICTING_TRACK_EVIDENCE"
+        selected_conflicts = (
+            selected_conflicts
+            or decision.selected_candidate_key == _candidate_key(candidate)
+        )
+    if selected_conflicts:
+        decision.outcome = "contradictory"
+        decision.reason_code = "MANUAL_IDENTITY_STALE"
+        decision.selected_candidate_key = None
+
+
+def _enforce_raw_track_identities(
+    decision: IdentificationDecision,
+    raw_tracks: list[dict],
+) -> None:
+    rows = {str(row["id"]): row for row in raw_tracks}
+    embedded_groups = {
+        str(row["embedded_release_group_mbid"])
+        for row in raw_tracks
+        if row["embedded_release_group_mbid"]
+    }
+    selected_conflicts = False
+    for candidate in decision.candidates:
+        candidate_conflicts = bool(
+            embedded_groups and embedded_groups != {candidate.release_group_mbid}
+        )
+        for item in candidate.track_evidence:
+            row = rows.get(item.local_track_id)
+            if row is None:
+                continue
+            recording_values = {
+                str(value)
+                for value in (
+                    row["embedded_recording_mbid"],
+                    row["recording_mbid"],
+                )
+                if value
+            }
+            accepted_recordings = {
+                str(value)
+                for value in (item.recording_mbid, *item.recording_mbid_redirects)
+                if value
+            }
+            release_track_values = {
+                str(value)
+                for value in (
+                    row["embedded_release_track_mbid"],
+                    row["release_track_mbid"],
+                )
+                if value
+            }
+            conflict_kinds: list[str] = []
+            ambiguous_occurrence = (
+                "ambiguous_release_track_identity" in item.evidence_kinds
+            )
+            if (
+                recording_values
+                and accepted_recordings
+                and not ambiguous_occurrence
+                and not recording_values.issubset(accepted_recordings)
+            ):
+                conflict_kinds.append("recording_mbid_conflict")
+            if release_track_values and (
+                item.release_track_mbid is None
+                or release_track_values != {item.release_track_mbid}
+            ):
+                conflict_kinds.append("release_track_mbid_conflict")
+            if not conflict_kinds:
+                continue
+            item.classification = "contradictory"
+            item.evidence_kinds = list(
+                dict.fromkeys([*item.evidence_kinds, *conflict_kinds])
+            )
+            candidate_conflicts = True
+        if not candidate_conflicts:
+            continue
+        candidate.reason_code = "CONFLICTING_TRACK_EVIDENCE"
+        selected_conflicts = (
+            selected_conflicts
+            or decision.selected_candidate_key == _candidate_key(candidate)
+        )
+    if selected_conflicts:
+        decision.outcome = "contradictory"
+        decision.reason_code = "CONFLICTING_TRACK_EVIDENCE"
+        decision.selected_candidate_key = None
+
+
 class AlbumIdentificationService:
     def __init__(
         self,
@@ -160,6 +350,7 @@ class AlbumIdentificationService:
         evidence_engine: AlbumEvidenceEngine,
         fingerprints: ConditionalFingerprintService,
         invalidate: CacheInvalidator | None = None,
+        on_identified: PostIdentificationCallback | None = None,
     ) -> None:
         self._store = store
         self._queue = queue
@@ -167,6 +358,7 @@ class AlbumIdentificationService:
         self._evidence_engine = evidence_engine
         self._fingerprints = fingerprints
         self._invalidate = invalidate
+        self._on_identified = on_identified
 
     async def run_claimed_job(
         self,
@@ -184,7 +376,15 @@ class AlbumIdentificationService:
                 job, worker_id, "SUBJECT_NOT_AVAILABLE", now=timestamp
             )
             return "provider_deferred"
-        raw_tracks: list[dict] = context["tracks"]
+        raw_tracks: list[dict] = [
+            row for row in context["tracks"] if row["availability"] == "indexed"
+        ]
+        if not raw_tracks:
+            await self._queue.defer(
+                job, worker_id, "SUBJECT_NOT_AVAILABLE", now=timestamp
+            )
+            return "provider_deferred"
+        identity_revision = album_identity_revision(context["identity"], raw_tracks)
         tracks = [_to_grouping_track(row) for row in raw_tracks]
         degradation = init_degradation_context()
         decision: IdentificationDecision | None = None
@@ -193,12 +393,21 @@ class AlbumIdentificationService:
             return not await self._queue.is_paused()
 
         try:
-            decision = _embedded_decision(tracks, raw_tracks)
+            local_metadata_only = all(
+                row["applied_policy"] == "local_metadata" for row in raw_tracks
+            )
+            release_decision = _embedded_release_decision(tracks)
+            decision = _stored_track_identity_decision(raw_tracks)
+            if decision is None and release_decision is not None:
+                decision = release_decision
+            elif decision is None and local_metadata_only:
+                decision = _embedded_decision(tracks, raw_tracks)
+            elif decision is None and any(track.release_mbid for track in tracks):
+                decision = None
+            elif decision is None:
+                decision = _embedded_decision(tracks, raw_tracks)
             decision_source = "embedded" if decision is not None else "automatic"
             if decision is None:
-                local_metadata_only = all(
-                    row["applied_policy"] == "local_metadata" for row in raw_tracks
-                )
                 if local_metadata_only:
                     decision = IdentificationDecision(
                         outcome="no_candidate",
@@ -214,7 +423,11 @@ class AlbumIdentificationService:
                     )
                     if cached is not None:
                         cached_release_groups.extend(cached.release_group_ids)
-                        if cached.state == "matched" and cached.recording_mbid:
+                        if (
+                            not track.recording_mbid
+                            and cached.state == "matched"
+                            and cached.recording_mbid
+                        ):
                             track.recording_mbid = cached.recording_mbid
                 recalled = await self._candidates.recall(
                     tracks,
@@ -242,7 +455,9 @@ class AlbumIdentificationService:
                             and item.classification == "supported"
                             and item.recording_mbid
                         }
-                        needed = len(supported_recordings) != 1
+                        needed = (
+                            not track.recording_mbid and len(supported_recordings) != 1
+                        )
                         outcome = await self._fingerprints.fingerprint_if_needed(
                             local_track_id=track.local_track_id,
                             path=Path(str(row["file_path"])),
@@ -291,6 +506,7 @@ class AlbumIdentificationService:
                             return "paused"
                         decision = self._evidence_engine.decide(tracks, recalled)
 
+            _enforce_raw_track_identities(decision, raw_tracks)
             degraded = degradation.degraded_summary()
             if degraded and not decision.candidates:
                 await self._queue.defer(
@@ -300,19 +516,7 @@ class AlbumIdentificationService:
                     now=timestamp,
                 )
                 return "provider_deferred"
-            existing_identity = context["identity"]
-            if (
-                existing_identity is not None
-                and existing_identity["decision_source"] == "manual"
-                and decision.outcome == "identified"
-                and decision.selected_candidate_key is not None
-                and not decision.selected_candidate_key.startswith(
-                    f"{existing_identity['release_group_mbid']}:"
-                )
-            ):
-                decision.outcome = "contradictory"
-                decision.reason_code = "MANUAL_IDENTITY_STALE"
-                decision.selected_candidate_key = None
+            _enforce_existing_album_identity(decision, context["identity"], raw_tracks)
             evidence_records = [
                 IdentificationEvidenceRecord(
                     id=str(uuid.uuid4()),
@@ -337,6 +541,7 @@ class AlbumIdentificationService:
                 input_tag_revision=tag_revision,
                 input_file_revision=file_revision,
                 input_policy_revision=policy_revision,
+                input_identity_revision=identity_revision,
                 matcher_version=MATCHER_VERSION,
                 state=decision.outcome,
                 terminal_reason_code=decision.reason_code,
@@ -353,6 +558,9 @@ class AlbumIdentificationService:
                 worker_id=worker_id,
                 expected_job_revision=int(job["row_revision"]),
                 expected_album_revision=int(context["album"]["row_revision"]),
+                expected_input_revision=":".join(
+                    (tag_revision, file_revision, policy_revision)
+                ),
                 attempt=attempt,
                 evidence=evidence_records,
                 outcome=decision.outcome,
@@ -365,6 +573,16 @@ class AlbumIdentificationService:
                     else None
                 ),
             )
+            if decision.outcome == "identified" and self._on_identified is not None:
+                try:
+                    await self._on_identified(
+                        str(job["local_album_id"]), policy_revision
+                    )
+                except Exception:  # noqa: BLE001 - identification is already committed
+                    logger.warning(
+                        "Automatic scan-discovered management scheduling failed",
+                        exc_info=True,
+                    )
             if self._invalidate is not None:
                 await self._invalidate(
                     {

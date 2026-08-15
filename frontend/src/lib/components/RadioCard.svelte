@@ -80,6 +80,7 @@
 							mbid={seedId}
 							alt={section.title}
 							size="full"
+							requestSize={250}
 							rounded="none"
 							className="h-full w-full object-cover"
 						/>

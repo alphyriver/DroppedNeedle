@@ -121,6 +121,22 @@ def get_listenbrainz_repository() -> "ListenBrainzRepository":
 
 
 @singleton
+def get_lrclib_repository() -> "LrclibRepository":
+    from repositories.lrclib_repository import LrclibRepository
+
+    advanced = get_preferences_service().get_advanced_settings()
+    client = HttpClientFactory.get_client(
+        name="lrclib",
+        timeout=float(advanced.http_timeout),
+        connect_timeout=float(advanced.http_connect_timeout),
+        max_connections=4,
+        max_keepalive=4,
+        settings=get_settings(),
+    )
+    return LrclibRepository(client, get_cache())
+
+
+@singleton
 def get_jellyfin_repository() -> "JellyfinRepository":
     from repositories.jellyfin_repository import JellyfinRepository
 
@@ -937,6 +953,22 @@ def get_source_download_client(source: str, client_type: str) -> "DownloadClient
             f"Download client {client_type!r} does not support source {source!r}"
         )
     return client
+
+
+def get_download_client_for_source(source: str) -> "DownloadClientProtocol":
+    """Resolve the download client that owns a given acquisition source.
+
+    Derived from each adapter's declared ``supported_sources`` instead of a
+    hardcoded source->client_type map, so registering an adapter in
+    ``_DOWNLOAD_CLIENT_PROVIDERS`` is the only step needed to route a new source.
+    Every provider is a ``@singleton``, so probing them is a one-time cost."""
+    from core.exceptions import ConfigurationError
+
+    for provider in _DOWNLOAD_CLIENT_PROVIDERS.values():
+        client = provider()
+        if source in client.supported_sources:
+            return client
+    raise ConfigurationError(f"No download client supports source {source!r}")
 
 
 @singleton

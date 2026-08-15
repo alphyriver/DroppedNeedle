@@ -17,6 +17,8 @@ import type {
 	LibraryAlbumDetail,
 	LibraryAlbumSummary,
 	LibraryArtistSummary,
+	LibraryArtistAppearancesResponse,
+	LibraryArtistScope,
 	LibraryScanSchedule,
 	LibraryStats,
 	LibraryMembershipResponse,
@@ -73,6 +75,7 @@ export const getLibraryMembershipQuery = (getAlbumIds: Getter<string[]>) =>
 export const getLibraryAlbumsQueryOptions = ({ page, sort, q, format }: LibraryAlbumsParams) =>
 	queryOptions({
 		staleTime: CACHE_TTL.LIBRARY_NATIVE,
+		placeholderData: keepPreviousData,
 		queryKey: LibraryQueryKeyFactory.albums(page, sort, q, format),
 		queryFn: ({ signal }) =>
 			api.global.get<NativeAlbumsResponse>(
@@ -88,20 +91,28 @@ export interface LibraryArtistsParams {
 	sortBy: ArtistSort;
 	sortOrder: 'asc' | 'desc';
 	q: string;
+	scope: LibraryArtistScope;
 }
 
 const ARTISTS_PAGE_SIZE = 48;
 
 export const getLibraryArtistsInfiniteQuery = (getParams: Getter<LibraryArtistsParams>) =>
 	createInfiniteQuery(() => {
-		const { sortBy, sortOrder, q } = getParams();
+		const { sortBy, sortOrder, q, scope } = getParams();
 		return {
 			staleTime: CACHE_TTL.LIBRARY_NATIVE,
-			queryKey: LibraryQueryKeyFactory.artists(sortBy, sortOrder, q),
+			queryKey: LibraryQueryKeyFactory.artists(scope, sortBy, sortOrder, q),
 			initialPageParam: 0,
 			queryFn: ({ pageParam = 0, signal }) =>
 				api.global.get<NativeArtistsResponse>(
-					API.library.artists(ARTISTS_PAGE_SIZE, pageParam, sortBy, sortOrder, q || undefined),
+					API.library.artists(
+						ARTISTS_PAGE_SIZE,
+						pageParam,
+						sortBy,
+						sortOrder,
+						q || undefined,
+						scope
+					),
 					{ signal }
 				),
 			getNextPageParam: (lastPage: NativeArtistsResponse, allPages: NativeArtistsResponse[]) => {
@@ -214,6 +225,31 @@ export const getLibraryArtistAlbumsQuery = (getArtistId: Getter<string>) =>
 			queryKey: LibraryQueryKeyFactory.artistAlbums(artistId),
 			queryFn: ({ signal }) =>
 				api.global.get<NativeAlbumsResponse>(API.library.artistAlbums(artistId), { signal })
+		};
+	});
+
+const ARTIST_APPEARANCES_PAGE_SIZE = 20;
+
+export const getLibraryArtistAppearancesQuery = (getArtistId: Getter<string>) =>
+	createInfiniteQuery(() => {
+		const artistId = getArtistId();
+		return {
+			enabled: !!artistId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.artistAppearances(artistId),
+			initialPageParam: 0,
+			queryFn: ({ pageParam = 0, signal }) =>
+				api.global.get<LibraryArtistAppearancesResponse>(
+					API.library.artistAppearances(artistId, ARTIST_APPEARANCES_PAGE_SIZE, pageParam),
+					{ signal }
+				),
+			getNextPageParam: (
+				lastPage: LibraryArtistAppearancesResponse,
+				allPages: LibraryArtistAppearancesResponse[]
+			) => {
+				const loaded = allPages.reduce((total, page) => total + page.items.length, 0);
+				return loaded < lastPage.total ? loaded : undefined;
+			}
 		};
 	});
 

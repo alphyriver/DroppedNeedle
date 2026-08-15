@@ -56,6 +56,7 @@ class TargetLibraryViewService:
         sort_order: str = "asc",
         q: str | None = None,
         user: "UserRecord | None" = None,
+        scope: str = "album",
     ) -> tuple[list[ViewArtist], int]:
         del sort_by
         rows, total = await self._store.list_target_artists(
@@ -63,6 +64,7 @@ class TargetLibraryViewService:
             offset=offset,
             search=q,
             sort_order=sort_order,
+            scope=scope,
         )
         artists = [self._artist(row) for row in rows]
         await self._overlay_favorites(artists, "artist", user)
@@ -166,13 +168,15 @@ class TargetLibraryViewService:
         if resolved is None:
             return None
         rows, _ = await self._store.list_target_artists(
-            limit=1, offset=0, sort_order="asc", artist_ids=[resolved]
+            limit=1,
+            offset=0,
+            sort_order="asc",
+            artist_ids=[resolved],
+            scope="all",
         )
         if not rows:
             return None
         albums = await self.get_albums_for_artist(resolved, user=user)
-        if not albums:
-            return None
         artist = self._artist(rows[0])
         await self._overlay_favorites([artist], "artist", user)
         await self._overlay_plays([artist], "artist", user)

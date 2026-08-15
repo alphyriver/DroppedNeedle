@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { ChevronLeft, Disc3, ExternalLink, FileSearch, FileUp } from 'lucide-svelte';
+	import { ChevronLeft, Disc3, ExternalLink, FileSearch, FileUp, Mic2 } from 'lucide-svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import LibraryAlbumCard from '$lib/components/library/LibraryAlbumCard.svelte';
+	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
 	import ArtistMergeDialog from '$lib/components/library/ArtistMergeDialog.svelte';
 	import LocalIdentityBadge from '$lib/components/library/LocalIdentityBadge.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
@@ -23,7 +24,7 @@
 	const artist = $derived(artistQuery.data);
 	const albums = $derived(albumsQuery.data?.items ?? []);
 	const contributionAlbums = $derived(
-		albums.filter((album) => album.album_identity_state !== 'release_linked')
+		albums.filter((album) => album.album_identity_state === 'local_only')
 	);
 	const contributionMutation = createLibraryContributionMutation();
 
@@ -70,6 +71,7 @@
 				available={artist.musicbrainz_artist_id !== null}
 				alt={artist.name}
 				size="xl"
+				requestSize={250}
 				className="shadow-xl"
 			/>
 			<div class="min-w-0 flex-1">
@@ -80,11 +82,22 @@
 					showDescription
 					className="mt-3"
 				/>
-				<p class="mt-2 text-sm text-base-content/55">
-					{artist.album_count}
-					{artist.album_count === 1 ? 'album' : 'albums'} · {artist.track_count}
-					{artist.track_count === 1 ? 'track' : 'tracks'}
-				</p>
+				<div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-base-content/55">
+					{#if artist.album_count > 0}
+						<span>
+							{artist.album_count}
+							{artist.album_count === 1 ? 'album' : 'albums'} · {artist.track_count}
+							{artist.track_count === 1 ? 'track' : 'tracks'}
+						</span>
+					{/if}
+					{#if artist.appearance_track_count > 0}
+						<span class="inline-flex items-center gap-1.5 text-accent">
+							<Mic2 class="h-3.5 w-3.5" />
+							Appears on {artist.appearance_track_count}
+							{artist.appearance_track_count === 1 ? 'local track' : 'local tracks'}
+						</span>
+					{/if}
+				</div>
 				{#if artist.musicbrainz_artist_id}
 					<a
 						class="btn btn-ghost btn-sm mt-3 gap-2"
@@ -147,6 +160,10 @@
 					{/each}
 				</ul>
 			</section>
+		{/if}
+
+		{#if artist.appearance_track_count > 0}
+			<ArtistAppearancesSection artistId={artist.id} className="mt-8" />
 		{/if}
 
 		<section class="mt-8" aria-labelledby="artist-albums-title">

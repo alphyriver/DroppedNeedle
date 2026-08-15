@@ -34,6 +34,12 @@ class TargetCoverArtService:
             return False
         return bool(checker(self._album_provider_ids.get(album_id, album_id), size))
 
+    def is_release_cover_warming(self, release_id: str) -> bool:
+        checker = getattr(self._provider, "is_release_cover_warming", None)
+        if not callable(checker):
+            return False
+        return bool(checker(release_id))
+
     def is_artist_cover_warming(self, artist_id: str, size: int | None = None) -> bool:
         checker = getattr(self._provider, "is_artist_cover_warming", None)
         if not callable(checker):

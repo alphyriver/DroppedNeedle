@@ -156,6 +156,28 @@ async def run_target_one_time_migrations(
         logger.info(
             "Backfilled %d identified album artwork associations", artwork_count
         )
+    release_year_count = await store.backfill_manual_identity_release_years(
+        updated_at=time.time()
+    )
+    if release_year_count:
+        logger.info("Backfilled %d accepted release catalog years", release_year_count)
+    from core.dependencies.service_providers import (
+        get_artist_identity_reconciliation_service,
+        get_catalog_identity_hygiene_service,
+    )
+
+    hygiene_job = await get_catalog_identity_hygiene_service().enqueue_backfill()
+    logger.info(
+        "Queued bounded catalog identity hygiene backfill %s",
+        hygiene_job["id"],
+    )
+    reconciliation_job = (
+        await get_artist_identity_reconciliation_service().enqueue_backfill()
+    )
+    logger.info(
+        "Queued bounded artist identity reconciliation backfill %s",
+        reconciliation_job["id"],
+    )
     await auth_store.backfill_usernames()
     await auth_store.migrate_local_provider_to_username()
     await _migrate_shared_avatar(auth_store, cache_dir)
@@ -186,6 +208,7 @@ async def start_target_operational_runtime(
     from core.dependencies import (
         get_audiodb_browse_queue,
         get_audiodb_image_service,
+        get_acquisition_cleanup_service,
         get_download_client_repository,
         get_target_events_watcher_service,
         get_jellyfin_repository,
@@ -216,6 +239,7 @@ async def start_target_operational_runtime(
     from core.dependencies.repo_providers import get_download_store
     from core.dependencies.service_providers import get_plugin_host
     from core.tasks import (
+        start_acquisition_cleanup_task,
         start_artist_discovery_cache_warming_task,
         start_audiodb_sweep_task,
         start_background_upgrade_scan_task,
@@ -223,6 +247,7 @@ async def start_target_operational_runtime(
         start_download_auto_retry_task,
         start_download_resume_task,
         start_download_watchdog_task,
+        start_management_hold_auto_retry_task,
         start_events_watcher_task,
         start_orphan_cover_demotion_task,
         start_personal_mix_refresh_task,
@@ -240,9 +265,15 @@ async def start_target_operational_runtime(
     target = get_target_consumer_composition()
     library = target.repository
 
+    try:
+        await get_acquisition_cleanup_service().recover_startup()
+    except Exception:  # noqa: BLE001 - durable worker continues recovery after startup
+        logger.exception("Acquisition cleanup startup recovery failed")
+    start_acquisition_cleanup_task(get_acquisition_cleanup_service)
     start_download_resume_task(get_target_download_orchestrator())
     start_download_watchdog_task(get_target_download_orchestrator)
     start_download_auto_retry_task(get_target_download_orchestrator)
+    start_management_hold_auto_retry_task(get_target_download_service)
 
     try:
         await get_target_drop_import_service().sweep_stale()

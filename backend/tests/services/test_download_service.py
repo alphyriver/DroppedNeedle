@@ -1,6 +1,7 @@
 """DownloadService tests: library check, search pipeline, pick/cancel ownership +
 bounds (domain exceptions), and the downloads-mount health check."""
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.exceptions import (
+    AutomaticManagementHoldError,
     ConfigurationError,
     PermissionDeniedError,
     ResourceNotFoundError,
@@ -126,6 +128,18 @@ async def test_disabled_client_blocks_every_download_entry_point():
             await make()
     store.create_task.assert_not_called()
     orchestrator.retry_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_activity_summary_delegates_user_scope_to_store():
+    service, store, *_rest = _make_service()
+    expected = object()
+    store.get_activity_summary.return_value = expected
+
+    result = await service.get_activity_summary("u1", "user")
+
+    assert result is expected
+    store.get_activity_summary.assert_awaited_once_with("u1", "user")
 
 
 @pytest.mark.asyncio
@@ -323,12 +337,18 @@ def _single_album_service(*, tracks=None, total=1, fail=False):
                 disc_number=1,
                 title="the arrival",
                 recording_id="rec-180ceef5",
+                release_track_id="release-track-1",
                 length=155556,
             )
         ]
-    svc.get_album_tracks_info.return_value = SimpleNamespace(
-        tracks=tracks, total_tracks=total
+    for index, track in enumerate(tracks, start=1):
+        if not hasattr(track, "release_track_id"):
+            track.release_track_id = f"release-track-{index}"
+    info = SimpleNamespace(
+        tracks=tracks, total_tracks=total, selected_release_mbid="release-1"
     )
+    svc.get_album_tracks_info.return_value = info
+    svc.get_exact_edition_tracks_info.return_value = info
     return svc
 
 
@@ -346,6 +366,10 @@ async def test_request_album_threads_single_track_identity():
     assert kwargs["track_count"] == 1
     assert kwargs["track_title"] == "the arrival"
     assert kwargs["recording_mbid"] == "rec-180ceef5"
+    assert kwargs["release_mbid"] == "release-1"
+    assert kwargs["release_track_mbid"] == "release-track-1"
+    assert kwargs["track_number"] == 1
+    assert kwargs["disc_number"] == 1
     assert kwargs["track_duration_seconds"] == pytest.approx(155.556)
 
 
@@ -370,24 +394,41 @@ async def test_request_album_multi_track_release_threads_nothing():
 
     kwargs = store.create_task.await_args.kwargs
     assert kwargs["track_count"] == 3
+    assert kwargs["release_mbid"] == "release-1"
+    assert kwargs["release_track_mbid"] is None
     assert kwargs["track_title"] is None
     assert kwargs["recording_mbid"] is None
     assert kwargs["track_duration_seconds"] is None
 
 
 @pytest.mark.asyncio
-async def test_request_album_mb_failure_never_blocks_the_download():
-    # Identity threading is best-effort: MB down -> fields stay None, task still
-    # created (the un-threaded task falls back to the album scorer).
+async def test_request_album_explicit_edition_never_uses_fallback_resolver():
+    album_service = _single_album_service()
+    service, store, *_ = _make_service(album_service=album_service)
+    store.get_active_task_for_album.return_value = None
+
+    await service.request_album(
+        "u1", "rg", "Yan Qing", "the arrival", release_mbid="release-explicit"
+    )
+
+    album_service.get_exact_edition_tracks_info.assert_awaited_once_with(
+        "rg",
+        "release-explicit",
+        priority=RequestPriority.USER_INITIATED,
+    )
+    album_service.get_album_tracks_info.assert_not_awaited()
+    assert store.create_task.await_args.kwargs["release_mbid"] == "release-explicit"
+
+
+@pytest.mark.asyncio
+async def test_request_album_mb_failure_starts_no_download_without_exact_identity():
     service, store, *_ = _make_service(album_service=_single_album_service(fail=True))
     store.get_active_task_for_album.return_value = None
 
-    result = await service.request_album("u1", "rg", "A", "B")
+    with pytest.raises(ValidationError, match="exact MusicBrainz edition"):
+        await service.request_album("u1", "rg", "A", "B")
 
-    assert result == "task1"
-    kwargs = store.create_task.await_args.kwargs
-    assert kwargs["track_title"] is None
-    assert kwargs["track_duration_seconds"] is None
+    store.create_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -433,6 +474,8 @@ async def test_pick_candidate_standalone_single_rethreads_identity():
     await service.pick_candidate("u1", "job1", 0)
 
     kwargs = store.create_task.await_args.kwargs
+    assert kwargs["release_mbid"] == "release-1"
+    assert kwargs["release_track_mbid"] == "release-track-1"
     assert kwargs["track_title"] == "the arrival"
     assert kwargs["recording_mbid"] == "rec-180ceef5"
     assert kwargs["track_duration_seconds"] == pytest.approx(155.556)
@@ -662,8 +705,23 @@ def _with_album_service(service, *, total_tracks=12, raises=False):
             side_effect=RuntimeError("MB down")
         )
     else:
+        tracks = [
+            SimpleNamespace(
+                position=index,
+                disc_number=1,
+                title=f"Track {index}",
+                recording_id=f"recording-{index}",
+                release_track_id=f"release-track-{index}",
+                length=180_000,
+            )
+            for index in range(1, total_tracks + 1)
+        ]
         album_service.get_album_tracks_info = AsyncMock(
-            return_value=SimpleNamespace(total_tracks=total_tracks)
+            return_value=SimpleNamespace(
+                total_tracks=total_tracks,
+                tracks=tracks,
+                selected_release_mbid="release-1",
+            )
         )
     service._album_service = album_service
     return album_service
@@ -689,22 +747,19 @@ async def test_request_album_backfills_track_count_from_musicbrainz():
 
 
 @pytest.mark.asyncio
-async def test_request_album_track_count_backfill_failure_still_creates_task():
-    # The completeness target is best-effort: a MusicBrainz failure must not block the
-    # download (it degrades to the unknown-count behaviour, never an error).
+async def test_request_album_track_map_failure_starts_no_download():
     service, store, _bus, _client, _scorer, _orch = _make_service()
     store.get_active_task_for_album.return_value = None
     _with_album_service(service, raises=True)
 
-    result = await service.request_album("u1", "rg", "Artist", "Album", year=1999)
+    with pytest.raises(ValidationError, match="exact MusicBrainz edition"):
+        await service.request_album("u1", "rg", "Artist", "Album", year=1999)
 
-    assert result == "task1"
-    assert store.create_task.await_args.kwargs["track_count"] is None
+    store.create_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_request_album_keeps_explicit_track_count_without_mb_call():
-    # A caller that already knows the count -> no MusicBrainz round-trip, value kept.
+async def test_request_album_verifies_exact_map_even_with_explicit_track_count():
     service, store, _bus, _client, _scorer, _orch = _make_service()
     store.get_active_task_for_album.return_value = None
     album_service = _with_album_service(service, total_tracks=99)
@@ -713,8 +768,8 @@ async def test_request_album_keeps_explicit_track_count_without_mb_call():
         "u1", "rg", "Artist", "Album", year=1999, track_count=10
     )
 
-    assert store.create_task.await_args.kwargs["track_count"] == 10
-    album_service.get_album_tracks_info.assert_not_called()
+    assert store.create_task.await_args.kwargs["track_count"] == 99
+    album_service.get_album_tracks_info.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -769,6 +824,27 @@ async def test_request_track_resolves_and_creates_track_task():
     # the user-supplied duration is threaded onto the task for TrackMatcher
     assert kwargs["track_duration_seconds"] == 212
     orchestrator.dispatch.assert_called_once_with("track-task")
+
+
+@pytest.mark.asyncio
+async def test_request_track_persists_exact_release_track_mapping():
+    album_service = _single_album_service()
+    service, store, *_ = _make_service(album_service=album_service)
+    service._library.has_track.return_value = False
+    store.get_active_task_for_track.return_value = None
+
+    await service.request_track(
+        "u1",
+        "rec-180ceef5",
+        "Yan Qing",
+        "the arrival",
+        release_group_mbid="rg",
+    )
+
+    kwargs = store.create_task.await_args.kwargs
+    assert kwargs["release_mbid"] == "release-1"
+    assert kwargs["release_track_mbid"] == "release-track-1"
+    assert (kwargs["disc_number"], kwargs["track_number"]) == (1, 1)
 
 
 @pytest.mark.asyncio
@@ -899,11 +975,12 @@ def test_mount_reason_prefers_a_known_boundary_over_a_stat_error(tmp_path, monke
 # -- held imports (import anyway / discard) --
 
 
-def _held_service(store, file_processor, library_reconciler=None):
+def _held_service(store, file_processor, library_reconciler=None, album_service=None):
     """A DownloadService with only the deps the held methods touch."""
     library = MagicMock()
     library.reconcile_with_filesystem = AsyncMock()
     orchestrator = MagicMock()
+    orchestrator.cancel_task = AsyncMock()
     orchestrator.settle_after_manual_import = AsyncMock()
     return DownloadService(
         MagicMock(),
@@ -915,20 +992,34 @@ def _held_service(store, file_processor, library_reconciler=None):
         orchestrator,
         file_processor=file_processor,
         library_reconciler=library_reconciler,
+        album_service=album_service,
     )
 
 
-async def _record_held(store, path, *, task_id="t-1"):
+async def _record_held(
+    store,
+    path,
+    *,
+    task_id="t-1",
+    reason="fingerprint_mismatch",
+    track_number=3,
+    release_mbid=None,
+    release_track_mbid=None,
+    recording_mbid="rec-3",
+    management_retry_count=0,
+    management_next_retry_at=None,
+):
     return await store.record_held_import(
         user_id="user-a",
         held_path=str(path),
-        reason="fingerprint_mismatch",
+        reason=reason,
         source="usenet",
         source_task_id=task_id,
         release_group_mbid="rg-1",
-        release_mbid=None,
-        recording_mbid="rec-3",
-        track_number=3,
+        release_mbid=release_mbid,
+        release_track_mbid=release_track_mbid,
+        recording_mbid=recording_mbid,
+        track_number=track_number,
         disc_number=1,
         track_title="You Shook Me",
         artist_name="Led Zeppelin",
@@ -942,6 +1033,8 @@ async def _record_held(store, path, *, task_id="t-1"):
         evidence_artist="Y",
         evidence_score=0.9,
         naming_template="{album}/{track}",
+        management_retry_count=management_retry_count,
+        management_next_retry_at=management_next_retry_at,
     )
 
 
@@ -1013,6 +1106,552 @@ async def test_import_held_unknown_id_raises_not_found(tmp_path):
     svc = _held_service(store, MagicMock())
     with pytest.raises(ResourceNotFoundError):
         await svc.import_held(999, "user-a", "user")
+
+
+@pytest.mark.asyncio
+async def test_management_hold_retries_the_complete_unit_and_settles_task(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_files = []
+    for track in (1, 2):
+        held_file = tmp_path / "held" / f"{track}.flac"
+        held_file.parent.mkdir(exist_ok=True)
+        held_file.write_bytes(b"audio")
+        await _record_held(
+            store,
+            held_file,
+            task_id="managed-task",
+            reason="management:PROFILE_CHANGED",
+            track_number=track,
+            release_mbid="release-1",
+            release_track_mbid=f"release-track-{track}",
+        )
+        held_files.append(held_file)
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock(
+        return_value=[Path("/music/Album/01.flac"), Path("/music/Album/02.flac")]
+    )
+    reconciler = MagicMock()
+    reconciler.reconcile_with_filesystem = AsyncMock()
+    service = _held_service(store, processor, reconciler)
+    store.get_task = AsyncMock(
+        return_value=DownloadTask(
+            id="managed-task",
+            user_id="user-a",
+            release_group_mbid="rg-1",
+            release_mbid="release-1",
+        )
+    )
+
+    result = await service.retry_management_hold("managed-task", "user-a", "user")
+
+    assert result == ["/music/Album/01.flac", "/music/Album/02.flac"]
+    unit = processor.place_held_management_bundle.await_args.args[0]
+    assert sorted(value.track_number for value in unit) == [1, 2]
+    assert all(value.source_task_id == "managed-task" for value in unit)
+    assert await store.list_held_imports("user-a", "user") == []
+    reconciler.reconcile_with_filesystem.assert_awaited_once_with(
+        targets=[Path("/music/Album")]
+    )
+    service._orchestrator.settle_after_manual_import.assert_awaited_once_with(
+        "managed-task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_management_hold_retry_preserves_unit_and_refreshes_reason_on_failure(
+    tmp_path,
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held.flac"
+    held_file.write_bytes(b"audio")
+    await _record_held(
+        store,
+        held_file,
+        task_id="managed-task",
+        reason="management:PROFILE_CHANGED",
+        release_mbid="release-1",
+        release_track_mbid="release-track-3",
+    )
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock(
+        side_effect=AutomaticManagementHoldError(
+            "SIDECAR_COLLISION", "cover.jpg conflicts with a different file"
+        )
+    )
+    service = _held_service(store, processor)
+    store.get_task = AsyncMock(
+        return_value=DownloadTask(
+            id="managed-task",
+            user_id="user-a",
+            release_group_mbid="rg-1",
+            release_mbid="release-1",
+        )
+    )
+
+    with pytest.raises(ValidationError, match="cover.jpg conflicts"):
+        await service.retry_management_hold("managed-task", "user-a", "user")
+
+    held = await store.list_held_imports("user-a", "user")
+    assert len(held) == 1
+    assert held[0].reason == "management:SIDECAR_COLLISION"
+    assert held[0].reason_detail == "cover.jpg conflicts with a different file"
+    service._orchestrator.settle_after_manual_import.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transient_management_hold_schedules_and_runs_without_redownload(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held.flac"
+    held_file.write_bytes(b"audio")
+    await _record_held(
+        store,
+        held_file,
+        task_id="managed-task",
+        reason="management:PROFILE_CHANGED",
+        release_mbid="release-1",
+        release_track_mbid="release-track-3",
+    )
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock(
+        side_effect=AutomaticManagementHoldError(
+            "ROOT_UNAVAILABLE", "The destination interrupted the staged write."
+        )
+    )
+    service = _held_service(store, processor)
+    store.get_task = AsyncMock(
+        return_value=DownloadTask(
+            id="managed-task",
+            user_id="user-a",
+            release_group_mbid="rg-1",
+            release_mbid="release-1",
+        )
+    )
+    monkeypatch.setattr("services.native.download_service.time.time", lambda: 1000.0)
+
+    with pytest.raises(ValidationError, match="destination interrupted"):
+        await service.retry_management_hold("managed-task", "user-a", "user")
+
+    held = await store.list_held_imports(
+        "user-a", "user", source_task_id="managed-task"
+    )
+    assert {value.management_retry_count for value in held} == {1}
+    assert {value.management_next_retry_at for value in held} == {1300.0}
+
+    processor.place_held_management_bundle.side_effect = None
+    processor.place_held_management_bundle.return_value = [Path("/music/Album/03.flac")]
+    monkeypatch.setattr("services.native.download_service.time.time", lambda: 1300.0)
+    await service.retry_due_management_holds()
+
+    assert await store.list_held_imports("user-a", "user") == []
+    assert processor.place_held_management_bundle.await_count == 2
+
+
+def _legacy_hold_album_service(*, fail: bool = False):
+    service = MagicMock()
+    service.resolve_edition = AsyncMock(return_value="release-1")
+    if fail:
+        service.get_exact_edition_tracks_info = AsyncMock(
+            side_effect=RuntimeError("provider unavailable")
+        )
+    else:
+        service.get_exact_edition_tracks_info = AsyncMock(
+            return_value=SimpleNamespace(
+                tracks=[
+                    SimpleNamespace(
+                        disc_number=1,
+                        position=track,
+                        recording_id=f"rec-{track}",
+                        release_track_id=f"release-track-{track}",
+                    )
+                    for track in (1, 2)
+                ]
+            )
+        )
+    return service
+
+
+async def _legacy_management_unit(store, tmp_path):
+    import sqlite3
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS auth_users "
+            "(id TEXT PRIMARY KEY, username TEXT, role TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO auth_users (id, username, role) VALUES ('user-a', 'alice', 'user')"
+        )
+        conn.commit()
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Led Zeppelin",
+        album_title="Led Zeppelin",
+        track_count=2,
+        status="failed",
+    )
+    for track in (1, 2):
+        path = tmp_path / f"legacy-{track}.flac"
+        path.write_bytes(b"audio")
+        await _record_held(
+            store,
+            path,
+            task_id=task.id,
+            reason="management:TRACK_NOT_MAPPED",
+            track_number=track,
+            recording_mbid=f"rec-{track}",
+        )
+    return task
+
+
+@pytest.mark.asyncio
+async def test_legacy_management_hold_repairs_complete_provider_map_before_retry(
+    tmp_path,
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    task = await _legacy_management_unit(store, tmp_path)
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock(
+        return_value=[Path("/music/Album/01.flac"), Path("/music/Album/02.flac")]
+    )
+    service = _held_service(
+        store,
+        processor,
+        album_service=_legacy_hold_album_service(),
+    )
+
+    await service.retry_management_hold(task.id, "user-a", "user")
+
+    repaired_task = await store.get_task(task.id)
+    assert repaired_task.release_mbid == "release-1"
+    repaired = processor.place_held_management_bundle.await_args.args[0]
+    assert {value.release_track_mbid for value in repaired} == {
+        "release-track-1",
+        "release-track-2",
+    }
+    assert all(value.release_mbid == "release-1" for value in repaired)
+
+
+@pytest.mark.asyncio
+async def test_legacy_management_hold_rejects_partial_map_without_publication(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    task = await _legacy_management_unit(store, tmp_path)
+    held = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+    await store.resolve_held_import(held[1].id, "discarded")
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock()
+    service = _held_service(
+        store,
+        processor,
+        album_service=_legacy_hold_album_service(),
+    )
+
+    with pytest.raises(ValidationError, match="complete positional match"):
+        await service.retry_management_hold(task.id, "user-a", "user")
+
+    remaining = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+    assert len(remaining) == 1
+    assert remaining[0].release_mbid is None
+    assert remaining[0].release_track_mbid is None
+    processor.place_held_management_bundle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_management_hold_provider_failure_keeps_every_file_held(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    task = await _legacy_management_unit(store, tmp_path)
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock()
+    service = _held_service(
+        store,
+        processor,
+        album_service=_legacy_hold_album_service(fail=True),
+    )
+
+    with pytest.raises(ValidationError, match="could not prove"):
+        await service.retry_management_hold(task.id, "user-a", "user")
+
+    held = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+    assert len(held) == 2
+    assert {value.reason for value in held} == {"management:METADATA_UNAVAILABLE"}
+    assert all(value.release_mbid is None for value in held)
+    assert all(value.release_track_mbid is None for value in held)
+    processor.place_held_management_bundle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_track_not_mapped_hold_with_full_expected_ids_is_not_repaired(tmp_path):
+    """Provider IDs alone cannot upgrade a file mapping that acquisition rejected."""
+
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "CREATE TABLE auth_users (id TEXT PRIMARY KEY, username TEXT, role TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO auth_users (id, username, role) VALUES ('user-a', 'alice', 'user')"
+        )
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        release_mbid="release-1",
+        artist_name="Led Zeppelin",
+        album_title="Led Zeppelin",
+        track_count=1,
+        status="failed",
+    )
+    held_file = tmp_path / "held.flac"
+    held_file.write_bytes(b"audio")
+    await _record_held(
+        store,
+        held_file,
+        task_id=task.id,
+        reason="management:TRACK_NOT_MAPPED",
+        track_number=1,
+        release_mbid="release-1",
+        release_track_mbid="release-track-1",
+        recording_mbid="rec-1",
+    )
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock()
+    album_service = _legacy_hold_album_service()
+    service = _held_service(
+        store,
+        processor,
+        album_service=album_service,
+    )
+
+    with pytest.raises(
+        ValidationError, match="did not provide enough recording evidence"
+    ):
+        await service.retry_management_hold(task.id, "user-a", "user")
+
+    held = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+    assert len(held) == 1
+    assert held[0].reason == "management:TRACK_NOT_MAPPED"
+    assert held_file.is_file()
+    album_service.resolve_edition.assert_not_awaited()
+    processor.place_held_management_bundle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_management_hold_actions_serialize_one_task(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held.flac"
+    held_file.write_bytes(b"audio")
+    await _record_held(
+        store,
+        held_file,
+        task_id="managed-task",
+        reason="management:PROFILE_CHANGED",
+        release_mbid="release-1",
+        release_track_mbid="release-track-3",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def publish(_held):  # noqa: ANN001
+        entered.set()
+        await release.wait()
+        return [Path("/music/Album/01.flac")]
+
+    processor = MagicMock()
+    processor.place_held_management_bundle = AsyncMock(side_effect=publish)
+    service = _held_service(store, processor)
+    store.get_task = AsyncMock(
+        return_value=DownloadTask(
+            id="managed-task",
+            user_id="user-a",
+            release_group_mbid="rg-1",
+            release_mbid="release-1",
+        )
+    )
+
+    first = asyncio.create_task(
+        service.retry_management_hold("managed-task", "user-a", "user")
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        service.retry_management_hold("managed-task", "user-a", "user")
+    )
+    await asyncio.sleep(0)
+
+    processor.place_held_management_bundle.assert_awaited_once()
+    release.set()
+    assert await first == ["/music/Album/01.flac"]
+    with pytest.raises(ResourceNotFoundError):
+        await second
+    assert service._management_hold_locks == {}
+    assert service._management_hold_lock_users == {}
+
+
+@pytest.mark.asyncio
+async def test_management_hold_cannot_use_per_track_escape_hatches(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held.flac"
+    held_file.write_bytes(b"audio")
+    held_id = await _record_held(
+        store,
+        held_file,
+        task_id="managed-task",
+        reason="management:PROFILE_CHANGED",
+    )
+    service = _held_service(store, MagicMock())
+
+    with pytest.raises(ValidationError, match="complete acquisition unit"):
+        await service.import_held(held_id, "user-a", "user")
+    with pytest.raises(ValidationError, match="complete acquisition unit"):
+        await service.discard_held(held_id, "user-a", "user")
+    assert held_file.exists()
+    assert len(await store.list_held_imports("user-a", "user")) == 1
+
+
+@pytest.mark.asyncio
+async def test_discard_management_hold_deletes_complete_unit_and_cancels_task(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_files = []
+    for track in (1, 2):
+        held_file = tmp_path / f"held-{track}.flac"
+        held_file.write_bytes(b"audio")
+        await _record_held(
+            store,
+            held_file,
+            task_id="managed-task",
+            reason="management:PROFILE_CHANGED",
+            track_number=track,
+        )
+        held_files.append(held_file)
+    service = _held_service(store, MagicMock())
+
+    count = await service.discard_management_hold("managed-task", "user-a", "user")
+
+    assert count == 2
+    assert all(not value.exists() for value in held_files)
+    assert await store.list_held_imports("user-a", "user") == []
+    service._orchestrator.cancel_task.assert_awaited_once_with(
+        "managed-task", "user-a", "user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_management_hold_retries_file_cleanup_after_unlink_failure(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_files = []
+    for track in (1, 2):
+        held_file = tmp_path / f"held-{track}.flac"
+        held_file.write_bytes(b"audio")
+        await _record_held(
+            store,
+            held_file,
+            task_id="managed-task",
+            reason="management:PROFILE_CHANGED",
+            track_number=track,
+        )
+        held_files.append(held_file)
+    service = _held_service(store, MagicMock())
+    unlink = Path.unlink
+
+    def fail_second_file(source, *, missing_ok=False):  # noqa: ANN001
+        if source == held_files[1] and source.exists():
+            raise PermissionError("read-only directory")
+        return unlink(source, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_second_file)
+
+    count = await service.discard_management_hold("managed-task", "user-a", "user")
+
+    assert count == 2
+    assert held_files[0].exists() is False
+    assert held_files[1].exists() is True
+    assert await store.list_held_imports("user-a", "user") == []
+    pending = await store.list_pending_discard_file_cleanups()
+    assert [value.held_path for value in pending] == [str(held_files[1])]
+    service._orchestrator.cancel_task.assert_awaited_once()
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    await service.cleanup_discarded_held_files()
+
+    assert held_files[1].exists() is False
+    assert await store.list_pending_discard_file_cleanups() == []
+
+
+@pytest.mark.asyncio
+async def test_discard_management_hold_restores_files_when_database_update_fails(
+    tmp_path,
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held.flac"
+    held_file.write_bytes(b"audio")
+    await _record_held(
+        store,
+        held_file,
+        task_id="managed-task",
+        reason="management:PROFILE_CHANGED",
+    )
+    service = _held_service(store, MagicMock())
+    original_resolve = store.resolve_held_imports
+    store.resolve_held_imports = AsyncMock(side_effect=RuntimeError("database busy"))
+
+    with pytest.raises(RuntimeError, match="database busy"):
+        await service.discard_management_hold("managed-task", "user-a", "user")
+
+    assert held_file.exists()
+    store.resolve_held_imports = original_resolve
+    assert len(await store.list_held_imports("user-a", "user")) == 1
+    service._orchestrator.cancel_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio

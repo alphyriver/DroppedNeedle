@@ -10,6 +10,7 @@ from api.v1.schemas.request import (
     RequestAcceptedResponse,
 )
 from core.exceptions import ExternalServiceError, ValidationError
+from infrastructure.queue.priority_queue import RequestPriority
 from services.native.download_service import ALREADY_IN_LIBRARY
 
 if TYPE_CHECKING:
@@ -200,6 +201,7 @@ class RequestService:
                 "year": year,
                 "artist_mbid": artist_mbid,
                 "origin": "user",
+                "track_count_priority": RequestPriority.USER_INITIATED,
             }
             if release_mbid is not None:
                 dispatch_kwargs["release_mbid"] = release_mbid
@@ -340,6 +342,7 @@ class RequestService:
                         artist_mbid=item.get("artist_mbid"),
                         origin="user",
                         release_mbid=item.get("release_mbid"),
+                        track_count_priority=RequestPriority.USER_INITIATED,
                     )
                 except Exception as e:  # noqa: BLE001 - one bad item must not sink the batch
                     logger.error("Batch download dispatch failed for %s: %s", mbid, e)

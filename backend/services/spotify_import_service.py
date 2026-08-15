@@ -226,9 +226,9 @@ class SpotifyImportService:
 
         if album_name:
             try:
-                query = f"{artist} {album_name}".strip()
-                results = await self._mb_repo.search_albums(
-                    query,
+                results = await self._mb_repo.search_release_groups(
+                    artist,
+                    album_name,
                     limit=3,
                     include_all_types=False,
                 )

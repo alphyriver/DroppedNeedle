@@ -377,3 +377,13 @@ class UserListeningPrefsStore:
             )
             for row in rows
         ]
+
+    async def count_pending_approvals(self) -> int:
+        def operation(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM personal_mix_approvals "
+                "WHERE state = 'pending'"
+            ).fetchone()
+            return int(row["count"] if row is not None else 0)
+
+        return await self._read(operation)

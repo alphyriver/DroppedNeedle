@@ -7,11 +7,18 @@
 	import { imageSettingsStore } from '$lib/stores/imageSettings';
 	import { appendAudioDBSizeSuffix } from '$lib/utils/imageSuffix';
 	import { getApiUrl } from '$lib/api/api-utils';
+	import {
+		COVER_VISUAL_SETTLE_MS,
+		watchWarmingCover,
+		type CoverWarmUpdate
+	} from '$lib/utils/coverWarmCoordinator';
 
 	interface Props {
 		mbid: string;
 		alt?: string;
 		size?: 'xs' | 'sm' | 'md' | 'lg' | 'xl' | 'hero' | 'full';
+		requestSize?: 250 | 500 | 1200;
+		responsiveSizes?: string;
 		lazy?: boolean;
 		showPlaceholder?: boolean;
 		className?: string;
@@ -31,6 +38,8 @@
 		mbid,
 		alt = 'Image',
 		size = 'md',
+		requestSize = undefined,
+		responsiveSizes = undefined,
 		lazy = true,
 		showPlaceholder = true,
 		className = '',
@@ -46,21 +55,16 @@
 		onload = undefined
 	}: Props = $props();
 
-	// A cold cover comes back as 202 (warming) while it resolves in the background; the <img>
-	// fires onerror, and we poll it in with a widening backoff (a rate-limited artist warm can
-	// take a while) until it lands, holding a shimmer skeleton the whole time. Only after this
-	// budget do we settle on the static placeholder.
-	const MAX_RETRIES = 6;
-	const RETRY_DELAYS = [1500, 3000, 5000, 8000, 12000, 20000];
-
 	let imgError = $state(false);
 	let failed = $state(false);
 	let imgLoaded = $state(false);
+	let visualSettled = $state(false);
 	let remoteError = $state(false);
 	let imgElement: HTMLImageElement | null = $state(null);
 	let currentSource = $state('');
-	let retryCount = $state(0);
-	let retryTimer: ReturnType<typeof setTimeout> | null = $state(null);
+	let warmResolvedUrl: string | null = $state(null);
+	let stopWatchingWarmCover: (() => void) | null = null;
+	let visualSettleTimer: ReturnType<typeof setTimeout> | null = null;
 	let retrySourceKey = $state('');
 
 	const albumSizeClasses: Record<typeof size, string> = {
@@ -102,12 +106,23 @@
 		full: API_SIZES.FULL
 	};
 
+	let requestedPixels = $derived(requestSize ?? apiSizes[size]);
+	let remoteRequestSize = $derived(
+		requestSize === 250 ? 'md' : requestSize === 500 ? 'lg' : requestSize === 1200 ? 'full' : size
+	);
 	let useRemoteUrl = $derived(remoteUrl && $imageSettingsStore.directRemoteImagesEnabled);
-	let resolvedRemoteUrl = $derived(remoteUrl ? appendAudioDBSizeSuffix(remoteUrl, size) : null);
+	let resolvedRemoteUrl = $derived(
+		remoteUrl ? appendAudioDBSizeSuffix(remoteUrl, remoteRequestSize) : null
+	);
+	let responsiveRemoteUrl = $derived(
+		remoteUrl && requestSize === 250 && responsiveSizes
+			? appendAudioDBSizeSuffix(remoteUrl, 'lg')
+			: null
+	);
 
 	let canonicalAlbumCoverUrl = $derived(
 		imageType === 'album' && isValidMbid(mbid)
-			? getApiUrl(`/api/v1/covers/release-group/${mbid}?size=${apiSizes[size]}`)
+			? getApiUrl(`/api/v1/covers/release-group/${mbid}?size=${requestedPixels}`)
 			: null
 	);
 	let validMbid = $derived(source === 'local' || imageType === 'album' ? true : isValidMbid(mbid));
@@ -118,29 +133,41 @@
 	);
 	let apiEndpoint = $derived(imageType === 'album' ? 'release-group' : 'artist');
 	let fallbackCoverUrl = $derived(
-		getApiUrl(`/api/v1/covers/${apiEndpoint}/${mbid}?size=${apiSizes[size]}`)
+		getApiUrl(`/api/v1/covers/${apiEndpoint}/${mbid}?size=${requestedPixels}`)
+	);
+	let responsiveCoverUrl = $derived(
+		requestSize === 250 && responsiveSizes
+			? getApiUrl(`/api/v1/covers/${apiEndpoint}/${mbid}?size=500`)
+			: null
 	);
 	let coverUrl = $derived(
 		imageType === 'album'
 			? (canonicalAlbumCoverUrl ?? customUrl ?? fallbackCoverUrl)
 			: fallbackCoverUrl
 	);
-	let retryCoverUrl = $derived(
-		retryCount > 0 ? coverUrl + (coverUrl.includes('?') ? '&' : '?') + `_r=${retryCount}` : coverUrl
-	);
+	let displayCoverUrl = $derived(warmResolvedUrl ?? coverUrl);
+	let displayCoverSrcset = $derived.by(() => {
+		if (warmResolvedUrl || !responsiveSizes) return undefined;
+		if (useRemoteUrl && resolvedRemoteUrl && responsiveRemoteUrl) {
+			return `${resolvedRemoteUrl} 250w, ${responsiveRemoteUrl} 500w`;
+		}
+		return responsiveCoverUrl ? `${coverUrl} 250w, ${responsiveCoverUrl} 500w` : undefined;
+	});
+	let visualSourceKey = $derived(useRemoteUrl && resolvedRemoteUrl ? resolvedRemoteUrl : coverUrl);
 	let sizeClasses = $derived(imageType === 'album' ? albumSizeClasses : artistSizeClasses);
 	let sizeClass = $derived(sizeClasses[size]);
 	let roundedClass = $derived(roundedClasses[rounded]);
 
 	$effect(() => {
-		const newKey = coverUrl;
+		const newKey = visualSourceKey;
 		if (newKey !== retrySourceKey) {
 			retrySourceKey = newKey;
-			if (retryTimer) {
-				clearTimeout(retryTimer);
-				retryTimer = null;
-			}
-			retryCount = 0;
+			stopWatchingWarmCover?.();
+			stopWatchingWarmCover = null;
+			if (visualSettleTimer) clearTimeout(visualSettleTimer);
+			visualSettleTimer = null;
+			warmResolvedUrl = null;
+			visualSettled = false;
 			failed = false;
 			if (imgError) {
 				imgError = false;
@@ -150,12 +177,18 @@
 	});
 
 	$effect(() => {
+		if (hasSource && showPlaceholder && !imgLoaded && !visualSettled) {
+			scheduleVisualSettlement();
+		}
+	});
+
+	$effect(() => {
 		const source = imageType === 'album' ? (canonicalAlbumCoverUrl ?? customUrl ?? mbid) : mbid;
 		if (source && imgElement && source !== currentSource) {
 			currentSource = source;
 			imgError = false;
 			imgLoaded = false;
-			resetLazyImage(imgElement, retryCoverUrl);
+			resetLazyImage(imgElement, displayCoverUrl, displayCoverSrcset);
 		}
 	});
 
@@ -169,22 +202,50 @@
 		imgLoaded = false;
 	}
 
-	function onImgError() {
-		if (retryOnError && retryCount < MAX_RETRIES) {
-			// Hide the img so it re-creates and re-requests on the next tick; hold the skeleton
-			// (imgLoaded false, failed false) until it either lands or we give up.
-			imgError = true;
-			imgLoaded = false;
-			const delay = RETRY_DELAYS[retryCount] + Math.random() * 1000 - 500;
-			retryTimer = setTimeout(() => {
-				retryTimer = null;
-				retryCount++;
-				imgError = false;
-				imgLoaded = false;
-			}, delay);
-		} else {
+	function onImgError(event: Event) {
+		imgError = true;
+		imgLoaded = false;
+
+		if (!retryOnError || warmResolvedUrl) {
 			imgError = true;
 			failed = true;
+			visualSettled = true;
+			return;
+		}
+
+		scheduleVisualSettlement();
+
+		const selected = (event.currentTarget as HTMLImageElement).currentSrc;
+		stopWatchingWarmCover ??= watchWarmingCover(currentCoverRequestUrl(selected), handleWarmUpdate);
+	}
+
+	function currentCoverRequestUrl(selected: string): string {
+		if (!selected) return coverUrl;
+		const parsed = new URL(selected, window.location.href);
+		return `${parsed.pathname}${parsed.search}`;
+	}
+
+	function scheduleVisualSettlement() {
+		if (visualSettleTimer) return;
+		visualSettleTimer = setTimeout(() => {
+			visualSettleTimer = null;
+			visualSettled = true;
+		}, COVER_VISUAL_SETTLE_MS);
+	}
+
+	function handleWarmUpdate(update: CoverWarmUpdate) {
+		if (update.status === 'ready') {
+			warmResolvedUrl = update.url;
+			imgError = false;
+			failed = false;
+			visualSettled = false;
+			if (visualSettleTimer) clearTimeout(visualSettleTimer);
+			visualSettleTimer = null;
+		} else if (update.status === 'failed') {
+			failed = true;
+			visualSettled = true;
+			if (visualSettleTimer) clearTimeout(visualSettleTimer);
+			visualSettleTimer = null;
 		}
 	}
 
@@ -194,6 +255,8 @@
 		// the real URL; that gif's load event must NOT mark the cover loaded, or imgLoaded flips
 		// true and hides the shimmer skeleton while the cover is still warming (202 + poll).
 		if (el.currentSrc.startsWith('data:')) return;
+		if (visualSettleTimer) clearTimeout(visualSettleTimer);
+		visualSettleTimer = null;
 		imgLoaded = true;
 		el.classList.remove('opacity-0');
 		onload?.();
@@ -211,7 +274,8 @@
 	}
 
 	onDestroy(() => {
-		if (retryTimer) clearTimeout(retryTimer);
+		stopWatchingWarmCover?.();
+		if (visualSettleTimer) clearTimeout(visualSettleTimer);
 	});
 </script>
 
@@ -221,8 +285,11 @@
 		: 'bg-base-200'} {sizeClass} {roundedClass} {className}"
 >
 	{#if showPlaceholder && (!imgLoaded || !hasSource)}
-		{#if !hasSource || failed}
-			<div class="absolute inset-0 w-full h-full flex items-center justify-center">
+		{#if !hasSource || failed || visualSettled}
+			<div
+				class="absolute inset-0 w-full h-full flex items-center justify-center"
+				data-testid="cover-fallback"
+			>
 				{#if imageType === 'album'}
 					<Disc3 class="h-1/3 w-1/3 text-base-content/20" />
 				{:else}
@@ -240,6 +307,8 @@
 		<img
 			data-testid={testId}
 			src={resolvedRemoteUrl}
+			srcset={displayCoverSrcset}
+			sizes={responsiveSizes}
 			{alt}
 			class="w-full h-full object-cover transition-opacity duration-300"
 			class:opacity-0={!imgLoaded}
@@ -254,7 +323,9 @@
 			<img
 				data-testid={testId}
 				src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-				data-src={retryCoverUrl}
+				data-src={displayCoverUrl}
+				data-srcset={displayCoverSrcset}
+				sizes={responsiveSizes}
 				{alt}
 				class="w-full h-full object-cover opacity-0 transition-opacity duration-300"
 				loading="lazy"
@@ -267,7 +338,9 @@
 		{:else}
 			<img
 				data-testid={testId}
-				src={retryCoverUrl}
+				src={displayCoverUrl}
+				srcset={displayCoverSrcset}
+				sizes={responsiveSizes}
 				{alt}
 				class="w-full h-full object-cover transition-opacity duration-300"
 				class:opacity-0={!imgLoaded}

@@ -17,7 +17,10 @@
 				? 'Several equally likely releases'
 				: item.reason_code === 'CONTRADICTORY'
 					? 'Conflicting track evidence'
-					: item.reason_code.replaceAll('_', ' ').toLowerCase()
+					: item.reason_code === 'RELEASE_TYPE_REQUIRES_CONFIRMATION' ||
+						  item.reason_code === 'UNSAFE_RELEASE_TYPE'
+						? 'Compilation or live edition needs confirmation'
+						: item.reason_code.replaceAll('_', ' ').toLowerCase()
 	);
 </script>
 

@@ -548,9 +548,9 @@ async def update_get_it_settings(
     settings: GetItSettings = MsgSpecBody(GetItSettings),
     preferences_service: PreferencesService = Depends(get_preferences_service),
 ):
-    # no provider clearing needed: GetItService reads these settings per call,
-    # and the options cache key carries region + decoration state, so a changed
-    # setting simply misses to a fresh key
+    # No provider clearing needed: GetItService reads these settings per call,
+    # and the options cache key carries the region, so a change misses to a
+    # fresh key.
     preferences_service.save_get_it_settings(settings)
     return preferences_service.get_get_it_settings()
 

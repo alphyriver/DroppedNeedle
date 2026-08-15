@@ -26,7 +26,10 @@ class AlbumCoverageService:
         if record is None or identity is None:
             return AlbumCoverage(local_album_id=album_id)
         evidence = record.evidence
-        current_inputs = album_input_revisions(context["tracks"])
+        tracks = [
+            track for track in context["tracks"] if track["availability"] == "indexed"
+        ]
+        current_inputs = album_input_revisions(tracks)
         attempt_input = await self._store.get_identification_attempt_input(
             record.attempt_id
         )
@@ -39,9 +42,7 @@ class AlbumCoverageService:
             stale
             and self._queue is not None
             and identity["decision_source"] in {"automatic", "embedded"}
-            and any(
-                track["applied_policy"] == "automatic" for track in context["tracks"]
-            )
+            and any(track["applied_policy"] == "automatic" for track in tracks)
         ):
             await self._queue.enqueue_album(
                 album_id,

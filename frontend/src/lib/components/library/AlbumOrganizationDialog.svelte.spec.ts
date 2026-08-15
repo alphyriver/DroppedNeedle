@@ -28,6 +28,18 @@ const album: LibraryAlbumDetail = {
 	identification_status: 'identified',
 	review_id: null,
 	review_revision: null,
+	management_identity_readiness: 'ready',
+	mapped_track_count: 2,
+	management_identity_kind: null,
+	custom_manifest_id: null,
+	custom_manifest_version: null,
+	custom_manifest_track_count: 0,
+	custom_manifest_recognized_track_count: 0,
+	custom_manifest_stale: false,
+	management_excluded: false,
+	management_exclusion_revision: null,
+	management_excluded_at: null,
+	active_edition_conversion: null,
 	contribution_id: null,
 	contribution_state: null
 };

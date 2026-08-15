@@ -228,9 +228,17 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	// tracks this album downloaded but couldn't auto-verify (held for "import anyway"),
 	// keyed both ways so a track row can find its held candidate the same way owned files match
 	const heldImportsQuery = getHeldImportsQuery(albumIdGetter, () => downloadClientConfigured);
+	const headerManagementHeld = $derived.by(() => {
+		if (!headerDownloadTask) return [];
+		return (heldImportsQuery.data?.items ?? []).filter(
+			(item) =>
+				item.source_task_id === headerDownloadTask?.id && item.reason.startsWith('management:')
+		);
+	});
 	const heldByRecording = $derived.by(() => {
 		const m = new SvelteMap<string, HeldImport>();
 		for (const h of heldImportsQuery.data?.items ?? []) {
+			if (h.reason.startsWith('management:')) continue;
 			if (h.recording_mbid) m.set(h.recording_mbid, h);
 		}
 		return m;
@@ -238,6 +246,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	const heldByPosition = $derived.by(() => {
 		const m = new SvelteMap<string, HeldImport>();
 		for (const h of heldImportsQuery.data?.items ?? []) {
+			if (h.reason.startsWith('management:')) continue;
 			m.set(getDiscTrackKey({ disc_number: h.disc_number, track_number: h.track_number }), h);
 		}
 		return m;
@@ -748,9 +757,10 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 			title,
 			album,
 			jellyfinMatch,
-			localMatch,
+			localMatchForPlayback,
 			navidromeMatch,
-			plexMatch
+			plexMatch,
+			tracksInfo?.tracks ?? []
 		);
 	}
 
@@ -788,6 +798,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'jellyfin',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 	const localCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -796,6 +807,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'local',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 	const navidromeCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -804,6 +816,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'navidrome',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 	const plexCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -812,6 +825,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'plex',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 
@@ -980,6 +994,9 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		},
 		get headerDownloadTask() {
 			return headerDownloadTask;
+		},
+		get headerManagementHeld() {
+			return headerManagementHeld;
 		},
 		get trackDownloadTasks() {
 			return trackDownloadTasks;

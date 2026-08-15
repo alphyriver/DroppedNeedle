@@ -95,6 +95,7 @@ async def test_request_album_canonicalizes_release_alias_before_history_and_disp
         artist_mbid=None,
         origin="user",
         release_mbid="release-edition",
+        release_track_mbid=None,
     )
 
 

@@ -9,7 +9,8 @@ import type { ArtistPurchaseOptionsResponse, PurchaseOptionsResponse } from '$li
 // section fetches this, with its own skeleton - the album page's load path
 // never pays for the cold MB/iTunes lookups. Not user-dependent (links come
 // from global admin settings), so no userId key segment.
-export const purchaseOptionsKey = (mbid: string) => ['albums', 'purchase-options', mbid] as const;
+export const purchaseOptionsKey = (mbid: string) =>
+	['albums', 'purchase-options', 'v2', mbid] as const;
 
 export const getPurchaseOptionsQuery = (
 	mbid: Getter<string>,
@@ -24,7 +25,7 @@ export const getPurchaseOptionsQuery = (
 	}));
 
 export const artistPurchaseOptionsKey = (mbid: string) =>
-	['artists', 'purchase-options', mbid] as const;
+	['artists', 'purchase-options', 'v2', mbid] as const;
 
 // The artist's own storefronts (their Bandcamp page, merch shop) - not one album.
 export const getArtistPurchaseOptionsQuery = (mbid: Getter<string>, name: Getter<string>) =>

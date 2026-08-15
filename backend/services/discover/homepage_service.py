@@ -308,11 +308,17 @@ class DiscoverHomepageService:
         if registry.is_running(task_name):
             return
         self._refresh_started_at.setdefault(user_id, time.time())
-        task = asyncio.create_task(self.warm_cache(user_id))
+        task = asyncio.create_task(self._run_triggered_warm(user_id))
         try:
             registry.register(task_name, task)
         except RuntimeError:
             pass
+
+    async def _run_triggered_warm(self, user_id: str) -> None:
+        if self._workload_gate is None:
+            await self.warm_cache(user_id)
+            return
+        await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
 
     async def get_discover_data(self, user_id: str) -> DiscoverResponse:
         _, _, _, _, lb_enabled, lfm_enabled, _ = await self._resolve_user_music(
@@ -870,6 +876,10 @@ class DiscoverHomepageService:
             "trending",
         )
 
+    async def _wait_for_background_window(self) -> None:
+        if self._workload_gate is not None:
+            await self._workload_gate.wait_until_available()
+
     async def build_discover_data(self, user_id: str) -> DiscoverResponse:
         (
             lb_client,
@@ -895,6 +905,7 @@ class DiscoverHomepageService:
             lfm_username=lfm_username,
             lb_client=lb_client,
         )
+        await self._wait_for_background_window()
 
         tasks: dict[str, Any] = {}
 
@@ -961,6 +972,7 @@ class DiscoverHomepageService:
             tasks["library_albums"] = self._library_repo.get_home_albums(limit=500)
 
         results = await self._execute_tasks(tasks)
+        await self._wait_for_background_window()
         library_mbids = {
             str(artist["mbid"]).lower()
             for artist in (results.get("library_artists") or [])
@@ -1042,6 +1054,7 @@ class DiscoverHomepageService:
             post_tasks["weekly_exploration"] = self._weekly_exploration.build_section(
                 username, lb_repo=lb_client
             )
+        await self._wait_for_background_window()
         post_results = await self._execute_tasks(post_tasks)
         response.missing_essentials = post_results.get("missing_essentials")
         response.weekly_exploration = post_results.get("weekly_exploration")
@@ -1062,6 +1075,7 @@ class DiscoverHomepageService:
             resolved_source=primary,
         )
 
+        await self._wait_for_background_window()
         response.popular_in_your_genres = await self._build_popular_in_genres(
             results,
             library_mbids,
@@ -1081,6 +1095,7 @@ class DiscoverHomepageService:
                 if mbid:
                     similar_artist_mbids.append(mbid)
 
+        await self._wait_for_background_window()
         response.unexplored_genres = await self._build_unexplored_genres(
             response.because_you_listen_to, similar_artist_mbids
         )
@@ -1106,6 +1121,7 @@ class DiscoverHomepageService:
 
         response.service_prompts = self._build_service_prompts(lb_enabled, lfm_enabled)
 
+        await self._wait_for_background_window()
         await self._apply_candidate_ownership(response)
         self._dedupe_album_sections(response)
 
@@ -1498,7 +1514,8 @@ class DiscoverHomepageService:
             for genre_lower, _count in ranked_genres:
                 artist_mbids = artists_by_genre.get(genre_lower, [])
                 unique = [
-                    a for a in artist_mbids
+                    a
+                    for a in artist_mbids
                     if is_valid_mbid(a) and a not in seen_artists
                 ]
                 if len(unique) < MIN_ARTISTS_PER_CLUSTER:

@@ -300,7 +300,12 @@
 							class="grid gap-2 p-3 sm:grid-cols-[1fr_auto] sm:items-center"
 						>
 							<div>
-								<strong>{finding.reason_code.replaceAll('_', ' ').toLowerCase()}</strong>
+								<strong
+									>{finding.reason_code === 'RELEASE_TYPE_REQUIRES_CONFIRMATION' ||
+									finding.reason_code === 'UNSAFE_RELEASE_TYPE'
+										? 'Compilation or live edition needs confirmation'
+										: finding.reason_code.replaceAll('_', ' ').toLowerCase()}</strong
+								>
 								<p class="mt-1 text-xs text-base-content/55">
 									{finding.confidence} evidence · {finding.state}
 								</p>

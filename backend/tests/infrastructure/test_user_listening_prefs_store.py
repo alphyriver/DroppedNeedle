@@ -198,6 +198,17 @@ async def test_list_pending_approvals_joins_user_name(store: UserListeningPrefsS
 
 
 @pytest.mark.asyncio
+async def test_count_pending_approvals_does_not_materialize_rows(
+    store: UserListeningPrefsStore,
+):
+    await store.upsert_approval("user-a", "pending")
+    await store.upsert_approval("user-b", "pending")
+    await store.set_approval_state("user-b", "rejected", ("admin-x", "Admin X"))
+
+    assert await store.count_pending_approvals() == 1
+
+
+@pytest.mark.asyncio
 async def test_backfill_queues_pre_gate_optins_once(tmp_path: Path):
     db_path = tmp_path / "library.db"
     lock = threading.Lock()

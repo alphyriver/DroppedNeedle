@@ -41,7 +41,7 @@ class _ProviderProbe:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def search_album_candidate_ids(self, query, limit, priority):
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
         self.calls += 1
         return []
 

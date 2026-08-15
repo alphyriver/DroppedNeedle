@@ -158,7 +158,7 @@ def test_failed_working_copy_keeps_database_and_settings_and_does_not_retry(
             is None
         )
 
-    with pytest.raises(AutomaticUpgradeError, match="already tried"):
+    with pytest.raises(AutomaticUpgradeError, match="previous attempt by this image"):
         run_automatic_copy_upgrade(settings, runner=fail)
     assert attempts == 1
 
@@ -433,7 +433,7 @@ def test_real_legacy_installation_upgrades_once_with_normal_startup(
     assert state["evidence"]["embedded_art_reads"] == 0
 
 
-def test_real_unresolved_reference_reports_only_aggregate_failure_evidence(
+def test_real_unresolved_reference_reports_sanitized_failure_evidence(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "app"
@@ -467,11 +467,17 @@ def test_real_unresolved_reference_reports_only_aggregate_failure_evidence(
         "blocker_count": 1,
         "unresolved_reference_counts": {"favorite": 1},
         "blocker_reason_counts": {"favorite_unresolved": 1},
+        "details": [
+            {
+                "kind": "favorite",
+                "item_kind": "album",
+                "item_id": "private-missing-reference",
+            }
+        ],
     }
     assert "reasons: favorite_unresolved=1" in result.stdout
     serialized_evidence = json.dumps(state["failure_evidence"])
     assert "alice" not in serialized_evidence
-    assert "private-missing-reference" not in serialized_evidence
     assert str(music) not in serialized_evidence
     assert not automatic_upgrade._database_has_marker(database)
     with sqlite3.connect(database) as connection:
@@ -479,6 +485,81 @@ def test_real_unresolved_reference_reports_only_aggregate_failure_evidence(
             "SELECT COUNT(*) FROM user_favorites WHERE item_id = ?",
             ("private-missing-reference",),
         ).fetchone() == (1,)
+
+    retry = _run_real_upgrade(root)
+
+    assert retry.returncode == 1
+    assert "previous attempt by this image" in retry.stdout
+    assert "Failure reason: unresolved_references" in retry.stdout
+    assert "corrected image" in retry.stdout
+
+
+def test_real_upgrade_retains_unresolved_history_and_completes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    music = tmp_path / "Music"
+    music.mkdir(parents=True)
+    database = root / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    _create_source(database, music)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO play_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "gone-track-history",
+                "alice",
+                "Gone Track",
+                "Gone Artist",
+                "Gone Album",
+                None,
+                None,
+                180000,
+                None,
+                "2025-01-01T00:00:00Z",
+            ),
+        )
+    config = root / "config" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({"library_settings": {"library_paths": [str(music)]}}),
+        encoding="utf-8",
+    )
+
+    first = _run_real_upgrade(root)
+    second = _run_real_upgrade(root)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "Library upgrade complete" in first.stdout
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "Preparing the library" not in second.stdout
+    assert automatic_upgrade._database_has_marker(database)
+    with sqlite3.connect(database) as connection:
+        retained = connection.execute(
+            "SELECT local_track_id, local_album_id, local_artist_id, track_name, "
+            "artist_name, album_name, recording_mbid, release_group_mbid, duration_ms, "
+            "source, played_at FROM library_play_history WHERE id = ?",
+            ("gone-track-history",),
+        ).fetchone()
+        unresolved = connection.execute(
+            "SELECT COUNT(*) FROM library_migration_provenance "
+            "WHERE source_kind = 'history' AND source_key = ?",
+            ("gone-track-history",),
+        ).fetchone()[0]
+    assert retained == (
+        None,
+        None,
+        None,
+        "Gone Track",
+        "Gone Artist",
+        "Gone Album",
+        None,
+        None,
+        180000,
+        None,
+        "2025-01-01T00:00:00Z",
+    )
+    assert unresolved == 0
 
 
 def test_real_upgrade_preserves_ten_identityless_legacy_library_files(

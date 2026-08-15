@@ -10,6 +10,8 @@ from api.v1.schemas.library_policies import (
     LibraryPolicyImpactResponse,
     LibraryPolicyTreeResponse,
     LibraryPolicyTreeNode,
+    LibraryRestorableRoot,
+    LibraryRestorableRootsResponse,
     LibrarySettingsResponse,
 )
 from core.dependencies import get_library_policy_service
@@ -36,6 +38,15 @@ def app() -> tuple[FastAPI, AsyncMock, Mock]:
         scope_ids=["root"],
         estimated_file_count=12,
     )
+    target.restorable_roots.return_value = LibraryRestorableRootsResponse(
+        policy_revision="policy-2",
+        restorable_roots=[
+            LibraryRestorableRoot(
+                root_id="root", path="/music", indexed_file_count=12
+            )
+        ],
+    )
+    target.restore_roots.return_value = target.get_settings.return_value
     target.policy_tree.return_value = LibraryPolicyTreeResponse(
         policy_revision="policy-2",
         roots=[
@@ -127,12 +138,69 @@ def test_target_policy_routes_are_admin_only(
         ).status_code
         == 403
     )
+    assert client.get("/settings/library/restorable-roots").status_code == 403
+    assert (
+        client.post(
+            "/settings/library/restore-roots",
+            json={"expected_policy_revision": "policy-2"},
+        ).status_code
+        == 403
+    )
 
     unauthenticated = FastAPI()
     unauthenticated.include_router(router)
     assert (
         build_test_client(unauthenticated).get("/settings/library").status_code == 401
     )
+    assert (
+        build_test_client(unauthenticated)
+        .get("/settings/library/restorable-roots")
+        .status_code
+        == 401
+    )
+    assert (
+        build_test_client(unauthenticated)
+        .post(
+            "/settings/library/restore-roots",
+            json={"expected_policy_revision": "policy-2"},
+        )
+        .status_code
+        == 401
+    )
+
+
+def test_target_policy_restorable_roots_contract(
+    app: tuple[FastAPI, AsyncMock, Mock],
+) -> None:
+    application, target, _ = app
+    override_admin_auth(application)
+    client = build_test_client(application)
+    response = client.get("/settings/library/restorable-roots")
+    assert response.status_code == 200
+    assert response.json()["restorable_roots"] == [
+        {"root_id": "root", "path": "/music", "indexed_file_count": 12}
+    ]
+    target.restorable_roots.assert_awaited_once()
+
+
+def test_target_policy_restore_roots_contract(
+    app: tuple[FastAPI, AsyncMock, Mock],
+) -> None:
+    application, target, _ = app
+    override_admin_auth(application)
+    client = build_test_client(application)
+    response = client.post(
+        "/settings/library/restore-roots",
+        json={
+            "expected_policy_revision": "policy-2",
+            "paths": {"root": "/music"},
+        },
+    )
+    assert response.status_code == 200
+    target.restore_roots.assert_awaited_once()
+    request = target.restore_roots.await_args.args[0]
+    assert request.expected_policy_revision == "policy-2"
+    assert request.paths == {"root": "/music"}
 
 
 def test_target_policy_route_inventory_is_complete() -> None:
@@ -148,4 +216,6 @@ def test_target_policy_route_inventory_is_complete() -> None:
         ("GET", "/settings/library/policy-tree"),
         ("POST", "/settings/library/policy-impact"),
         ("POST", "/settings/library/policy-apply-preview"),
+        ("GET", "/settings/library/restorable-roots"),
+        ("POST", "/settings/library/restore-roots"),
     }

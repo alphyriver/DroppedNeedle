@@ -34,6 +34,9 @@
 		if (code === 'NO_CANDIDATE') return 'No external result';
 		if (code === 'AMBIGUOUS') return 'Several equally likely releases';
 		if (code === 'CONTRADICTORY') return 'Conflicting track evidence';
+		if (code === 'RELEASE_TYPE_REQUIRES_CONFIRMATION' || code === 'UNSAFE_RELEASE_TYPE') {
+			return 'Compilation or live edition needs confirmation';
+		}
 		return code.replaceAll('_', ' ').toLowerCase();
 	}
 </script>

@@ -556,6 +556,27 @@ class FollowStore:
             for row in rows
         ]
 
+    async def count_pending_approval_units(self) -> int:
+        """Count individual approvals plus one unit per pending import batch."""
+
+        def operation(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM auto_download_approvals
+                     WHERE state = 'pending' AND batch_id IS NULL)
+                    +
+                    (SELECT COUNT(*) FROM (
+                        SELECT batch_id, user_id FROM auto_download_approvals
+                        WHERE state = 'pending' AND batch_id IS NOT NULL
+                        GROUP BY batch_id, user_id
+                    )) AS count
+                """
+            ).fetchone()
+            return int(row["count"] if row is not None else 0)
+
+        return await self._read(operation)
+
     async def create_import_approval_batch(
         self,
         user_id: str,

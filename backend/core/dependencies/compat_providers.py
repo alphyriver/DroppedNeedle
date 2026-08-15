@@ -169,9 +169,9 @@ def get_compat_bookmark_service() -> "CompatBookmarkService":
 @singleton
 def get_native_lyrics_service() -> "NativeLyricsService":
     from services.compat.native_lyrics_service import NativeLyricsService
-    from .service_providers import get_local_files_service
+    from .service_providers import get_target_local_files_service
 
-    return NativeLyricsService(get_local_files_service())
+    return NativeLyricsService(get_target_local_files_service())
 
 
 @singleton

@@ -1,10 +1,21 @@
 <script lang="ts">
-	import { AlertTriangle, ArrowRight, DatabaseZap } from 'lucide-svelte';
+	import { ArrowRight, ChevronDown, X } from 'lucide-svelte';
+	import { onMount } from 'svelte';
+
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getLibraryActivityQuery } from '$lib/queries/library/LibraryActivityQueries.svelte';
-	import type { LibraryActivityResponse } from '$lib/queries/library/LibraryOperationsTypes';
-	import LibraryWorkLane from './LibraryWorkLane.svelte';
-	import { onMount } from 'svelte';
+	import type {
+		LibraryActivityResponse,
+		LibraryWorkItem
+	} from '$lib/queries/library/LibraryOperationsTypes';
+	import LibraryWorkIcon from './LibraryWorkIcon.svelte';
+	import LibraryWorkProgress from './LibraryWorkProgress.svelte';
+	import {
+		libraryWorkContext,
+		libraryWorkEffect,
+		libraryWorkHref,
+		libraryWorkTitle
+	} from './LibraryWorkPresentation';
 
 	interface Props {
 		activityOverride?: LibraryActivityResponse | null;
@@ -20,6 +31,9 @@
 		adminOverride = undefined
 	}: Props = $props();
 	let currentTime = $state(Date.now() / 1000);
+	let activityShell: HTMLDivElement | null = $state(null);
+	let expanded = $state(false);
+	let dismissedFailureKeys = $state<string[]>([]);
 	const effectiveNow = $derived(now ?? currentTime);
 
 	onMount(() => {
@@ -30,164 +44,153 @@
 		return () => window.clearInterval(timer);
 	});
 
+	$effect(() => {
+		const shell = activityShell;
+		if (!shell || typeof ResizeObserver === 'undefined') return;
+		const container = shell.parentElement;
+		if (!container) return;
+		const updateOffset = () => {
+			container.style.setProperty(
+				'--droppedneedle-library-activity-height',
+				`${shell.offsetHeight}px`
+			);
+		};
+		const observer = new ResizeObserver(updateOffset);
+		observer.observe(shell);
+		updateOffset();
+		return () => {
+			observer.disconnect();
+			container.style.removeProperty('--droppedneedle-library-activity-height');
+		};
+	});
+
 	const userId = $derived(userIdOverride ?? authStore.user?.id);
 	const isAdmin = $derived(adminOverride ?? authStore.isAdmin);
 	const activityQuery = getLibraryActivityQuery(() => userId);
 	const activity = $derived(activityOverride ?? activityQuery.data);
-	const scan = $derived(activity?.items.find((item) => item.kind === 'scan'));
-	const identification = $derived(activity?.items.find((item) => item.kind === 'identification'));
-	const destination = $derived(isAdmin ? '/library#operations' : '/library');
-	const identificationActive = $derived(
-		Boolean(identification && identification.waiting_count > 0)
-	);
-	const foregroundActive = $derived(
-		Boolean(identification && identification.foreground_operation_count > 0)
-	);
-	const failure = $derived(
-		[scan, identification]
-			.filter((item) => item?.failure_event_id && item.failure_at)
-			.sort((left, right) => (right?.failure_at ?? 0) - (left?.failure_at ?? 0))[0]
-	);
-	const recentFailure = $derived(
-		Boolean(
-			failure?.failure_event_id &&
-			failure.failure_at &&
-			effectiveNow - failure.failure_at < 24 * 60 * 60
-		)
-	);
-	const dismissalKey = $derived(
-		userId && failure?.failure_event_id
-			? `droppedneedle:library-failure:${userId}:${failure.failure_event_id}`
-			: null
-	);
-	let dismissedKey = $state<string | null>(null);
+	const rawWorkItems = $derived(activity?.work_items ?? []);
 
 	$effect(() => {
-		if (!dismissalKey || typeof localStorage === 'undefined') {
-			dismissedKey = null;
+		const currentUserId = userId;
+		const keys = rawWorkItems
+			.map((item) => failureStorageKey(currentUserId, item))
+			.filter((key): key is string => key !== null);
+		if (typeof localStorage === 'undefined') {
+			dismissedFailureKeys = [];
 			return;
 		}
-		dismissedKey = localStorage.getItem(dismissalKey) === '1' ? dismissalKey : null;
+		dismissedFailureKeys = keys.filter((key) => localStorage.getItem(key) === '1');
 	});
 
-	const failureVisible = $derived(recentFailure && dismissedKey !== dismissalKey);
-	const displayedScan = $derived(
-		scan?.state === 'failed'
-			? failureVisible && failure?.kind === 'scan'
-				? scan
-				: undefined
-			: scan
+	const workItems = $derived(
+		rawWorkItems.filter((item) => {
+			if (item.kind === 'recovery') return true;
+			if (!item.failure_event_id || !item.failure_at) return true;
+			if (effectiveNow - item.failure_at >= 24 * 60 * 60) return false;
+			const key = failureStorageKey(userId, item);
+			return key === null || !dismissedFailureKeys.includes(key);
+		})
 	);
-	const quietIdentification = $derived(
-		Boolean(
-			!displayedScan &&
-			identificationActive &&
-			!foregroundActive &&
-			!failureVisible &&
-			identification?.state === 'running' &&
-			identification.started_at &&
-			effectiveNow - identification.started_at >= 24 * 60 * 60
-		)
+	const primary = $derived(workItems[0] ?? null);
+	const additional = $derived(workItems.slice(1));
+	const destination = $derived(
+		primary ? (isAdmin ? libraryWorkHref(primary) : '/library') : '/library'
 	);
-	const showStrip = $derived(
-		Boolean(displayedScan || identificationActive || foregroundActive || failureVisible)
-	);
-	const accessibleName = $derived(
-		[
-			displayedScan
-				? `Local files ${displayedScan.state}, ${displayedScan.processed} of ${displayedScan.total ?? 'an unknown total'}`
-				: 'Local files idle',
-			identification
-				? `Identification ${identification.state}, ${identification.processed} complete and ${identification.waiting_count} waiting`
-				: 'Identification idle'
-		].join('. ')
-	);
-	const headline = $derived(
-		displayedScan
-			? displayedScan.state === 'discovering'
-				? 'Counting local files'
-				: displayedScan.state === 'indexing'
-					? 'Indexing local files'
-					: displayedScan.state === 'reconciling'
-						? 'Reconciling library'
-						: displayedScan.state === 'pausing'
-							? 'Pausing after the current file...'
-							: displayedScan.state === 'paused'
-								? 'Local library update paused'
-								: displayedScan.state === 'stopping'
-									? 'Stopping after the current file...'
-									: displayedScan.state === 'failed'
-										? 'Local library update failed'
-										: 'Scan in progress'
-			: identification?.state === 'pausing'
-				? 'Pausing identification...'
-				: identification?.state === 'paused'
-					? 'Identification paused'
-					: identification?.state === 'failed'
-						? 'Library identification failed'
-						: foregroundActive
-							? 'Administrative library work in progress'
-							: 'Library identification in progress'
+	const announcement = $derived(
+		primary
+			? `${libraryWorkTitle(primary)}. ${libraryWorkEffect(primary)}.`
+			: 'No library work is running.'
 	);
 
-	function dismissFailure(): void {
-		if (!dismissalKey) return;
-		dismissedKey = dismissalKey;
+	$effect(() => {
+		if (additional.length === 0) expanded = false;
+	});
+
+	function failureStorageKey(
+		currentUserId: string | undefined,
+		item: LibraryWorkItem
+	): string | null {
+		return currentUserId && item.failure_event_id
+			? `droppedneedle:library-failure:${currentUserId}:${item.failure_event_id}`
+			: null;
+	}
+
+	function dismissFailure(item: LibraryWorkItem): void {
+		const key = failureStorageKey(userId, item);
+		if (!key) return;
+		dismissedFailureKeys = [...dismissedFailureKeys, key];
 		try {
-			localStorage.setItem(dismissalKey, '1');
+			localStorage.setItem(key, '1');
 		} catch {
-			// The current page still honours dismissal when browser storage is unavailable.
+			// local dismissal still works when browser storage is unavailable
 		}
 	}
 </script>
 
-{#if showStrip}
-	<div class="library-activity-shell" data-testid="library-activity-strip">
-		<span class="sr-only" aria-live="polite" aria-atomic="true">{headline}</span>
-		{#if failureVisible}
-			<div class="library-activity-failure" role="status">
-				<AlertTriangle class="h-4 w-4 shrink-0" aria-hidden="true" />
-				<span class="min-w-0 flex-1"
-					>{failure?.kind === 'scan'
-						? 'Local library update needs attention'
-						: 'Library identification needs attention'}</span
-				>
+{#if primary}
+	<div
+		bind:this={activityShell}
+		class="library-activity-shell"
+		data-testid="library-activity-strip"
+		data-effect={primary.effect}
+	>
+		<span class="sr-only" aria-live="polite" aria-atomic="true">{announcement}</span>
+		<div class="library-activity-primary">
+			<a href={destination} class="library-activity-primary__link">
+				<span class="library-activity-primary__icon">
+					<LibraryWorkIcon item={primary} />
+				</span>
+				<div class="min-w-0 flex-1">
+					<div class="library-activity-primary__heading">
+						<span>{libraryWorkEffect(primary)}</span>
+						<strong>{libraryWorkTitle(primary)}</strong>
+						{#if libraryWorkContext(primary)}<small>{libraryWorkContext(primary)}</small>{/if}
+					</div>
+					<LibraryWorkProgress item={primary} compact />
+				</div>
+				<ArrowRight class="h-4 w-4 shrink-0 text-base-content/45" aria-hidden="true" />
+			</a>
+
+			{#if primary.effect === 'attention' && primary.kind !== 'recovery'}
 				<button
 					type="button"
-					class="btn btn-ghost btn-xs"
-					onclick={dismissFailure}
-					aria-label="Dismiss library failure">Dismiss</button
+					class="library-activity-icon-button"
+					onclick={() => dismissFailure(primary)}
+					aria-label="Dismiss library failure"><X class="h-4 w-4" /></button
 				>
+			{/if}
+			{#if additional.length}
+				<button
+					type="button"
+					class="library-activity-stack-toggle"
+					aria-expanded={expanded}
+					aria-controls="library-activity-work-stack"
+					aria-label={`${expanded ? 'Hide' : 'Show'} ${additional.length} other ${additional.length === 1 ? 'task' : 'tasks'}`}
+					onclick={() => (expanded = !expanded)}
+				>
+					<span>+{additional.length} other {additional.length === 1 ? 'task' : 'tasks'}</span>
+					<ChevronDown class={`h-4 w-4${expanded ? ' rotate-180' : ''}`} />
+				</button>
+			{/if}
+		</div>
+
+		{#if expanded && additional.length}
+			<div id="library-activity-work-stack" class="library-activity-stack">
+				{#each additional as item (item.id)}
+					<a
+						href={isAdmin ? libraryWorkHref(item) : '/library'}
+						class="library-activity-stack__item"
+					>
+						<span class="library-activity-stack__icon"><LibraryWorkIcon {item} /></span>
+						<span class="min-w-0 flex-1">
+							<strong>{libraryWorkTitle(item)}</strong>
+							<small>{libraryWorkEffect(item)}</small>
+							<LibraryWorkProgress {item} compact />
+						</span>
+						<ArrowRight class="h-4 w-4 shrink-0 text-base-content/40" aria-hidden="true" />
+					</a>
+				{/each}
 			</div>
 		{/if}
-
-		<a
-			href={destination}
-			class="library-activity-link"
-			class:library-activity-link--quiet={quietIdentification}
-			aria-label={accessibleName}
-		>
-			{#if quietIdentification && identification}
-				<DatabaseZap class="h-4 w-4 shrink-0 text-[var(--color-library-identify)]" />
-				<span class="min-w-0 flex-1 truncate font-medium">Library identification continues</span>
-				<span class="hidden text-xs text-base-content/60 sm:inline">
-					{identification.processed.toLocaleString()} complete · {identification.waiting_count.toLocaleString()}
-					waiting
-				</span>
-				<ArrowRight class="h-4 w-4 shrink-0" aria-hidden="true" />
-			{:else}
-				<div class="min-w-0 flex-1 space-y-1.5">
-					<div class="flex items-center justify-between gap-3 text-xs">
-						<span class="font-display font-semibold tracking-wide">Library work</span>
-						<span class="truncate text-base-content/55">
-							{headline}
-						</span>
-					</div>
-					<LibraryWorkLane kind="scan" item={displayedScan} compact />
-					<LibraryWorkLane kind="identification" item={identification} compact />
-				</div>
-				<ArrowRight class="h-4 w-4 shrink-0 text-base-content/50" aria-hidden="true" />
-			{/if}
-		</a>
 	</div>
 {/if}

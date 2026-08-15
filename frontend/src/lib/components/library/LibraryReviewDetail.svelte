@@ -145,6 +145,8 @@
 	function reasonLabel(reasonCode: string): string {
 		const labels: Record<string, string> = {
 			CONTRADICTORY: 'The local evidence conflicts with this release',
+			RELEASE_TYPE_REQUIRES_CONFIRMATION: 'Compilation or live edition needs confirmation',
+			UNSAFE_RELEASE_TYPE: 'Compilation or live edition needs confirmation',
 			MULTIPLE_LIKELY_RELEASES: 'More than one release is equally likely',
 			UNKNOWN_EXTRAS: 'Some local tracks cannot be matched safely',
 			INCOMPLETE_SUPPORT: 'The available evidence does not support the whole album'

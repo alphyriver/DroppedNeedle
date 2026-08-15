@@ -7,6 +7,7 @@ from math import ceil
 from typing import Optional, TYPE_CHECKING
 from api.v1.schemas.search import (
     SearchResult,
+    SearchRemoteStatus,
     SearchResponse,
     SuggestResult,
     SuggestResponse,
@@ -18,6 +19,8 @@ from repositories.protocols import (
 )
 from services.preferences_service import PreferencesService
 from infrastructure.http.deduplication import deduplicate
+from infrastructure.degradation import try_get_degradation_context
+from infrastructure.integration_result import IntegrationResult
 
 if TYPE_CHECKING:
     from services.audiodb_image_service import AudioDBImageService
@@ -30,6 +33,8 @@ COVER_PREFETCH_LIMIT = 12
 SEARCH_CACHE_TTL = 90
 SEARCH_CACHE_MAX_SIZE = 200
 TOP_RESULT_SCORE_THRESHOLD = 90
+FULL_SEARCH_TIMEOUT_SECONDS = 6.0
+SUGGEST_TIMEOUT_SECONDS = 3.0
 
 
 class SearchService:
@@ -86,6 +91,19 @@ class SearchService:
     async def _safe_gather(self, *tasks):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r if not isinstance(r, Exception) else None for r in results]
+
+    @staticmethod
+    def _record_musicbrainz_error(message: str) -> None:
+        context = try_get_degradation_context()
+        if context is not None:
+            context.record(IntegrationResult.error(source="musicbrainz", msg=message))
+
+    @staticmethod
+    def _remote_status(has_results: bool) -> SearchRemoteStatus:
+        context = try_get_degradation_context()
+        if context is None or context.summary().get("musicbrainz") is None:
+            return "ok"
+        return "partial" if has_results else "error"
 
     @staticmethod
     def _normalize_tokens(text: str) -> set[str]:
@@ -241,25 +259,46 @@ class SearchService:
         if not buckets or "albums" in buckets:
             limits["albums"] = limit_albums
 
-        try:
-            tasks = [
-                self._mb_repo.search_grouped(
+        async def fetch_grouped():
+            async with asyncio.timeout(FULL_SEARCH_TIMEOUT_SECONDS):
+                return await self._mb_repo.search_grouped(
                     query,
                     limits=limits,
                     buckets=buckets,
                     included_secondary_types=included_secondary_types,
                     included_primary_types=included_primary_types,
                 )
-            ]
-            if self._ownership is None:
-                tasks.append(
-                    self._library_repo.get_library_mbids(include_release_ids=True)
-                )
-            grouped, *library_results = await self._safe_gather(*tasks)
-            library_mbids_raw = library_results[0] if library_results else None
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Search gather failed unexpectedly: {e}")
-            grouped, library_mbids_raw = None, None
+
+        tasks = [fetch_grouped()]
+        if self._ownership is None:
+            tasks.append(self._library_repo.get_library_mbids(include_release_ids=True))
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        grouped_result, *library_results = gathered
+        remote_status_override: SearchRemoteStatus | None = None
+        failed_buckets: set[str] | None = None
+        if isinstance(grouped_result, TimeoutError):
+            self._record_musicbrainz_error("Search exceeded the response deadline")
+            logger.warning("MusicBrainz search exceeded the response deadline")
+            grouped = None
+            remote_status_override = "timeout"
+        elif isinstance(grouped_result, Exception):
+            self._record_musicbrainz_error("Search provider request failed")
+            logger.warning(
+                "MusicBrainz search failed: %s", type(grouped_result).__name__
+            )
+            grouped = None
+            remote_status_override = "error"
+        else:
+            if isinstance(grouped_result, tuple):
+                grouped, failed_buckets = grouped_result
+                if failed_buckets:
+                    self._record_musicbrainz_error("One or more search buckets failed")
+            else:
+                grouped = grouped_result
+        library_result = library_results[0] if library_results else None
+        library_mbids_raw = (
+            None if isinstance(library_result, Exception) else library_result
+        )
 
         if grouped is None:
             logger.warning("MusicBrainz search returned no results or failed")
@@ -274,13 +313,35 @@ class SearchService:
         top_artist = self._detect_top_result(grouped.get("artists", []), query)
         top_album = self._detect_top_result(grouped.get("albums", []), query)
 
+        has_results = bool(grouped.get("artists") or grouped.get("albums"))
+        remote_status = remote_status_override or self._remote_status(has_results)
+        if remote_status_override is not None:
+            bucket_status = {
+                name: remote_status_override
+                for name in ("artists", "albums")
+                if not buckets or name in buckets
+            }
+        elif failed_buckets is not None:
+            bucket_status = {
+                name: "error" if name in failed_buckets else "ok"
+                for name in ("artists", "albums")
+                if not buckets or name in buckets
+            }
+        else:
+            bucket_status = {
+                name: remote_status
+                for name in ("artists", "albums")
+                if not buckets or name in buckets
+            }
         response = SearchResponse(
             artists=grouped.get("artists", []),
             albums=grouped.get("albums", []),
             top_artist=top_artist,
             top_album=top_album,
+            bucket_status=bucket_status,
         )
-        self._search_cache[cache_key] = (now, response)
+        if all(status == "ok" for status in bucket_status.values()):
+            self._search_cache[cache_key] = (now, response)
         if len(self._search_cache) > SEARCH_CACHE_MAX_SIZE:
             expired = [
                 k
@@ -312,25 +373,43 @@ class SearchService:
     )
     async def search_bucket(
         self, bucket: str, query: str, limit: int = 50, offset: int = 0
-    ) -> tuple[list[SearchResult], SearchResult | None]:
+    ) -> tuple[list[SearchResult], SearchResult | None, SearchRemoteStatus]:
         prefs = self._preferences_service.get_preferences()
         included_secondary_types = set(t.lower() for t in prefs.secondary_types)
         included_primary_types = set(t.lower() for t in prefs.primary_types)
 
-        if bucket == "artists":
-            results = await self._mb_repo.search_artists(
-                query, limit=limit, offset=offset
+        try:
+            async with asyncio.timeout(FULL_SEARCH_TIMEOUT_SECONDS):
+                if bucket == "artists":
+                    results = await self._mb_repo.search_artists(
+                        query, limit=limit, offset=offset
+                    )
+                elif bucket == "albums":
+                    results = await self._mb_repo.search_albums(
+                        query,
+                        limit=limit,
+                        offset=offset,
+                        included_secondary_types=included_secondary_types,
+                        included_primary_types=included_primary_types,
+                    )
+                else:
+                    return [], None, "error"
+        except TimeoutError:
+            self._record_musicbrainz_error(
+                "Search bucket exceeded the response deadline"
             )
-        elif bucket == "albums":
-            results = await self._mb_repo.search_albums(
-                query,
-                limit=limit,
-                offset=offset,
-                included_secondary_types=included_secondary_types,
-                included_primary_types=included_primary_types,
+            logger.warning(
+                "MusicBrainz %s search exceeded the response deadline", bucket
             )
-        else:
-            return [], None
+            return [], None, "timeout"
+        except Exception as error:  # noqa: BLE001 - provider failures degrade one bucket
+            self._record_musicbrainz_error("Search bucket provider request failed")
+            logger.warning(
+                "MusicBrainz %s search failed: %s", bucket, type(error).__name__
+            )
+            return [], None, "error"
+
+        status = self._remote_status(bool(results))
 
         if bucket == "albums":
             library_mbids_raw = None
@@ -345,7 +424,7 @@ class SearchService:
         await self._apply_audiodb_search_overlay(results)
 
         top_result = self._detect_top_result(results, query) if offset == 0 else None
-        return results, top_result
+        return results, top_result, status
 
     @deduplicate(
         lambda self, query, limit=5: f"suggest:{query.strip().lower()}:{limit}"
@@ -361,20 +440,33 @@ class SearchService:
         bucket_limit = ceil(limit * 0.6)
 
         try:
-            grouped = await self._mb_repo.search_grouped(
-                query,
-                limits={"artists": bucket_limit, "albums": bucket_limit},
-                included_secondary_types=included_secondary_types,
-                included_primary_types=included_primary_types,
-            )
+            async with asyncio.timeout(SUGGEST_TIMEOUT_SECONDS):
+                grouped_result = await self._mb_repo.search_grouped(
+                    query,
+                    limits={"artists": bucket_limit, "albums": bucket_limit},
+                    included_secondary_types=included_secondary_types,
+                    included_primary_types=included_primary_types,
+                )
+        except TimeoutError:
+            self._record_musicbrainz_error("Suggestions exceeded the response deadline")
+            logger.warning("MusicBrainz suggest exceeded the response deadline")
+            return SuggestResponse(remote_status="timeout")
         except Exception as e:  # noqa: BLE001
+            self._record_musicbrainz_error("Suggestions provider request failed")
             logger.warning(
                 "MusicBrainz suggest failed (query_len=%d): %s",
                 len(query),
                 type(e).__name__,
             )
-            return SuggestResponse()
+            return SuggestResponse(remote_status="error")
 
+        failed_buckets: set[str] | None = None
+        if isinstance(grouped_result, tuple):
+            grouped, failed_buckets = grouped_result
+            if failed_buckets:
+                self._record_musicbrainz_error("One or more suggestion buckets failed")
+        else:
+            grouped = grouped_result
         grouped = grouped or {"artists": [], "albums": []}
 
         library_mbids_raw = None
@@ -406,4 +498,7 @@ class SearchService:
         suggestions.sort(
             key=lambda s: (-s.score, type_order.get(s.type, 2), s.title.lower())
         )
-        return SuggestResponse(results=suggestions[:limit])
+        remote_status = self._remote_status(bool(suggestions))
+        if failed_buckets:
+            remote_status = "partial" if suggestions else "error"
+        return SuggestResponse(results=suggestions[:limit], remote_status=remote_status)

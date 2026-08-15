@@ -183,7 +183,7 @@ class TestGetSimilarArtistsSource:
 
         await svc.get_similar_artists("mbid-123", count=5)
 
-        assert svc._cache.set.await_count == 1
+        assert svc._cache.set.await_count == 2
 
     @pytest.mark.asyncio
     async def test_lb_not_configured_returns_not_configured(self):
@@ -223,6 +223,7 @@ class TestGetSimilarArtistsSource:
     async def test_same_count_hits_cache_for_similar(self):
         svc, lb_repo, _, _ = _make_service()
         svc._cache.get.side_effect = [
+            None,
             None,
             MagicMock(similar_artists=[]),
         ]
@@ -294,7 +295,7 @@ class TestGetTopSongsSource:
 
         await svc.get_top_songs("mbid-123", count=10)
 
-        assert svc._cache.set.await_count == 1
+        assert svc._cache.set.await_count == 2
 
 
 class TestGetTopAlbumsSource:
@@ -361,7 +362,7 @@ class TestGetTopAlbumsSource:
 
         await svc.get_top_albums("mbid-123", count=10)
 
-        assert svc._cache.set.await_count == 1
+        assert svc._cache.set.await_count == 2
 
     @pytest.mark.asyncio
     async def test_lb_empty_result_is_cached(self):
@@ -370,7 +371,7 @@ class TestGetTopAlbumsSource:
 
         await svc.get_top_albums("mbid-123", count=10)
 
-        assert svc._cache.set.await_count == 1
+        assert svc._cache.set.await_count == 2
 
     @pytest.mark.asyncio
     async def test_lb_empty_release_groups_falls_back_to_recordings(self):

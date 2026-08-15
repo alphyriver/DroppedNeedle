@@ -1,4 +1,5 @@
 """Service-level tests for filter-aware artist release pagination."""
+
 import os
 import tempfile
 
@@ -7,13 +8,16 @@ os.environ.setdefault("ROOT_APP_DIR", tempfile.mkdtemp())
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from core.exceptions import ClientDisconnectedError
 from services.artist_service import ArtistService
 
 
 ARTIST_MBID = "f4a31f0a-51dd-4fa7-986d-3095c40c5ed9"
 
 
-def _make_release_group(rg_id: str, title: str, primary_type: str, date: str = "2020-01-01") -> dict:
+def _make_release_group(
+    rg_id: str, title: str, primary_type: str, date: str = "2020-01-01"
+) -> dict:
     return {
         "id": rg_id,
         "title": title,
@@ -23,11 +27,17 @@ def _make_release_group(rg_id: str, title: str, primary_type: str, date: str = "
     }
 
 
-def _make_prefs(primary_types: list[str] | None = None, secondary_types: list[str] | None = None) -> MagicMock:
+def _make_prefs(
+    primary_types: list[str] | None = None, secondary_types: list[str] | None = None
+) -> MagicMock:
     p = MagicMock()
     p.get_preferences.return_value = MagicMock(
-        primary_types=primary_types if primary_types is not None else ["Album", "Single", "EP"],
-        secondary_types=secondary_types if secondary_types is not None else ["Studio", "Live", "Compilation"],
+        primary_types=primary_types
+        if primary_types is not None
+        else ["Album", "Single", "EP"],
+        secondary_types=secondary_types
+        if secondary_types is not None
+        else ["Studio", "Live", "Compilation"],
     )
     p.get_advanced_settings.return_value = MagicMock(
         cache_ttl_artist_library=21600,
@@ -75,6 +85,22 @@ def _make_service(
 
 class TestFilterAwarePagination:
     @pytest.mark.asyncio
+    async def test_disconnect_after_first_upstream_page_prevents_second_stage(self):
+        batch = [_make_release_group("rg-1", "Album A", "Album")]
+        svc = _make_service(mb_release_pages=[(batch, 200), (batch, 200)])
+        is_disconnected = AsyncMock(side_effect=[False, False, True])
+
+        with pytest.raises(ClientDisconnectedError):
+            await svc.get_artist_releases(
+                ARTIST_MBID,
+                offset=0,
+                limit=50,
+                is_disconnected=is_disconnected,
+            )
+
+        svc._mb_repo.get_artist_release_groups.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_single_page_fits_filter(self):
         rg1 = _make_release_group("rg-1", "Album A", "Album")
         rg2 = _make_release_group("rg-2", "Single B", "Single")
@@ -93,7 +119,10 @@ class TestFilterAwarePagination:
 
     @pytest.mark.asyncio
     async def test_sparse_filter_scans_multiple_batches(self):
-        batch1 = [_make_release_group(f"rg-{i}", f"Broadcast {i}", "Broadcast") for i in range(5)]
+        batch1 = [
+            _make_release_group(f"rg-{i}", f"Broadcast {i}", "Broadcast")
+            for i in range(5)
+        ]
         batch2 = [_make_release_group("rg-album", "Real Album", "Album")]
         svc = _make_service(
             mb_release_pages=[
@@ -121,18 +150,25 @@ class TestFilterAwarePagination:
 
     @pytest.mark.asyncio
     async def test_next_offset_is_scan_position(self):
-        batch1 = [_make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(100)]
+        batch1 = [
+            _make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(100)
+        ]
         svc = _make_service(mb_release_pages=[(batch1, 200)])
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=10)
 
         assert result.has_more is True
-        assert result.next_offset == 100
+        assert result.returned_count == 10
+        assert result.next_offset == 10
 
     @pytest.mark.asyncio
     async def test_no_duplicates_within_scan(self):
-        batch1 = [_make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(5)]
-        batch2 = [_make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(3, 8)]
+        batch1 = [
+            _make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(5)
+        ]
+        batch2 = [
+            _make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(3, 8)
+        ]
         svc = _make_service(
             mb_release_pages=[
                 (batch1, 8),
@@ -148,12 +184,26 @@ class TestFilterAwarePagination:
     @pytest.mark.asyncio
     async def test_no_drops_across_sequential_pages(self):
         rgs = [_make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(10)]
-        svc = _make_service(mb_release_pages=[(rgs, 10)])
+        svc = _make_service(
+            mb_release_pages=[
+                (rgs, 10),
+                (rgs[3:], 10),
+                (rgs[6:], 10),
+                (rgs[9:], 10),
+            ]
+        )
 
         page1 = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=3)
-        assert page1.returned_count == 10
-        assert page1.has_more is False
-        assert page1.next_offset is None
+        page2 = await svc.get_artist_releases(ARTIST_MBID, offset=3, limit=3)
+        page3 = await svc.get_artist_releases(ARTIST_MBID, offset=6, limit=3)
+        page4 = await svc.get_artist_releases(ARTIST_MBID, offset=9, limit=3)
+
+        pages = [page1, page2, page3, page4]
+        assert [page.returned_count for page in pages] == [3, 3, 3, 1]
+        assert [page.next_offset for page in pages] == [3, 6, 9, None]
+        ids = [item.id for page in pages for item in page.albums]
+        assert ids == [item["id"] for item in rgs]
+        assert len(ids) == len(set(ids))
 
     @pytest.mark.asyncio
     async def test_empty_result_set(self):
@@ -193,7 +243,7 @@ class TestFilterAwarePagination:
         assert len(result.eps) == 1
 
     @pytest.mark.asyncio
-    async def test_limit_controls_scan_termination_all_items_returned(self):
+    async def test_limit_controls_returned_items(self):
         rgs = [
             _make_release_group("rg-a1", "Album 1", "Album"),
             _make_release_group("rg-a2", "Album 2", "Album"),
@@ -205,16 +255,57 @@ class TestFilterAwarePagination:
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=3)
 
-        assert result.returned_count == 5
+        assert result.returned_count == 3
         assert len(result.albums) == 3
-        assert len(result.singles) == 1
-        assert len(result.eps) == 1
-        assert result.has_more is False
+        assert len(result.singles) == 0
+        assert len(result.eps) == 0
+        assert result.has_more is True
+        assert result.next_offset == 3
+
+    @pytest.mark.asyncio
+    async def test_sparse_pages_honor_limit_without_drops(self):
+        filtered = [
+            _make_release_group(f"rg-b{i}", f"Broadcast {i}", "Broadcast")
+            for i in range(95)
+        ]
+        first_included = [
+            _make_release_group(f"rg-a{i}", f"Album {i}", "Album") for i in range(5)
+        ]
+        later_included = [
+            _make_release_group(f"rg-s{i}", f"Single {i}", "Single") for i in range(20)
+        ]
+        svc = _make_service(
+            mb_release_pages=[
+                (filtered + first_included, 120),
+                (later_included, 120),
+                (later_included[5:], 120),
+                (later_included[15:], 120),
+            ]
+        )
+
+        page1 = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=10)
+        page2 = await svc.get_artist_releases(ARTIST_MBID, offset=105, limit=10)
+        page3 = await svc.get_artist_releases(ARTIST_MBID, offset=115, limit=10)
+
+        pages = [page1, page2, page3]
+        assert [page.returned_count for page in pages] == [10, 10, 5]
+        assert [page.next_offset for page in pages] == [105, 115, None]
+        ids = [
+            item.id
+            for page in pages
+            for items in (page.albums, page.singles, page.eps)
+            for item in items
+        ]
+        expected = [item["id"] for item in first_included + later_included]
+        assert set(ids) == set(expected)
+        assert len(ids) == len(set(ids))
 
     @pytest.mark.asyncio
     async def test_exception_returns_empty_page(self):
         svc = _make_service()
-        svc._library_repo.get_library_mbids = AsyncMock(side_effect=RuntimeError("boom"))
+        svc._library_repo.get_library_mbids = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
 
@@ -237,10 +328,10 @@ class TestFilterAwarePagination:
 
     @pytest.mark.asyncio
     async def test_all_types_filtered_out_except_one(self):
-        batch = (
-            [_make_release_group(f"rg-b{i}", f"Broadcast {i}", "Broadcast") for i in range(5)]
-            + [_make_release_group("rg-album", "Found Album", "Album")]
-        )
+        batch = [
+            _make_release_group(f"rg-b{i}", f"Broadcast {i}", "Broadcast")
+            for i in range(5)
+        ] + [_make_release_group("rg-album", "Found Album", "Album")]
         svc = _make_service(
             mb_release_pages=[
                 (batch, 6),
@@ -273,7 +364,10 @@ class TestFilterAwarePagination:
 
     @pytest.mark.asyncio
     async def test_scan_batch_cap_stops_early(self):
-        batches = [([_make_release_group(f"rg-{i}", f"Album {i}", "Album")], 5000) for i in range(25)]
+        batches = [
+            ([_make_release_group(f"rg-{i}", f"Album {i}", "Album")], 5000)
+            for i in range(25)
+        ]
         svc = _make_service(mb_release_pages=batches)
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)

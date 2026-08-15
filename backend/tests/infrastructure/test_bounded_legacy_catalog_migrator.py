@@ -10,11 +10,14 @@ from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.bounded_legacy_catalog_migrator import (
     BoundedLegacyCatalogMigrator,
 )
+from services.native.legacy_catalog_importer import _valid_mbid
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from tests.infrastructure.test_legacy_catalog_importer import (
     ARTIST_1,
+    RECORDING_1,
     RG,
     TRACK_1,
+    TRACK_2,
     _create_source,
 )
 
@@ -89,6 +92,14 @@ def _insert_legacy_library_file(
             20.0,
         ),
     )
+
+
+def test_legacy_mbid_validation_requires_canonical_unpadded_value() -> None:
+    canonical = "88d17133-abbc-42db-9526-4e2c1db60336"
+
+    assert _valid_mbid(canonical)
+    assert not _valid_mbid(canonical.replace("-", ""))
+    assert not _valid_mbid(f" {canonical} ")
 
 
 @pytest.mark.asyncio
@@ -592,6 +603,49 @@ async def test_bounded_migration_omits_invalid_optional_recording_identity(
 
 
 @pytest.mark.asyncio
+async def test_bounded_migration_does_not_treat_dashless_artist_id_as_mbid(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    synthetic_artist_id = "d4ee74d98c7a6f053a0ebffd0ed5fccb"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_files SET artist_mbid = ? WHERE id = ?",
+            (synthetic_artist_id, TRACK_1),
+        )
+        connection.execute(
+            "DELETE FROM user_favorites WHERE item_kind = 'artist' AND item_id = ?",
+            (ARTIST_1,),
+        )
+    _store, migrator = _migrator(database, root, [])
+
+    outcome = await migrator.migrate("bounded-synthetic-artist", now=100)
+
+    assert outcome.report.state == "applied", outcome.blocker_reason_counts
+    with sqlite3.connect(database) as connection:
+        track_artist = connection.execute(
+            "SELECT artist.id, identity.provider_artist_id "
+            "FROM local_track_artists credit "
+            "JOIN local_artists artist ON artist.id = credit.local_artist_id "
+            "LEFT JOIN local_artist_external_identities identity "
+            "ON identity.local_artist_id = artist.id "
+            "WHERE credit.local_track_id = ? AND credit.position = 0",
+            (TRACK_1,),
+        ).fetchone()
+        synthetic_identity = connection.execute(
+            "SELECT local_artist_id FROM local_artist_external_identities "
+            "WHERE provider_artist_id = ?",
+            (synthetic_artist_id,),
+        ).fetchone()
+    assert track_artist is not None
+    assert track_artist[1] is None
+    assert synthetic_identity is None
+
+
+@pytest.mark.asyncio
 async def test_bounded_migration_reports_outside_root_before_catalog_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -762,7 +816,7 @@ async def test_bounded_migration_retains_provider_era_and_removed_jellyfin_refer
 
 
 @pytest.mark.asyncio
-async def test_bounded_migration_blocks_ambiguous_history_without_completion_marker(
+async def test_bounded_migration_retains_ambiguous_history_unlinked(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "Music"
@@ -792,12 +846,125 @@ async def test_bounded_migration_blocks_ambiguous_history_without_completion_mar
         )
     store, migrator = _migrator(database, root, [])
 
-    outcome = await migrator.migrate("bounded-blocked", now=100)
+    outcome = await migrator.migrate("bounded-retained", now=100)
 
-    assert outcome.report.state == "blocked"
-    assert outcome.blocker_count == 1
-    assert any("ambiguous-history" in blocker for blocker in outcome.report.blockers)
-    assert await store.row_count("library_migration_markers") == 0
+    assert outcome.report.state == "applied"
+    assert outcome.blocker_count == 0
+    counts = {
+        count.kind: count
+        for count in outcome.report.reference_counts
+        if count.user_id is None
+    }
+    assert counts["history"].unresolved == 0
+    assert counts["history"].retained == 1
+    with sqlite3.connect(database) as connection:
+        retained = connection.execute(
+            "SELECT local_track_id, local_album_id, local_artist_id, track_name, "
+            "artist_name, album_name FROM library_play_history WHERE id = ?",
+            ("ambiguous-history",),
+        ).fetchone()
+    assert retained == (
+        None,
+        None,
+        None,
+        "First",
+        "Artist One",
+        "Compilation",
+    )
+    assert await store.row_count("library_migration_markers") == 1
+    assert await store.validate_migration_references() == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_migration_disambiguates_shared_recording_by_release_group(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    other_release_group = "99999999-9999-4999-8999-999999999999"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_files SET recording_mbid = ?, "
+            "release_group_mbid = ?, track_title = 'First', artist_name = 'Artist One' "
+            "WHERE id = ?",
+            (RECORDING_1, other_release_group, TRACK_2),
+        )
+        connection.execute(
+            "INSERT INTO play_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "shared-recording-history",
+                "alice",
+                "First",
+                "Artist One",
+                "Compilation",
+                RECORDING_1,
+                RG,
+                180000,
+                None,
+                "2025-01-01T00:00:00Z",
+            ),
+        )
+    store, migrator = _migrator(database, root, [])
+
+    outcome = await migrator.migrate("bounded-shared-recording", now=100)
+
+    assert outcome.blocker_count == 0
+    counts = {
+        count.kind: count
+        for count in outcome.report.reference_counts
+        if count.user_id is None
+    }
+    assert counts["history"].mapped == 2
+    assert counts["history"].retained == 0
+    with sqlite3.connect(database) as connection:
+        resolved = connection.execute(
+            "SELECT local_track_id FROM library_play_history WHERE id = ?",
+            ("shared-recording-history",),
+        ).fetchone()
+    assert resolved == (TRACK_1,)
+
+
+@pytest.mark.asyncio
+async def test_bounded_migration_disambiguates_shared_recording_by_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_files SET recording_mbid = ? WHERE id = ?",
+            (RECORDING_1, TRACK_2),
+        )
+        connection.execute(
+            "INSERT INTO play_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "shared-recording-text-history",
+                "alice",
+                "First",
+                "Artist One",
+                "Compilation",
+                RECORDING_1,
+                None,
+                180000,
+                None,
+                "2025-01-01T00:00:00Z",
+            ),
+        )
+    store, migrator = _migrator(database, root, [])
+
+    outcome = await migrator.migrate("bounded-shared-recording-text", now=100)
+
+    assert outcome.blocker_count == 0
+    with sqlite3.connect(database) as connection:
+        resolved = connection.execute(
+            "SELECT local_track_id FROM library_play_history WHERE id = ?",
+            ("shared-recording-text-history",),
+        ).fetchone()
+    assert resolved == (TRACK_1,)
 
 
 @pytest.mark.asyncio

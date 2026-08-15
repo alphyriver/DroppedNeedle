@@ -380,6 +380,7 @@
 											remoteUrl={artist.image_url}
 											alt={artist.name}
 											size="full"
+											requestSize={250}
 										/>
 									</div>
 									<p class="text-sm font-medium mt-1 line-clamp-1">{artist.name}</p>

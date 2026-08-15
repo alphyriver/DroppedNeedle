@@ -24,6 +24,7 @@
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
 	import { createLibraryContributionMutation } from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { artistHref } from '$lib/utils/entityRoutes';
 
 	interface Props {
 		albumId: string;
@@ -49,6 +50,18 @@
 				: album?.identification_status === 'manual_identity_needs_review'
 					? 'Manual identity needs review'
 					: null
+	);
+	const managementIdentityAttention = $derived(
+		album?.management_identity_readiness === 'exact_release_required'
+			? 'Exact MusicBrainz edition required'
+			: album?.management_identity_readiness === 'track_mapping_required'
+				? 'Exact track map required'
+				: album?.management_identity_readiness === 'custom_manifest_stale'
+					? 'Custom edition review required'
+					: album?.identification_status === 'needs_review' ||
+						  album?.identification_status === 'manual_identity_needs_review'
+						? 'Identity review required'
+						: null
 	);
 	const musicbrainzUrl = $derived(
 		album?.musicbrainz_release_id
@@ -115,7 +128,7 @@
 				</div>
 				<h1 class="mt-3 text-3xl font-black tracking-tight sm:text-5xl">{album.title}</h1>
 				<a
-					href={`/artist/${album.artist_id}`}
+					href={artistHref(album.musicbrainz_artist_id ?? album.artist_id)}
 					class="mt-2 inline-block text-lg text-base-content/65 hover:underline"
 					>{album.artist_name || 'Unknown album artist'}</a
 				>
@@ -138,7 +151,7 @@
 					<button class="btn btn-ghost gap-2" disabled={!tracks.length} onclick={() => play(true)}
 						><Shuffle class="h-4 w-4" /> Shuffle</button
 					>
-					{#if authStore.isTrusted && album.album_identity_state !== 'release_linked'}
+					{#if authStore.isTrusted && album.album_identity_state === 'local_only'}
 						<button
 							class="btn btn-ghost gap-2"
 							disabled={contributionMutation.isPending}
@@ -148,10 +161,10 @@
 							{album.contribution_id ? 'Contribution in progress' : 'Contribute to MusicBrainz'}
 						</button>
 					{/if}
-					{#if authStore.isAdmin}<AlbumIdentificationPanel {album} /><AlbumOrganizationDialog
+					{#if authStore.isAdmin}<AlbumIdentificationPanel
 							{album}
-							{tracks}
-						/>{/if}
+							attentionLabel={managementIdentityAttention}
+						/><AlbumOrganizationDialog {album} {tracks} />{/if}
 				</div>
 				{#if album.review_id && authStore.isAdmin}
 					<a

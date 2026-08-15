@@ -271,11 +271,17 @@ class HomeService:
         task_name = f"home-warm-{user_id}"
         if registry.is_running(task_name):
             return
-        task = asyncio.create_task(self.warm_cache(user_id))
+        task = asyncio.create_task(self._run_triggered_warm(user_id))
         try:
             registry.register(task_name, task)
         except RuntimeError:
             pass
+
+    async def _run_triggered_warm(self, user_id: str) -> None:
+        if self._workload_gate is None:
+            await self.warm_cache(user_id)
+            return
+        await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
 
     async def warm_cache(self, user_id: str) -> None:
         if self._workload_gate is not None:

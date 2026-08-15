@@ -71,19 +71,29 @@ async def test_artist_cache_warmer_resolves_rebuilt_service_each_cycle(monkeypat
 
     service = SimpleNamespace(precache_artist_discovery=AsyncMock())
     service_getter = MagicMock(return_value=service)
+    gate = MagicMock()
+    gate.wait_until_available = AsyncMock()
+
+    async def run_warmer_unit(operation):
+        await operation()
+
+    gate.run_warmer_unit = AsyncMock(side_effect=run_warmer_unit)
+    first_mbid = "60000000-0000-4000-8000-000000000001"
+    second_mbid = "60000000-0000-4000-8000-000000000002"
     library = SimpleNamespace(
-        get_artist_mbid_page=AsyncMock(
-            return_value=["60000000-0000-4000-8000-000000000001"]
-        )
+        get_artist_mbid_page=AsyncMock(return_value=[first_mbid, second_mbid])
     )
     monkeypatch.setattr(tasks.asyncio, "sleep", stop_after_first_cycle)
 
     await tasks.warm_artist_discovery_cache_periodically(
-        service_getter, library, interval=10, delay=0
+        service_getter, library, interval=10, delay=0, workload_gate=gate
     )
 
-    service_getter.assert_called_once_with()
-    service.precache_artist_discovery.assert_awaited_once()
+    assert service_getter.call_count == 2
+    assert [
+        awaited.args[0] for awaited in service.precache_artist_discovery.await_args_list
+    ] == [[first_mbid], [second_mbid]]
+    assert gate.run_warmer_unit.await_count == 2
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from core.dependencies import (
     get_cache,
@@ -58,6 +57,7 @@ from core.exception_handlers import (
     stale_revision_error_handler,
 )
 from infrastructure.resilience.retry import CircuitOpenError
+from infrastructure.http.compression import CompressibleGZipMiddleware
 from infrastructure.msgspec_fastapi import MsgSpecJSONResponse
 from middleware import (
     DegradationMiddleware,
@@ -354,12 +354,19 @@ async def lifespan(app: FastAPI):
         # a bad path is operator-fixable at /settings/library, never fatal
         logger.error("startup.config_invalid", extra={"error": str(exc)})
 
-    from core.dependencies import get_download_orchestrator, get_library_scanner
+    from core.dependencies import (
+        get_acquisition_cleanup_service,
+        get_download_service,
+        get_download_orchestrator,
+        get_library_scanner,
+    )
     from core.tasks import (
+        start_acquisition_cleanup_task,
         start_download_auto_retry_task,
         start_download_resume_task,
         start_download_watchdog_task,
         start_library_scan_resume_task,
+        start_management_hold_auto_retry_task,
     )
 
     start_library_scan_resume_task(
@@ -367,6 +374,11 @@ async def lifespan(app: FastAPI):
         [_Path(root.path) for root in _library_settings.library_roots],
     )
 
+    try:
+        await get_acquisition_cleanup_service().recover_startup()
+    except Exception:  # noqa: BLE001 - durable worker continues recovery after startup
+        logger.exception("Acquisition cleanup startup recovery failed")
+    start_acquisition_cleanup_task(get_acquisition_cleanup_service)
     start_download_resume_task(get_download_orchestrator())
 
     # drop-import housekeeping: jobs whose task died with the process are failed,
@@ -398,6 +410,7 @@ async def lifespan(app: FastAPI):
     # orchestrator singleton, which is rebuilt when download-client settings are saved
     start_download_watchdog_task(get_download_orchestrator)
     start_download_auto_retry_task(get_download_orchestrator)
+    start_management_hold_auto_retry_task(get_download_service)
 
     from core.dependencies import get_download_store as _get_download_store
 
@@ -777,7 +790,7 @@ app.add_exception_handler(Exception, general_exception_handler)
 app.add_middleware(HSTSMiddleware)
 app.add_middleware(DegradationMiddleware)
 app.add_middleware(PerformanceMiddleware)
-app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
+app.add_middleware(CompressibleGZipMiddleware, minimum_size=1000, compresslevel=6)
 app.add_middleware(AuthMiddleware)
 app.add_middleware(
     RateLimitMiddleware,

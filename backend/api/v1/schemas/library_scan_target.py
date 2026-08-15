@@ -7,7 +7,7 @@ from typing import Literal
 import msgspec
 
 from infrastructure.msgspec_fastapi import AppStruct
-from models.library_work import ScanRun, ScanRunSnapshot
+from models.library_work import LibraryWorkItem, ScanRun, ScanRunSnapshot
 
 
 class ScanRunRequestBody(AppStruct):
@@ -78,6 +78,8 @@ class LibraryActivityItem(AppStruct):
 
 class LibraryActivityResponse(AppStruct):
     items: list[LibraryActivityItem]
+    work_items: list[LibraryWorkItem] = msgspec.field(default_factory=list)
+    revisions: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class IdentificationControlRequestBody(AppStruct):

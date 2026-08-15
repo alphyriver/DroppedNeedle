@@ -7,10 +7,12 @@ the PRE-enqueue key; ``torrents/add`` returns no hash) → recover the hash from
 qBittorrent states; **a torrent at 100% reports ``completed`` even while it keeps
 seeding** - seeding is a tracker obligation, not part of the download lifecycle.
 
-**Private-tracker rule (cancel):** post-import cleanup and user cancellation call
-``cancel``. A torrent that finished downloading is NEVER deleted (it must keep
-seeding; the import COPIES files, see ``TorrentStrategy``); only an incomplete
-torrent is removed WITH its partial data. list_completed_files remaps qBittorrent's
+**Private-tracker rule (abort / discard_client_artifacts):** a torrent that
+finished downloading is NEVER deleted (it must keep seeding; the import COPIES
+files, see ``TorrentStrategy``); only an incomplete torrent is removed WITH its
+partial data. ``inspect_materialization`` therefore reports no ``file_paths`` -
+a seeding torrent's bytes are not the attempt's to unlink. list_completed_files
+remaps qBittorrent's
 ``content_path`` (its namespace) onto the DroppedNeedle downloads mount by
 stripping the ``save_path`` prefix, then enumerates audio files (the folder-based
 import source, D18).
@@ -25,6 +27,7 @@ from pathlib import Path, PurePosixPath
 
 from models.common import ServiceStatus
 from repositories.protocols.download_client import (
+    DownloadMaterialization,
     DownloadTaskStatus,
     EnqueueRequest,
     MountDiagnosis,
@@ -141,16 +144,70 @@ class QbittorrentDownloadClient:
             return DownloadTaskStatus(task_id="", status="queued", matched_transfers=0)
         return _map_status(info)
 
-    async def cancel(self, handle: TaskHandle) -> bool:
-        """Private-tracker rule: a COMPLETED torrent is never deleted - it keeps
-        seeding under its category (the import copied the files). Only an incomplete
-        torrent is removed, WITH its partial data."""
+    async def abort(self, handle: TaskHandle) -> bool:
+        """Stop an active torrent and remove only client-owned incomplete data.
+
+        Private-tracker rule: a COMPLETED torrent is never deleted - it keeps
+        seeding under its category (the import COPIES files out). Only an
+        incomplete torrent is removed, WITH its partial data. A torrent that is
+        already gone leaves nothing to stop, so that is success - returning False
+        would wedge the cleanup journal in a retry loop."""
         info = await self._find(handle)
         if info is None:
-            return False
+            return True
         if info.progress >= 1.0:
             logger.info(
                 "qbittorrent: leaving completed torrent %s seeding (no delete)", info.hash
+            )
+            return True
+        return await self._client.delete_torrents(info.hash, delete_files=True)
+
+    async def inspect_materialization(
+        self, handle: TaskHandle
+    ) -> DownloadMaterialization:
+        """Resolve current torrent state and the local content path.
+
+        ``file_paths`` is deliberately left EMPTY even for a completed torrent.
+        Those bytes belong to the seeding torrent, not to the attempt, and the
+        cleanup journal unlinks every path reported here. ``workspace_path``
+        still carries the location as evidence."""
+        info = await self._find(handle)
+        healthy = await self.downloads_mount_healthy()
+        if info is None:
+            return DownloadMaterialization(
+                state="missing",
+                mount_root=str(self._mount),
+                mount_healthy=healthy,
+            )
+        state = info.state.lower()
+        if state in _FAILED_STATES:
+            resolved = "failed"
+        elif info.progress >= 1.0 or state in _SEEDING_STATES:
+            resolved = "completed"
+        else:
+            resolved = "active"
+        local = self._local_path(info) if info.content_path else None
+        return DownloadMaterialization(
+            state=resolved,
+            remote_storage=info.content_path or "",
+            mount_root=str(self._mount),
+            workspace_path=str(local) if local is not None else "",
+            mount_healthy=healthy,
+        )
+
+    async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
+        """Discard client-owned records once local cleanup is durable.
+
+        For qBittorrent the "record" IS the live seeding session, so a completed
+        torrent is retained on purpose and reported as success - there is nothing
+        left that the attempt owns. An incomplete torrent has no seeding value, so
+        it is removed with its partial data (same rule as ``abort``)."""
+        info = await self._find(handle)
+        if info is None:
+            return True
+        if info.progress >= 1.0:
+            logger.info(
+                "qbittorrent: retaining completed torrent %s for seeding", info.hash
             )
             return True
         return await self._client.delete_torrents(info.hash, delete_files=True)

@@ -37,12 +37,14 @@ export function reidentifyLibraryAlbum() {
 			expectedAlbumRevision: number;
 			expectedInputRevision: string;
 			oneOffLocalMetadata: boolean;
+			releaseMbid?: string | null;
 		}) =>
 			api.global.post<OperationResponse>(API.library.reidentifyAlbum(input.albumId), {
 				expected_album_revision: input.expectedAlbumRevision,
 				expected_input_revision: input.expectedInputRevision,
 				idempotency_key: createUuid(),
-				one_off_local_metadata: input.oneOffLocalMetadata
+				one_off_local_metadata: input.oneOffLocalMetadata,
+				release_mbid: input.releaseMbid ?? null
 			}),
 		onSuccess: async () => {
 			await invalidateLibraryCatalog();
@@ -59,15 +61,38 @@ export function selectReidentificationCandidate() {
 			expectedRevision: number;
 			candidateKey: string;
 			confirmation: boolean;
+			decisionMode?: 'exact_release' | 'custom_edition' | 'leave_unmanaged';
 		}) =>
 			api.global.post<OperationResponse>(API.library.operationCandidate(input.jobId), {
 				expected_row_revision: input.expectedRevision,
 				candidate_key: input.candidateKey,
-				confirmation: input.confirmation
+				confirmation: input.confirmation,
+				decision_mode: input.decisionMode ?? 'exact_release'
 			}),
 		onSuccess: invalidateLibraryCatalog,
-		onError: () =>
-			toastStore.show({ message: 'The candidates changed; review them again', type: 'error' })
+		onError: (error) =>
+			toastStore.show({
+				message: error instanceof Error ? error.message : 'Could not save this album decision',
+				type: 'error'
+			})
+	}));
+}
+
+export function reenableAlbumManagement() {
+	return createMutation(() => ({
+		mutationFn: (input: { albumId: string; expectedRevision: number }) =>
+			api.global.post<{ reenabled: boolean }>(API.library.reenableAlbumManagement(input.albumId), {
+				expected_exclusion_revision: input.expectedRevision
+			}),
+		onSuccess: async () => {
+			await invalidateLibraryCatalog();
+			toastStore.show({ message: 'Library Management re-enabled', type: 'success' });
+		},
+		onError: (error) =>
+			toastStore.show({
+				message: error instanceof Error ? error.message : 'Could not re-enable Library Management',
+				type: 'error'
+			})
 	}));
 }
 

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from infrastructure.queue.priority_queue import RequestPriority
 from services.requests_page_service import RequestsPageService
 from tests.helpers import make_builtin_dispatcher
 
@@ -53,6 +54,8 @@ def _make(
 @pytest.mark.asyncio
 async def test_approve_dispatches_download_and_links_task():
     service, history, download_service = _make()
+    dispatch = service._acquisition.request_album
+    service._acquisition.request_album = AsyncMock(wraps=dispatch)
 
     resp = await service.approve_request("mbid-1", "admin-id", "Admin")
 
@@ -61,6 +64,10 @@ async def test_approve_dispatches_download_and_links_task():
     assert (
         download_service.request_album.await_args.kwargs["release_mbid"]
         == "release-edition"
+    )
+    assert (
+        service._acquisition.request_album.await_args.kwargs["track_count_priority"]
+        is RequestPriority.USER_INITIATED
     )
     history.async_update_download_task_id.assert_awaited_once_with("mbid-1", "task-9")
 
@@ -106,6 +113,8 @@ async def test_retry_request_redispatches_native_and_links():
     service, history, download_service = _make(
         record_status="failed", download_task_id="old-task"
     )
+    dispatch = service._acquisition.request_album
+    service._acquisition.request_album = AsyncMock(wraps=dispatch)
 
     resp = await service.retry_request("mbid-1", user_id="u1", user_role="user")
 
@@ -114,6 +123,10 @@ async def test_retry_request_redispatches_native_and_links():
     assert (
         download_service.request_album.await_args.kwargs["release_mbid"]
         == "release-edition"
+    )
+    assert (
+        service._acquisition.request_album.await_args.kwargs["track_count_priority"]
+        is RequestPriority.USER_INITIATED
     )
     history.async_update_download_task_id.assert_awaited_once_with("mbid-1", "task-9")
 

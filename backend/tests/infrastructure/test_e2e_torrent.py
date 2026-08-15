@@ -44,6 +44,7 @@ from services.native.library_manager import LibraryManager
 from services.native.naming import NamingTemplateEngine
 from services.native.torrent_release_scorer import TorrentReleaseScorer
 from services.native.track_matcher import TrackMatcher
+from tests.helpers import make_test_import_publisher
 
 FIXTURE_FLAC = Path(__file__).resolve().parent.parent / "fixtures" / "library" / "flac_full_01.flac"
 _TEMPLATE = "{albumartist}/{album} ({year})/{disc:02d}{track:02d} {title}.{ext}"
@@ -245,6 +246,9 @@ def _build(tmp_path: Path, *, album_tracks, qbt: _FakeQbtServer,
         AudioTagger(), naming_engine=NamingTemplateEngine(), library_manager=manager,
         library_paths=[library], client=qbt_dl,
         slskd_downloads_path=tmp_path / "slskd", fingerprinter=None, verify_downloads=False,
+        library_root_ids=["root-a"],
+        publish_import_bundle=make_test_import_publisher(manager, {"root-a": library}),
+        policy_revision_getter=lambda: "test-policy",
     )
     orch = DownloadOrchestrator(
         client=_EmptySlskdIndexer(),  # placeholder; download-side not used for torrent

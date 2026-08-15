@@ -1,7 +1,8 @@
 import { browser } from '$app/environment';
 import { ApiError, api } from '$lib/api/client';
 import { API, AUTH_FREE_PATHS } from '$lib/constants';
-import { resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
+import { queryClient, resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
+import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte';
 import { DEFAULT_SOURCE, isMusicSource, musicSourceStore } from '$lib/stores/musicSource';
 import { scrobbleManager } from '$lib/stores/scrobble.svelte';
 import { authStore, LAST_USER_ID_KEY } from '$lib/stores/authStore.svelte';
@@ -72,6 +73,9 @@ export const load: LayoutLoad = async ({ url }) => {
 	if (setupRequired && !isAuthFree) {
 		throw redirect(302, '/setup');
 	}
+	if (!setupRequired && path.startsWith('/setup')) {
+		throw redirect(302, authStore.isAuthenticated ? '/' : '/login');
+	}
 
 	// initialized stays true after in-app login; reset persisted caches on account switches
 	if (browser && authStore.user) {
@@ -80,7 +84,7 @@ export const load: LayoutLoad = async ({ url }) => {
 			await resetQueryCacheForUserSwitch();
 			clearUserScopedLocalCaches();
 			musicSourceStore.reset();
-			await scrobbleManager.refreshSettings();
+			scrobbleManager.reset();
 		}
 		localStorage.setItem(LAST_USER_ID_KEY, authStore.user.id);
 	}
@@ -93,11 +97,13 @@ export const load: LayoutLoad = async ({ url }) => {
 	let primarySource = DEFAULT_SOURCE;
 	if (authStore.isAuthenticated) {
 		try {
-			const data = await api.global.get<{ primary_music_source: unknown }>(
-				API.me.scrobblePreferences(),
-				{ timeoutMs: BOOTSTRAP_TIMEOUT_MS }
+			const data = await queryClient.ensureQueryData(
+				getScrobblePreferencesQueryOptions(authStore.user?.id)
 			);
-			if (isMusicSource(data.primary_music_source)) primarySource = data.primary_music_source;
+			if (isMusicSource(data.primary_music_source)) {
+				primarySource = data.primary_music_source;
+				musicSourceStore.setSource(primarySource);
+			}
 		} catch {
 			primarySource = DEFAULT_SOURCE;
 		}

@@ -22,6 +22,8 @@ function held(overrides: Partial<HeldImport> = {}): HeldImport {
 	return {
 		id: 7,
 		release_group_mbid: 'rg-1',
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid: 'rec-3',
 		track_number: 3,
 		disc_number: 1,
@@ -33,12 +35,15 @@ function held(overrides: Partial<HeldImport> = {}): HeldImport {
 		file_format: 'flac',
 		duration_seconds: 388,
 		reason: 'fingerprint_mismatch',
+		reason_detail: null,
 		source: 'usenet',
 		source_task_id: 't-1',
 		created_at: 0,
 		evidence_title: "Nobody's Fault but Mine",
 		evidence_artist: 'Led Zeppelin',
 		evidence_score: 0.99,
+		management_retry_count: 0,
+		management_next_retry_at: null,
 		...overrides
 	};
 }

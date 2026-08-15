@@ -12,7 +12,7 @@ from services.native.musicbrainz_matcher import MusicBrainzMatcher, TargetAlbum
 
 def _repo(results: list[SearchResult]) -> AsyncMock:
     repo = AsyncMock()
-    repo.search_albums = AsyncMock(return_value=results)
+    repo.search_release_groups = AsyncMock(return_value=results)
     return repo
 
 
@@ -54,7 +54,7 @@ def _rec(
 
 def _repo2(albums: list[SearchResult], recordings: list[RecordingMatch]) -> AsyncMock:
     repo = AsyncMock()
-    repo.search_albums = AsyncMock(return_value=albums)
+    repo.search_release_groups = AsyncMock(return_value=albums)
     repo.search_recordings = AsyncMock(return_value=recordings)
     return repo
 
@@ -213,7 +213,13 @@ async def test_matcher_only_uses_repo_for_mb_access():
     repo = _repo([_result("OK Computer", "rg-ok")])
     matcher = MusicBrainzMatcher(repo)
     await matcher.text_match(TargetAlbum(artist="Radiohead", album="OK Computer"))
-    repo.search_albums.assert_awaited_once()  # no raw HTTP - only the repo
+    repo.search_release_groups.assert_awaited_once_with(
+        "Radiohead",
+        "OK Computer",
+        limit=10,
+        include_all_types=True,
+        priority=RequestPriority.BACKGROUND_SYNC,
+    )
 
 
 # -- Tier 3: recording MBID -> release-group MBID (AUD-13: via the repo) --
@@ -273,7 +279,7 @@ async def test_album_search_includes_all_secondary_types():
     )
     assert res.release_group_mbid == "rg-poppy"
     assert res.matched is True
-    assert repo.search_albums.await_args.kwargs.get("include_all_types") is True
+    assert repo.search_release_groups.await_args.kwargs.get("include_all_types") is True
 
 
 @pytest.mark.asyncio
@@ -453,7 +459,7 @@ async def test_album_text_match_issues_background_priority():
         TargetAlbum(artist="Radiohead", album="OK Computer")
     )
     assert (
-        repo.search_albums.await_args.kwargs["priority"]
+        repo.search_release_groups.await_args.kwargs["priority"]
         == RequestPriority.BACKGROUND_SYNC
     )
 

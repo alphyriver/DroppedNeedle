@@ -8,11 +8,12 @@ unlink and the soft-delete are genuinely exercised, not mocked.
 import os
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from core.exceptions import ExternalServiceError
+from infrastructure.cache.cache_keys import ALBUM_TRACKS_INFO_PREFIX
 from infrastructure.persistence.library_db import LibraryDB
 from models.audio import AudioInfo, AudioTag
 from services.library_service import LibraryService
@@ -172,9 +173,9 @@ async def test_remove_album_partial_unlink_stays_visible_and_retryable(
 
     assert not removed.exists()
     assert blocked.exists()
-    assert [row["file_path"] for row in await db.get_library_files_for_album("rg-1")] == [
-        str(blocked)
-    ]
+    assert [
+        row["file_path"] for row in await db.get_library_files_for_album("rg-1")
+    ] == [str(blocked)]
     assert await db.get_album_by_mbid("rg-1") is not None
 
     monkeypatch.setattr(os, "remove", real_remove)
@@ -247,8 +248,8 @@ async def test_remove_file_soft_deletes_row_and_unlinks(db, tmp_path):
     result = await service.remove_file(orphan_id)
 
     assert result.status == "ok"
-    assert not orphan.exists()                       # audio unlinked
-    assert keep.exists()                             # sibling untouched
+    assert not orphan.exists()  # audio unlinked
+    assert keep.exists()  # sibling untouched
     remaining = await db.get_library_files_for_album("rg-1")
     assert [r["file_path"] for r in remaining] == [str(keep)]
     # soft-deleted, not hard-deleted (recoverable via re-import)
@@ -265,7 +266,12 @@ async def test_remove_file_last_file_drops_ghost_album_row(db, tmp_path):
     only = tmp_path / "only.flac"
     await _seed(manager, only, rg="rg-solo", artist_mbid="am-2")
     await db.upsert_album(
-        {"mbid": "rg-solo", "artist_mbid": "am-2", "artist_name": "Artist", "title": "Album"}
+        {
+            "mbid": "rg-solo",
+            "artist_mbid": "am-2",
+            "artist_name": "Artist",
+            "title": "Album",
+        }
     )
     rows = await db.get_library_files_for_album("rg-solo")
     service = _service(db)
@@ -283,3 +289,24 @@ async def test_remove_file_unknown_id_raises_not_found(db):
     service = _service(db)
     with pytest.raises(ResourceNotFoundError):
         await service.remove_file("no-such-file")
+
+
+@pytest.mark.asyncio
+async def test_removal_clears_native_track_cache(db):
+    memory_cache = MagicMock()
+    memory_cache.delete = AsyncMock()
+    memory_cache.clear_prefix = AsyncMock()
+    disk_cache = MagicMock()
+    disk_cache.delete_album = AsyncMock()
+    service = LibraryService(
+        library_repo=LibraryManager(db),
+        library_db=db,
+        cover_repo=None,
+        preferences_service=MagicMock(),
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+    )
+
+    await service._invalidate_caches_after_removal("release-group-1", None)
+
+    memory_cache.delete.assert_any_await(f"{ALBUM_TRACKS_INFO_PREFIX}release-group-1")

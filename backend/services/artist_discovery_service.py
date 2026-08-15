@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from api.v1.schemas.discovery import (
@@ -24,6 +25,7 @@ from services.preferences_service import PreferencesService
 
 if TYPE_CHECKING:
     from infrastructure.persistence.auth_store import AuthStore
+    from services.native.background_workload_gate import BackgroundWorkloadGate
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,7 @@ class ArtistDiscoveryService:
         preferences_service: Optional[PreferencesService] = None,
         client_factory: Optional[PerUserClientFactory] = None,
         auth_store: Optional["AuthStore"] = None,
+        workload_gate: "BackgroundWorkloadGate | None" = None,
     ):
         self._lb_repo = listenbrainz_repo
         self._mb_repo = musicbrainz_repo
@@ -81,6 +84,7 @@ class ArtistDiscoveryService:
         self._preferences_service = preferences_service
         self._client_factory = client_factory
         self._auth_store = auth_store
+        self._workload_gate = workload_gate
 
     async def _resolve_listenbrainz(
         self, user_id: str | None
@@ -115,20 +119,20 @@ class ArtistDiscoveryService:
         """When the ListenBrainz source yields nothing (popularity disabled/auth-gated
         or breaker tripped upstream), try the same section from Last.fm. Returns the
         response (possibly empty) or None when Last.fm isn't available/failed."""
-        lastfm_repo = await self._resolve_lastfm(user_id)
-        if lastfm_repo is None:
-            return None
         try:
             if kind == "similar":
-                return await self._get_similar_artists_lastfm(
-                    lastfm_repo, artist_mbid, count
+                result = await self.get_similar_artists(
+                    artist_mbid, count, source="lastfm", user_id=user_id
                 )
-            if kind == "top_songs":
-                return await self._get_top_songs_lastfm(lastfm_repo, artist_mbid, count)
-            if kind == "top_albums":
-                return await self._get_top_albums_lastfm(
-                    lastfm_repo, artist_mbid, count
+            elif kind == "top_songs":
+                result = await self.get_top_songs(
+                    artist_mbid, count, source="lastfm", user_id=user_id
                 )
+            else:
+                result = await self.get_top_albums(
+                    artist_mbid, count, source="lastfm", user_id=user_id
+                )
+            return result if result.configured else None
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Last.fm %s fallback failed for %s: %s", kind, artist_mbid[:8], e
@@ -192,7 +196,7 @@ class ArtistDiscoveryService:
             "similar", artist_mbid, count, effective_source
         )
         cached = await self._cache.get(cache_key)
-        if cached:
+        if cached is not None:
             return cached
 
         lb_unavailable = False
@@ -275,7 +279,7 @@ class ArtistDiscoveryService:
             "top_songs", artist_mbid, count, effective_source
         )
         cached = await self._cache.get(cache_key)
-        if cached:
+        if cached is not None:
             return cached
 
         lb_unavailable = False
@@ -374,7 +378,7 @@ class ArtistDiscoveryService:
             "top_albums", artist_mbid, count, effective_source
         )
         cached = await self._cache.get(cache_key)
-        if cached:
+        if cached is not None:
             return cached
 
         lb_unavailable = False
@@ -641,6 +645,7 @@ class ArtistDiscoveryService:
         mbid_to_name: dict[str, str] | None = None,
         generation: int = 0,
     ) -> int:
+        started = monotonic()
         # Precache warms a GLOBAL cache (keyed by mbid+source, not per-user), so it
         # only needs one valid set of credentials. Use the first admin's per-user
         # connection - the same identity the startup backfill seeds.
@@ -676,6 +681,8 @@ class ArtistDiscoveryService:
             try:
                 async with sem:
                     for source in sources:
+                        if self._workload_gate is not None:
+                            await self._workload_gate.wait_until_available()
                         similar_key = self._build_cache_key(
                             "similar", mbid, DEFAULT_SIMILAR_COUNT, source
                         )
@@ -790,6 +797,12 @@ class ArtistDiscoveryService:
             if batch_tasks:
                 await asyncio.gather(*batch_tasks, return_exceptions=True)
 
+        logger.info(
+            "Artist discovery precache complete: artists=%d source_fetches=%d duration=%.2fs",
+            cached_count,
+            source_fetches,
+            monotonic() - started,
+        )
         return cached_count
 
     async def _resolve_release_groups(self, release_ids: list[str]) -> dict[str, str]:

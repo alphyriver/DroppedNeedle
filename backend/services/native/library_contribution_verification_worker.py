@@ -169,6 +169,9 @@ class LibraryContributionVerificationWorker:
                 contribution.id, now=timestamp
             )
             await self._contributions.invalidate_catalog_cache()
+            await self._contributions.after_identified(
+                contribution.local_album_id, policy_revision
+            )
         return result
 
     async def _retry_or_review(

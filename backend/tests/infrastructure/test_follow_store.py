@@ -233,6 +233,19 @@ async def test_list_pending_approvals_ordered_with_user_name(store: FollowStore)
 
 
 @pytest.mark.asyncio
+async def test_pending_approval_unit_count_uses_one_unit_per_batch(store: FollowStore):
+    await store.upsert_approval("user-a", "MBID-1", "Alpha", "pending")
+    await store.create_import_approval_batch(
+        "user-b", [("MBID-2", "Beta"), ("MBID-3", "Gamma")], "batch-1"
+    )
+    await store.create_import_approval_batch(
+        "user-a", [("MBID-4", "Delta")], "batch-2"
+    )
+
+    assert await store.count_pending_approval_units() == 3
+
+
+@pytest.mark.asyncio
 async def test_distinct_followed_artists_dedups(store: FollowStore):
     await store.follow_artist("user-a", "MBID-A", "Radiohead")
     await store.follow_artist("user-b", "mbid-a", "Radiohead")  # same artist, diff case

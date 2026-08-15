@@ -130,9 +130,10 @@ def env(tmp_path) -> _Env:
     album_service = AsyncMock()
     album_service.get_album_tracks_info.side_effect = ResourceNotFoundError("MB down")
     mb = AsyncMock()
-    mb.get_release_group_by_id.return_value = {
-        "first-release-date": _FIXTURE_RELEASE_DATE
-    }
+    # Evaluated once at import (see _FIXTURE_RELEASE_DATE) so the date cannot roll
+    # over between fixture construction and the assertions during a slow run.
+    first_release_date = _FIXTURE_RELEASE_DATE
+    mb.get_release_group_by_id.return_value = {"first-release-date": first_release_date}
     sse = AsyncMock()
     prefs = Mock()
     prefs.get_wanted_settings.return_value = WantedWatcherSettings()
@@ -160,6 +161,7 @@ def env(tmp_path) -> _Env:
         sse=sse,
         prefs=prefs,
         settings=prefs.get_wanted_settings.return_value,
+        first_release_date=first_release_date,
     )
 
 
@@ -257,7 +259,7 @@ async def test_availability_failures_enrol_as_missing(env, message):
     assert watch is not None
     assert watch.kind == "missing"
     assert watch.user_id == "user-a"
-    assert watch.first_release_date == _FIXTURE_RELEASE_DATE
+    assert watch.first_release_date == env.first_release_date
     # first check lands one age-curve interval out (13-day-old release -> 2 d ± 20 %)
     delta = watch.next_check_at - time.time()
     assert 0.8 * 2 * _DAY * 0.95 <= delta <= 1.2 * 2 * _DAY
@@ -750,7 +752,7 @@ async def test_dismiss_review_cancels_watches_and_records_seen(env):
     assert watch.state == "watching"
     assert watch.kind == "missing"
     assert watch.user_id == "user-a"
-    assert watch.first_release_date == _FIXTURE_RELEASE_DATE
+    assert watch.first_release_date == env.first_release_date
     # every rejected candidate is seen: the watcher never badges those copies again
     assert len(await env.store.seen_identities("rg-1")) == 2
 

@@ -17,10 +17,22 @@ const state = vi.hoisted(() => ({
 	initialized: false,
 	setupRequired: false,
 	clear: vi.fn(),
-	markInitialized: vi.fn()
+	markInitialized: vi.fn(),
+	ensureQueryData: vi.fn().mockResolvedValue({ primary_music_source: 'invalid' }),
+	resetQueryCache: vi.fn().mockResolvedValue(undefined),
+	musicSourceReset: vi.fn(),
+	musicSourceSet: vi.fn(),
+	scrobbleReset: vi.fn()
 }));
 
-vi.mock('$app/environment', () => ({ browser: false }));
+const storage = new Map<string, string>();
+vi.stubGlobal('localStorage', {
+	getItem: (key: string) => storage.get(key) ?? null,
+	setItem: (key: string, value: string) => storage.set(key, value),
+	removeItem: (key: string) => storage.delete(key)
+});
+
+vi.mock('$app/environment', () => ({ browser: true }));
 vi.mock('$lib/api/client', () => {
 	class ApiError extends Error {
 		constructor(
@@ -39,14 +51,22 @@ vi.mock('$lib/constants', () => ({
 		me: { scrobblePreferences: () => '/scrobble-preferences' }
 	}
 }));
-vi.mock('$lib/queries/QueryClient', () => ({ resetQueryCacheForUserSwitch: vi.fn() }));
+vi.mock('$lib/queries/QueryClient', () => ({
+	queryClient: { ensureQueryData: state.ensureQueryData },
+	resetQueryCacheForUserSwitch: state.resetQueryCache
+}));
+vi.mock('$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte', () => ({
+	getScrobblePreferencesQueryOptions: (userId: string | undefined) => ({
+		queryKey: ['me', 'scrobble-preferences', userId]
+	})
+}));
 vi.mock('$lib/stores/musicSource', () => ({
 	DEFAULT_SOURCE: 'listenbrainz',
-	isMusicSource: vi.fn(() => false),
-	musicSourceStore: { reset: vi.fn() }
+	isMusicSource: (value: unknown) => value === 'listenbrainz' || value === 'lastfm',
+	musicSourceStore: { reset: state.musicSourceReset, setSource: state.musicSourceSet }
 }));
 vi.mock('$lib/stores/scrobble.svelte', () => ({
-	scrobbleManager: { reset: vi.fn(), refreshSettings: vi.fn() }
+	scrobbleManager: { reset: state.scrobbleReset }
 }));
 vi.mock('$lib/utils/userScopedCaches', () => ({ clearUserScopedLocalCaches: vi.fn() }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
@@ -104,6 +124,13 @@ describe('+layout load session bootstrap', () => {
 		state.apiGet.mockReset();
 		state.clear.mockReset();
 		state.markInitialized.mockReset();
+		state.ensureQueryData.mockReset();
+		state.ensureQueryData.mockResolvedValue({ primary_music_source: 'invalid' });
+		state.resetQueryCache.mockClear();
+		state.musicSourceReset.mockClear();
+		state.musicSourceSet.mockClear();
+		state.scrobbleReset.mockClear();
+		storage.clear();
 		state.user = null;
 		state.initialized = false;
 		state.setupRequired = false;
@@ -140,27 +167,54 @@ describe('+layout load session bootstrap', () => {
 	it('bounds the optional preferences request without discarding the session', async () => {
 		state.user = user;
 		state.initialized = true;
-		state.apiGet.mockRejectedValueOnce(new DOMException('Timed out', 'TimeoutError'));
+		state.ensureQueryData.mockRejectedValueOnce(new DOMException('Timed out', 'TimeoutError'));
 
 		await expect(loadPage()).resolves.toEqual({ primarySource: 'listenbrainz', user });
-		expect(state.apiGet).toHaveBeenNthCalledWith(1, '/scrobble-preferences', {
-			timeoutMs: 10_000
+		expect(state.ensureQueryData).toHaveBeenNthCalledWith(1, {
+			queryKey: ['me', 'scrobble-preferences', 'user-1']
 		});
 		expect(state.clear).not.toHaveBeenCalled();
 		expect(state.user).toBe(user);
 	});
 
+	it('hydrates the primary source through the user-scoped session query', async () => {
+		state.user = user;
+		state.initialized = true;
+		state.ensureQueryData.mockResolvedValueOnce({ primary_music_source: 'lastfm' });
+
+		await expect(loadPage('/library')).resolves.toEqual({ primarySource: 'lastfm', user });
+		expect(state.ensureQueryData).toHaveBeenCalledWith({
+			queryKey: ['me', 'scrobble-preferences', 'user-1']
+		});
+		expect(state.apiGet).not.toHaveBeenCalled();
+	});
+
+	it('clears the old account before hydrating the new user source', async () => {
+		storage.set('test:last-user', 'user-old');
+		state.user = user;
+		state.initialized = true;
+		state.ensureQueryData.mockResolvedValueOnce({ primary_music_source: 'lastfm' });
+
+		await expect(loadPage('/')).resolves.toEqual({ primarySource: 'lastfm', user });
+		expect(state.resetQueryCache).toHaveBeenCalledOnce();
+		expect(state.musicSourceReset).toHaveBeenCalledOnce();
+		expect(state.scrobbleReset).toHaveBeenCalledOnce();
+		expect(state.musicSourceSet).toHaveBeenCalledWith('lastfm');
+		expect(storage.get('test:last-user')).toBe('user-1');
+	});
+
 	it('runs setup and session hydration only once across in-app navigation', async () => {
-		state.apiGet
-			.mockResolvedValueOnce({ required: false })
-			.mockResolvedValueOnce(user)
-			.mockResolvedValue({ primary_music_source: 'invalid' });
+		state.apiGet.mockResolvedValueOnce({ required: false }).mockResolvedValueOnce(user);
 
 		await expect(loadPage()).resolves.toEqual({ primarySource: 'listenbrainz', user });
 		await expect(loadPage()).resolves.toEqual({ primarySource: 'listenbrainz', user });
 
 		expect(state.apiGet.mock.calls.filter(([url]) => url === '/setup-status')).toHaveLength(1);
 		expect(state.apiGet.mock.calls.filter(([url]) => url === '/me')).toHaveLength(1);
+		expect(state.apiGet.mock.calls.filter(([url]) => url === '/scrobble-preferences')).toHaveLength(
+			0
+		);
+		expect(state.ensureQueryData).toHaveBeenCalledTimes(2);
 	});
 
 	it('retains setup state across navigation without repeating bootstrap requests', async () => {
@@ -176,5 +230,22 @@ describe('+layout load session bootstrap', () => {
 
 		expect(state.apiGet.mock.calls.filter(([url]) => url === '/setup-status')).toHaveLength(1);
 		expect(state.apiGet.mock.calls.filter(([url]) => url === '/me')).toHaveLength(1);
+	});
+
+	it('redirects a configured setup route to login when signed out', async () => {
+		state.initialized = true;
+
+		await expect(loadPage('/setup')).rejects.toMatchObject({ status: 302, location: '/login' });
+		expect(state.apiGet).not.toHaveBeenCalled();
+		expect(state.ensureQueryData).not.toHaveBeenCalled();
+	});
+
+	it('redirects a configured setup route home when already authenticated', async () => {
+		state.initialized = true;
+		state.user = user;
+
+		await expect(loadPage('/setup')).rejects.toMatchObject({ status: 302, location: '/' });
+		expect(state.apiGet).not.toHaveBeenCalled();
+		expect(state.ensureQueryData).not.toHaveBeenCalled();
 	});
 });

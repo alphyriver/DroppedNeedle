@@ -24,6 +24,7 @@ class ReidentificationService:
         expected_album_revision: int | None = None,
         expected_input_revision: str | None = None,
         one_off_local_metadata: bool = False,
+        release_mbid: str | None = None,
         idempotency_key: str | None = None,
         review_id: str | None = None,
         expected_review_revision: int | None = None,
@@ -33,7 +34,12 @@ class ReidentificationService:
         context = await self._store.get_album_identification_context(album_id)
         if context is None:
             raise ResourceNotFoundError(f"Album not found: {album_id}")
-        revisions = album_input_revisions(context["tracks"])
+        tracks = [
+            track for track in context["tracks"] if track["availability"] == "indexed"
+        ]
+        if not tracks:
+            raise ResourceNotFoundError(f"Album not found: {album_id}")
+        revisions = album_input_revisions(tracks)
         input_revision = ":".join(revisions)
         if (
             expected_input_revision is not None
@@ -54,8 +60,21 @@ class ReidentificationService:
             raise StaleRevisionError(
                 "The album changed before re-identification started."
             )
-        idempotency_key = idempotency_key or (
+        normalized_release_mbid: str | None = None
+        if release_mbid is not None:
+            try:
+                normalized_release_mbid = str(uuid.UUID(release_mbid))
+            except (ValueError, AttributeError) as error:
+                from core.exceptions import ValidationError
+
+                raise ValidationError(
+                    "The exact MusicBrainz release ID is invalid."
+                ) from error
+        base_idempotency_key = idempotency_key or (
             f"explicit_reidentification:{album_id}:{input_revision}"
+        )
+        idempotency_key = (
+            f"{base_idempotency_key}:release:{normalized_release_mbid or 'automatic'}"
         )
         existing = await self._store.get_operation_by_idempotency_key(idempotency_key)
         if existing is not None:
@@ -74,6 +93,7 @@ class ReidentificationService:
             expected_album_revision=album_revision,
             expected_input_revision=input_revision,
             one_off_local_metadata=one_off_local_metadata,
+            requested_release_mbid=normalized_release_mbid,
             review_id=review_id,
             expected_review_revision=expected_review_revision,
         )

@@ -68,11 +68,22 @@ describe('fetchLyrics', () => {
 		expect(mockGet).not.toHaveBeenCalled();
 	});
 
-	it('returns null for local source type', async () => {
+	it('normalizes local lyrics response', async () => {
+		mockGet.mockResolvedValueOnce({
+			text: 'Local lyrics',
+			is_synced: false,
+			lines: [{ text: 'Local lyrics', start_seconds: null }]
+		});
+
 		const np = makeNowPlaying({ sourceType: 'local' });
 		const result = await fetchLyrics(np, signal);
-		expect(result).toBeNull();
-		expect(mockGet).not.toHaveBeenCalled();
+
+		expect(result).toEqual({
+			text: 'Local lyrics',
+			is_synced: false,
+			lines: [{ text: 'Local lyrics', start_seconds: null }]
+		});
+		expect(mockGet).toHaveBeenCalledWith('/api/v1/local/tracks/track-1/lyrics', { signal });
 	});
 
 	it('normalizes Navidrome response correctly', async () => {

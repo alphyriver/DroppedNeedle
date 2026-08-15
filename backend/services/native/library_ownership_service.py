@@ -88,7 +88,7 @@ class LibraryOwnershipService:
         if identifier is None:
             return None
         rows, _ = await self._store.list_target_artists(
-            limit=1, offset=0, artist_ids=[identifier]
+            limit=1, offset=0, artist_ids=[identifier], scope="all"
         )
         if not rows:
             return identifier
@@ -106,6 +106,9 @@ class LibraryOwnershipService:
 
     async def provider_artist_owned(self, identifier: str) -> bool:
         return await self._store.target_has_provider_artist(identifier)
+
+    async def provider_artist_relationship(self, identifier: str) -> tuple[bool, bool]:
+        return await self._store.target_provider_artist_relationship(identifier)
 
     async def project_albums(
         self, candidates: list[AlbumOwnershipCandidate]

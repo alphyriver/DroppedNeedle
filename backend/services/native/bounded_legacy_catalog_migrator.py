@@ -46,6 +46,7 @@ class BoundedMigrationOutcome:
     blocker_count: int
     invariants: dict[str, int] | None = None
     blocker_reason_counts: dict[str, int] = field(default_factory=dict)
+    blocker_details: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class BoundedLegacyCatalogMigrator:
             embedded_art_read_limit=0,
         )
         self._blockers: list[str] = []
+        self._blocker_details: list[dict[str, str]] = []
         self._blocker_count = 0
         self._blocker_reason_counts: Counter[str] = Counter()
         self._counts: dict[tuple[str, str | None], MigrationReferenceCount] = {
@@ -172,6 +174,7 @@ class BoundedLegacyCatalogMigrator:
                 ),
                 blocker_count=self._blocker_count,
                 blocker_reason_counts=dict(self._blocker_reason_counts),
+                blocker_details=list(self._blocker_details),
             )
 
         await self._migrate_roots(migration_id, source_revision, migrated_at)
@@ -218,6 +221,7 @@ class BoundedLegacyCatalogMigrator:
                 ),
                 blocker_count=self._blocker_count,
                 blocker_reason_counts=dict(self._blocker_reason_counts),
+                blocker_details=list(self._blocker_details),
             )
 
         self._progress.message("Validating migrated catalog.")
@@ -860,8 +864,18 @@ class BoundedLegacyCatalogMigrator:
                 )
                 provenance: list[MigrationProvenance] = []
                 tombstones: list[MigrationTombstone] = []
+                unlinked_history: list[dict[str, Any]] = []
                 for row, target in zip(rows, targets, strict=True):
                     source_key, user_id = self._reference_key(kind, row)
+                    if target is None and kind == "history":
+                        unlinked_history.append(row)
+                        self._increment(
+                            kind,
+                            mapped=False,
+                            user_id=user_id,
+                            retained=True,
+                        )
+                        continue
                     if target is None and kind in {"playlist_track", "jellyfin_id_map"}:
                         tombstone = self._tombstone(kind, source_key, row, migrated_at)
                         tombstones.append(tombstone)
@@ -891,6 +905,7 @@ class BoundedLegacyCatalogMigrator:
                         self._add_blocker(
                             f"{kind} reference {source_key} cannot be resolved.",
                             reason=f"{kind}_unresolved",
+                            detail=self._blocker_locator(kind, row),
                         )
                         continue
                     provenance.append(
@@ -906,6 +921,11 @@ class BoundedLegacyCatalogMigrator:
                     provenance,
                     tombstones=tombstones,
                     migration_id=migration_id,
+                    source_revision=source_revision,
+                )
+                await self._store.materialize_unlinked_history_batch(
+                    unlinked_history,
+                    migration_run_id=migration_id,
                     source_revision=source_revision,
                 )
                 processed += len(batch)
@@ -1190,11 +1210,34 @@ class BoundedLegacyCatalogMigrator:
         for blocker in blockers:
             self._add_blocker(blocker, reason="migration_plan")
 
-    def _add_blocker(self, blocker: str, *, reason: str) -> None:
+    @staticmethod
+    def _blocker_locator(kind: str, row: dict[str, Any]) -> dict[str, str] | None:
+        # no user IDs or paths, so the failure evidence stays shareable
+        if kind == "favorite":
+            item_kind = str(row.get("item_kind") or "")
+            item_id = str(row.get("item_id") or "")
+            return {"kind": kind, "item_kind": item_kind, "item_id": item_id}
+        if kind == "compat_bookmark" or kind == "compat_play_queue_item":
+            return {"kind": kind, "file_id": str(row.get("file_id") or "")}
+        field = {
+            "history": "id",
+            "playlist_track": "id",
+            "album_release_pin": "release_group_mbid",
+            "jellyfin_id_map": "jf_id",
+        }.get(kind)
+        if field is None:
+            return None
+        return {"kind": kind, field: str(row.get(field) or "")}
+
+    def _add_blocker(
+        self, blocker: str, *, reason: str, detail: dict[str, str] | None = None
+    ) -> None:
         self._blocker_count += 1
         self._blocker_reason_counts[reason] += 1
         if len(self._blockers) < MAX_REPORTED_BLOCKERS:
             self._blockers.append(blocker)
+        if detail is not None and len(self._blocker_details) < MAX_REPORTED_BLOCKERS:
+            self._blocker_details.append(detail)
 
     @staticmethod
     def _without_rowid(row: dict[str, Any]) -> dict[str, Any]:

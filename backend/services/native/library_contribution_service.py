@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from difflib import SequenceMatcher
 import hashlib
 import logging
@@ -85,11 +86,13 @@ class LibraryContributionService:
         discogs_repository: DiscogsRepositoryProtocol | None = None,
         musicbrainz_repository: MusicBrainzRepositoryProtocol | None = None,
         cache: CacheInterface | None = None,
+        on_identified: Callable[[str, str], Awaitable[object]] | None = None,
     ) -> None:
         self._store = store
         self._discogs = discogs_repository
         self._musicbrainz = musicbrainz_repository
         self._cache = cache
+        self._on_identified = on_identified
         self._evidence = AlbumEvidenceEngine()
 
     async def create(self, album_id: str, actor_user_id: str) -> ContributionRecord:
@@ -514,6 +517,7 @@ class LibraryContributionService:
         if await self._purge_provider_data_row(row, now=now):
             row = await self._store.get_library_contribution(contribution_id) or row
         await self._invalidate_catalog_cache()
+        await self.after_identified(current.local_album_id, policy_revision)
         return await self._record(row)
 
     async def create_musicbrainz_seed(
@@ -690,6 +694,12 @@ class LibraryContributionService:
 
     async def invalidate_catalog_cache(self) -> None:
         await self._invalidate_catalog_cache()
+
+    async def after_identified(
+        self, local_album_id: str, input_policy_revision: str
+    ) -> None:
+        if self._on_identified is not None:
+            await self._on_identified(local_album_id, input_policy_revision)
 
     @staticmethod
     def parse_musicbrainz_release_id(value: str) -> str:
@@ -1218,6 +1228,7 @@ class LibraryContributionService:
                     absolute_position=index + 1,
                     duration_seconds=track.duration_seconds,
                     recording_mbid=track.recording_mbid,
+                    release_track_mbid=track.release_track_mbid,
                 )
                 for index, track in enumerate(verified.tracks)
             ],

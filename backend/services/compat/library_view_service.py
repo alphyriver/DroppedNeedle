@@ -62,7 +62,9 @@ class LibraryViewService:
         sort_order: str = "asc",
         q: str | None = None,
         user: "UserRecord | None" = None,
+        scope: str = "album",
     ) -> tuple[list[ViewArtist], int]:
+        del scope
         # synthetic (Q14) ids stay: compat browse-by-id keys off them for MBID-less artists
         items, total = await self._lm.get_artists(
             limit=limit,

@@ -19,6 +19,7 @@ const {
 	mockAlbumYouTubeCache,
 	mockAlbumSourceMatchCache,
 	mockDownloadsData,
+	mockHeldData,
 	mockLibraryStatusData,
 	mockLocalCopiesData
 } = vi.hoisted(() => ({
@@ -32,6 +33,7 @@ const {
 	mockAlbumYouTubeCache: { get: vi.fn(), set: vi.fn() },
 	mockAlbumSourceMatchCache: { get: vi.fn(), set: vi.fn() },
 	mockDownloadsData: { value: undefined as unknown },
+	mockHeldData: { value: { items: [] } as unknown },
 	mockLibraryStatusData: { value: undefined as unknown },
 	mockLocalCopiesData: { value: { items: [] } as unknown }
 }));
@@ -115,6 +117,11 @@ vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
 			return mockLocalCopiesData.value;
 		},
 		isLoading: false
+	}),
+	getLibraryAlbumDetailQuery: () => ({
+		data: undefined,
+		isLoading: false,
+		isError: false
 	})
 }));
 
@@ -135,6 +142,7 @@ vi.mock('$lib/queries/downloads/DownloadQueries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	tryNextSource: () => ({ mutate: vi.fn(), isPending: false }),
 	cancelDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	retryDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	stopAutoRetry: () => ({ mutate: vi.fn(), isPending: false }),
@@ -167,14 +175,14 @@ vi.mock('$lib/queries/downloads/UpgradeQueries.svelte', () => ({
 vi.mock('$lib/queries/downloads/HeldQueries.svelte', () => ({
 	getHeldImportsQuery: () => ({
 		get data() {
-			return { items: [] };
+			return mockHeldData.value;
 		}
 	})
 }));
 
 vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
 	createDownloadStream: () => ({
-		state: { progress: null, status: null, done: false },
+		state: { progress: null, status: null, source: null, done: false },
 		start: vi.fn(),
 		stop: vi.fn()
 	})
@@ -273,7 +281,10 @@ function makeTask(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		id: 'task-1',
 		user_id: 'user-1',
 		download_type: 'album',
+		source: 'soulseek',
 		release_group_mbid: albumId,
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid: null,
 		artist_name: 'Grimes',
 		album_title: 'Visions',
@@ -299,6 +310,19 @@ function makeTask(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		next_retry_at: null,
 		retry_max: 6,
 		retry_ladder_minutes: [15, 30, 60, 120, 240, 480],
+		acquisition_cleanup_state: 'not_tracked',
+		quality_format: null,
+		quality_bit_depth: null,
+		quality_sample_rate: null,
+		advertised_queue_depth: null,
+		queue_position_start: null,
+		queue_position_end: null,
+		remote_queued: false,
+		preferred_quality_fallback_at: null,
+		attempt_number: 0,
+		attempt_total: 0,
+		has_next_source: false,
+		held_for_review: false,
 		...overrides
 	};
 }
@@ -316,6 +340,7 @@ describe('album detail page track rendering', () => {
 		mockPageFetch.mockReset();
 		mockHydrateDetailCacheEntry.mockReset();
 		mockDownloadsData.value = undefined;
+		mockHeldData.value = { items: [] };
 		mockLibraryStatusData.value = undefined;
 		mockLocalCopiesData.value = { items: [] };
 		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: HydrateOptions) => {
@@ -550,7 +575,7 @@ describe('album detail page track rendering', () => {
 		await expect.element(page.getByText('In Library', { exact: true })).not.toBeInTheDocument();
 	});
 
-	it('links every local copy when a provider release is ambiguous', async () => {
+	it('keeps every local copy visible on the shared provider route', async () => {
 		const copy = (id: string, title: string) => ({
 			id,
 			title,
@@ -587,10 +612,10 @@ describe('album detail page track rendering', () => {
 			.toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Open Visions, original files' }))
-			.toHaveAttribute('href', '/album/local-copy-1');
+			.toHaveAttribute('href', `/album/${albumId}`);
 		await expect
 			.element(page.getByRole('link', { name: 'Open Visions, remaster' }))
-			.toHaveAttribute('href', '/album/local-copy-2');
+			.toHaveAttribute('href', `/album/${albumId}`);
 	});
 
 	it('replaces a release alias URL with the canonical release-group URL', async () => {
@@ -696,9 +721,107 @@ describe('album detail page track rendering', () => {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
-		await expect.element(page.getByText('Downloading')).toBeVisible();
+		await expect.element(page.getByText('Downloading', { exact: true })).toBeVisible();
 		// the old broken poller badge is gone for good
 		expect(page.getByText('Checking for sources…').elements()).toHaveLength(0);
+	});
+
+	it('uses the shared Soulseek queue presentation on the album strip', async () => {
+		mockDownloadsData.value = {
+			items: [
+				makeTask({
+					downloaded_bytes: 0,
+					progress_percent: 0,
+					files_completed: 0,
+					quality_format: 'flac',
+					quality_bit_depth: 24,
+					quality_sample_rate: 48_000,
+					advertised_queue_depth: 2710,
+					remote_queued: true,
+					attempt_number: 1,
+					attempt_total: 3,
+					has_next_source: true
+				})
+			],
+			page: 1,
+			page_size: 100
+		};
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await expect.element(page.getByText('24-bit / 48 kHz FLAC')).toBeVisible();
+		await expect.element(page.getByText('Waiting for Soulseek · queue 2,710')).toBeVisible();
+		await expect.element(page.getByText('Trying source 1 of 3')).toBeVisible();
+	});
+
+	it('shows a secured organizer hold instead of historical Soulseek failure telemetry', async () => {
+		mockDownloadsData.value = {
+			items: [
+				makeTask({
+					status: 'failed',
+					held_for_review: true,
+					quality_format: 'flac',
+					quality_bit_depth: 16,
+					quality_sample_rate: 44_100,
+					attempt_number: 3,
+					attempt_total: 3,
+					error_message: 'No working source found on Soulseek'
+				})
+			],
+			page: 1,
+			page_size: 100
+		};
+		mockHeldData.value = {
+			items: [1, 2].map((track) => ({
+				id: track,
+				release_group_mbid: albumId,
+				release_mbid: 'release-1',
+				release_track_mbid: `release-track-${track}`,
+				recording_mbid: `recording-${track}`,
+				track_number: track,
+				disc_number: 1,
+				track_title: `Track ${track}`,
+				artist_name: 'Grimes',
+				album_title: 'Visions',
+				year: 2012,
+				original_filename: `${track}.flac`,
+				file_format: 'flac',
+				duration_seconds: 200,
+				reason: 'management:BUNDLE_BLOCKED',
+				reason_detail:
+					'The durable publication evidence no longer agrees with its journal. Nothing was overwritten.',
+				source: 'soulseek',
+				source_task_id: 'task-1',
+				created_at: track,
+				evidence_title: null,
+				evidence_artist: null,
+				evidence_score: null,
+				management_retry_count: 0,
+				management_next_retry_at: null
+			}))
+		};
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await expect.element(page.getByText('Organizer paused · 2 files secured')).toBeVisible();
+		await expect
+			.element(
+				page.getByText(
+					'The durable publication evidence no longer agrees with its journal. Nothing was overwritten.'
+				)
+			)
+			.toBeVisible();
+		await expect.element(page.getByRole('link', { name: 'Review organizer' })).toBeVisible();
+		await expect.element(page.getByText('16-bit / 44.1 kHz FLAC')).not.toBeInTheDocument();
+		await expect.element(page.getByText('Downloading from Soulseek')).not.toBeInTheDocument();
+		await expect.element(page.getByText('Trying source 3 of 3')).not.toBeInTheDocument();
+		await expect
+			.element(page.getByText('No working source found on Soulseek'))
+			.not.toBeInTheDocument();
 	});
 
 	it('shows no download strip for a settled album with no active download', async () => {

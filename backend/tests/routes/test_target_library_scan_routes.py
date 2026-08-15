@@ -13,13 +13,14 @@ from api.v1.schemas.library_policies import (
     TypedLibrarySettings,
 )
 from core.dependencies import (
+    get_library_administrative_work_service,
     get_library_policy_resolver,
     get_target_identification_queue,
     get_target_library_scan_coordinator,
 )
 from core.exceptions import ResourceNotFoundError, StaleRevisionError
 from middleware import _get_current_admin
-from models.library_work import ScanControlResult, ScanRequestResult
+from models.library_work import LibraryWorkItem, ScanControlResult, ScanRequestResult
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_activity_events import activity_events
 from tests.helpers import build_test_client, override_admin_auth, override_user_auth
@@ -100,9 +101,17 @@ def identification_queue() -> AsyncMock:
 
 
 @pytest.fixture
+def administrative_work() -> AsyncMock:
+    service = AsyncMock()
+    service.active.return_value = []
+    return service
+
+
+@pytest.fixture
 def app(
     coordinator: AsyncMock,
     identification_queue: AsyncMock,
+    administrative_work: AsyncMock,
     resolver: LibraryPolicyResolver,
 ) -> FastAPI:
     application = FastAPI()
@@ -113,6 +122,9 @@ def app(
     application.dependency_overrides[get_library_policy_resolver] = lambda: resolver
     application.dependency_overrides[get_target_identification_queue] = (
         lambda: identification_queue
+    )
+    application.dependency_overrides[get_library_administrative_work_service] = (
+        lambda: administrative_work
     )
     return application
 
@@ -210,7 +222,10 @@ def test_mutations_are_admin_only(
 
 
 def test_activity_is_authenticated_and_redacted(
-    app: FastAPI, coordinator: AsyncMock, identification_queue: AsyncMock
+    app: FastAPI,
+    coordinator: AsyncMock,
+    identification_queue: AsyncMock,
+    administrative_work: AsyncMock,
 ) -> None:
     unauthenticated = build_test_client(app)
     assert unauthenticated.get("/library/activity").status_code == 401
@@ -233,8 +248,16 @@ def test_activity_is_authenticated_and_redacted(
     response = build_test_client(app).get("/library/activity")
     assert response.status_code == 200
     payload = response.json()
+    assert payload["revisions"] == {
+        "scan": 0,
+        "identification": 0,
+        "operation": 0,
+    }
     assert payload["items"][0]["label"] == "Updating the local library"
     assert payload["items"][0]["processed"] == 4
+    assert payload["work_items"][0]["processed"] == 4
+    assert payload["work_items"][0]["scope_label"] is None
+    administrative_work.active.assert_not_awaited()
     encoded = response.text
     assert "admin-secret" not in encoded
     assert "private/path" not in encoded
@@ -286,6 +309,83 @@ def test_activity_is_authenticated_and_redacted(
         "failure_at": 9.0,
         "foreground_operation_count": 1,
     }
+    work = next(
+        item
+        for item in payload["work_items"]
+        if item["kind"] == "identification" and item["state"] != "failed"
+    )
+    assert work["processed"] == 0
+    assert work["total"] is None
+    assert work["remaining_count"] == 7
+    failure = next(
+        item
+        for item in payload["work_items"]
+        if item["kind"] == "identification" and item["state"] == "failed"
+    )
+    assert failure["failure_event_id"] == "failure-opaque"
+
+
+def test_activity_projects_admin_work_and_scan_finalization_truthfully(
+    admin_client,
+    coordinator: AsyncMock,
+    administrative_work: AsyncMock,
+) -> None:
+    coordinator.current.return_value = [
+        SimpleNamespace(
+            id="run-1",
+            state="reconciling",
+            phase="reconciling",
+            aggregate_scope="all",
+            updated_at=10,
+            started_at=1,
+        ),
+        SimpleNamespace(
+            id="run-2",
+            state="queued",
+            phase="queued",
+            aggregate_scope="all",
+            updated_at=11,
+            started_at=None,
+        ),
+    ]
+    coordinator.snapshot.side_effect = [
+        SimpleNamespace(
+            counters={"inspected_count": 95, "total_count": 100, "changed_count": 3}
+        ),
+        SimpleNamespace(counters={}),
+    ]
+    administrative_work.active.return_value = [
+        LibraryWorkItem(
+            id="management-1",
+            kind="library_management",
+            state="running",
+            phase="planning",
+            effect="catalog_only",
+            processed=20,
+            total=200,
+            unit="files",
+            priority=30,
+            updated_at=9,
+        )
+    ]
+
+    payload = admin_client.get("/library/activity").json()
+
+    scans = [item for item in payload["work_items"] if item["kind"] == "scan"]
+    scan = next(item for item in scans if item["id"] == "run-1")
+    queued_scan = next(item for item in scans if item["id"] == "run-2")
+    management = next(
+        item for item in payload["work_items"] if item["kind"] == "library_management"
+    )
+    assert scan["processed"] == 100
+    assert scan["total"] == 100
+    assert scan["phase"] == "reconciling"
+    assert scan["scope_label"] == "Whole library"
+    assert queued_scan["state"] == "queued"
+    assert queued_scan["priority"] > scan["priority"]
+    assert len(payload["items"]) == 1
+    assert management["processed"] == 20
+    administrative_work.active.assert_awaited_once()
 
 
 def test_activity_projects_recent_scan_failure_and_foreground_work(
@@ -475,4 +575,5 @@ async def test_activity_stream_coalesces_revisions_and_sends_bounded_heartbeats(
     assert '"scan":1' in first
     assert heartbeat == ": keepalive\n\n"
     assert '"identification":4' in changed
+    assert first.splitlines()[0] != changed.splitlines()[0]
     assert delays == [2.0] * 16

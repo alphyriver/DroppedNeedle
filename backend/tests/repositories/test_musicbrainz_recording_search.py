@@ -86,7 +86,7 @@ async def test_search_recordings_parses_and_dedupes_release_groups():
         matches = await _Repo().search_recordings("XXXTENTACION", "SAD!")
 
     assert mock_get.await_args.kwargs["params"]["query"] == (
-        'recording:"SAD!" AND artist:"XXXTENTACION"'
+        'recording:"SAD\\!" AND artist:"XXXTENTACION"'
     )
     assert [m.recording_mbid for m in matches] == ["rec-sad", "rec-sad-2"]
 

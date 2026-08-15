@@ -1,6 +1,4 @@
 <script lang="ts">
-	import type { ReleaseGroup } from '$lib/types';
-	import { dedupeById } from '$lib/utils/dedupe';
 	import { colors } from '$lib/colors';
 	import ArtistHeaderSkeleton from '$lib/components/ArtistHeaderSkeleton.svelte';
 	import AlbumGridSkeleton from '$lib/components/AlbumGridSkeleton.svelte';
@@ -14,6 +12,7 @@
 	import TopAlbumsList from '$lib/components/TopAlbumsList.svelte';
 	import LastFmEnrichment from '$lib/components/LastFmEnrichment.svelte';
 	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
+	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
 	import { requestAlbum } from '$lib/utils/albumRequest';
 	import { libraryStore } from '$lib/stores/library';
@@ -39,6 +38,8 @@
 		type DiscographyRelease
 	} from '$lib/stores/discographyDownload.svelte';
 	import { Download } from 'lucide-svelte';
+	import ArtistReleasePagination from '$lib/components/ArtistReleasePagination.svelte';
+	import { mergeArtistReleasePages } from '$lib/queries/artist/artistReleasePages';
 
 	interface Props {
 		data: { artistId: string; primarySource: MusicSource };
@@ -126,43 +127,16 @@
 	const releasesQuery = getArtistReleasesInfiniteQuery(() => data.artistId);
 	const loadingMoreReleases = $derived(releasesQuery.isFetchingNextPage);
 	const hasMoreReleases = $derived(releasesQuery.hasNextPage);
-	const releases = $derived.by(() => {
-		const albums = releasesQuery.data?.pages.flatMap((page) => page.albums) || [];
-		const singles = releasesQuery.data?.pages.flatMap((page) => page.singles) || [];
-		const eps = releasesQuery.data?.pages.flatMap((page) => page.eps) || [];
-		// pages can repeat a release group; dedupe so the keyed {#each} never hits each_key_duplicate, which would blank the page
-		return {
-			albums: sortReleasesByYear(dedupeById(albums)),
-			singles: sortReleasesByYear(dedupeById(singles)),
-			eps: sortReleasesByYear(dedupeById(eps))
-		};
-	});
+	const releases = $derived(mergeArtistReleasePages(releasesQuery.data?.pages ?? []));
 	const loadedReleaseCount = $derived(
-		releasesQuery.data?.pages.flatMap((page) => [...page.albums, ...page.singles, ...page.eps])
-			.length || 0
+		releases.albums.length + releases.singles.length + releases.eps.length
 	);
 	const initialReleasesLoading = $derived(releasesQuery.isLoading);
 	const sourceTotalCount = $derived(releasesQuery.data?.pages[0]?.source_total_count ?? null);
 
-	$effect(() => {
-		if (hasMoreReleases && !releasesQuery.isFetchingNextPage) {
-			releasesQuery.fetchNextPage();
-		}
-	});
-
 	const refreshingArtist = $derived(
 		artistBasicQuery.isRefetching || artistExtendedQuery.isRefetching
 	);
-
-	function sortReleasesByYear(releases: ReleaseGroup[]) {
-		return [...releases].sort((a, b) => {
-			const yearA = a.year;
-			const yearB = b.year;
-			if (yearA === null || yearA === undefined) return 1;
-			if (yearB === null || yearB === undefined) return -1;
-			return yearB - yearA;
-		});
-	}
 
 	async function handleRefreshClick() {
 		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
@@ -194,6 +168,11 @@
 
 	function handleReleaseRemoved() {
 		void invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
+	}
+
+	function handleLoadMoreReleases() {
+		if (!hasMoreReleases || loadingMoreReleases) return;
+		void releasesQuery.fetchNextPage();
 	}
 
 	let allReleases = $derived([...releases.albums, ...releases.eps, ...releases.singles]);
@@ -239,6 +218,9 @@
 		}
 		return [
 			{ id: 'section-overview', label: 'Overview' },
+			...(artist.appears_in_library
+				? [{ id: 'section-library-appearances', label: 'Local appearances' }]
+				: []),
 			{ id: 'section-about', label: 'About' },
 			{ id: 'section-similar', label: 'Similar Artists' },
 			...(releases.albums.length > 0 ? [{ id: 'section-albums', label: 'Albums' }] : []),
@@ -313,9 +295,16 @@
 					<ArtistWhereToBuy artistMbid={data.artistId} artistName={artist.name} />
 				</section>
 
+				{#if artist.appears_in_library}
+					<ArtistAppearancesSection artistId={data.artistId} />
+				{/if}
+
 				<section id="section-about" class="space-y-4 scroll-mt-24">
 					{#if !lastfmEnrichment?.bio}
-						<ArtistDescription description={artist.description} loading={loadingExtended} />
+						<ArtistDescription
+							description={artist.description}
+							loading={loadingExtended && !artistExtended}
+						/>
 					{/if}
 
 					{#if loadingLastfm || lastfmEnrichment}
@@ -387,22 +376,6 @@
 
 				{#if initialReleasesLoading}
 					<AlbumGridSkeleton title="Discography" count={12} />
-				{:else if hasMoreReleases || loadingMoreReleases}
-					<div
-						class="flex items-center justify-center gap-3 p-4 bg-base-300 rounded-box mb-6"
-						style="border: 2px solid {colors.accent};"
-					>
-						<span class="loading loading-spinner loading-md" style="color: {colors.accent};"></span>
-						<div class="flex flex-col items-start">
-							<span class="font-semibold text-base" style="color: {colors.accent};"
-								>Loading releases...</span
-							>
-							<span class="text-sm text-base-content/70"
-								>{#if sourceTotalCount}Loaded {loadedReleaseCount} of {sourceTotalCount} releases{:else}Loading
-									{loadedReleaseCount} releases{/if}</span
-							>
-						</div>
-					</div>
 				{/if}
 
 				{#if releases.albums.length > 0}
@@ -412,7 +385,7 @@
 							releases={releases.albums}
 							collapsed={albumsCollapsed}
 							requestingIds={requestedReleaseIds}
-							showLoadingIndicator={hasMoreReleases || loadingMoreReleases}
+							showLoadingIndicator={loadingMoreReleases}
 							artistName={artist.name}
 							onRequest={handleRequest}
 							onRemoved={handleReleaseRemoved}
@@ -429,7 +402,7 @@
 							releases={releases.eps}
 							collapsed={epsCollapsed}
 							requestingIds={requestedReleaseIds}
-							showLoadingIndicator={hasMoreReleases || loadingMoreReleases}
+							showLoadingIndicator={loadingMoreReleases}
 							artistName={artist.name}
 							onRequest={handleRequest}
 							onRemoved={handleReleaseRemoved}
@@ -446,7 +419,7 @@
 							releases={releases.singles}
 							collapsed={singlesCollapsed}
 							requestingIds={requestedReleaseIds}
-							showLoadingIndicator={hasMoreReleases || loadingMoreReleases}
+							showLoadingIndicator={loadingMoreReleases}
 							artistName={artist.name}
 							onRequest={handleRequest}
 							onRemoved={handleReleaseRemoved}
@@ -454,6 +427,15 @@
 							onDownloadAll={() => openSectionDownloadModal(releases.singles, 'Single')}
 						/>
 					</section>
+				{/if}
+
+				{#if hasMoreReleases || loadingMoreReleases}
+					<ArtistReleasePagination
+						loadedCount={loadedReleaseCount}
+						totalCount={sourceTotalCount}
+						loading={loadingMoreReleases}
+						onloadmore={handleLoadMoreReleases}
+					/>
 				{/if}
 			</div>
 		</div>

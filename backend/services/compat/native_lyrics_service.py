@@ -41,8 +41,7 @@ def _record_degradation(message: str) -> None:
 
 def _plain_lines(value: str) -> tuple[NativeLyricsLine, ...]:
     return tuple(
-        NativeLyricsLine(line.rstrip("\r"))
-        for line in value.splitlines()[:_MAX_LINES]
+        NativeLyricsLine(line.rstrip("\r")) for line in value.splitlines()[:_MAX_LINES]
     )
 
 
@@ -59,9 +58,7 @@ def _parse_lrc(value: str) -> tuple[NativeLyricsLine, ...]:
             fraction = timestamp.group(3) or "0"
             milliseconds = int(fraction.ljust(3, "0")[:3])
             lines.append(
-                NativeLyricsLine(
-                    lyric, (minutes * 60 + seconds) * 1000 + milliseconds
-                )
+                NativeLyricsLine(lyric, (minutes * 60 + seconds) * 1000 + milliseconds)
             )
             if len(lines) >= _MAX_LINES:
                 break
@@ -80,20 +77,19 @@ def _embedded_lyrics(
     for key in tags.keys():
         if str(key).upper().startswith("SYLT"):
             frame = tags[key]
+            if (
+                getattr(frame, "type", None) != 1
+                or getattr(frame, "format", None) != 2
+                or not getattr(frame, "text", None)
+            ):
+                continue
             lines = tuple(
                 NativeLyricsLine(str(value), int(start))
                 for value, start in getattr(frame, "text", ())[:_MAX_LINES]
             )
             if lines:
                 return "", str(getattr(frame, "lang", "und") or "und"), lines
-        if str(key).upper().startswith("USLT"):
-            frame = tags[key]
-            return (
-                str(getattr(frame, "text", "")),
-                str(getattr(frame, "lang", "und") or "und"),
-                None,
-            )
-    for key in ("SYNCEDLYRICS", "SYNCED LYRICS"):
+    for key in ("SYNCEDLYRICS", "SYNCED LYRICS", "WM/Lyrics_Synchronised"):
         value = tags.get(key)
         if value:
             if isinstance(value, (list, tuple)):
@@ -101,7 +97,21 @@ def _embedded_lyrics(
             lines = _parse_lrc(str(value))
             if lines:
                 return "", "und", lines
-    for key in ("LYRICS", "UNSYNCEDLYRICS", "UNSYNCED LYRICS", "©lyr"):
+    for key in tags.keys():
+        if str(key).upper().startswith("USLT"):
+            frame = tags[key]
+            return (
+                str(getattr(frame, "text", "")),
+                str(getattr(frame, "lang", "und") or "und"),
+                None,
+            )
+    for key in (
+        "LYRICS",
+        "UNSYNCEDLYRICS",
+        "UNSYNCED LYRICS",
+        "WM/Lyrics",
+        "©lyr",
+    ):
         value = tags.get(key)
         if value:
             if isinstance(value, (list, tuple)):
@@ -115,10 +125,8 @@ class NativeLyricsService:
         self._local_files = local_files
         self._max_cache_entries = max_cache_entries
         self._cache: OrderedDict[
-            tuple[str, str, int, int, int, int], NativeLyrics | None
-        ] = (
-            OrderedDict()
-        )
+            tuple[str, str, int, int, int, int, int, int], NativeLyrics | None
+        ] = OrderedDict()
 
     async def get(self, file_id: str) -> NativeLyrics | None:
         path = await self._local_files.resolve_validated_path(file_id)
@@ -137,8 +145,10 @@ class NativeLyricsService:
             file_id,
             str(path),
             file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
             file_stat.st_size,
             sidecar_stat.st_mtime_ns if sidecar_stat else 0,
+            sidecar_stat.st_ctime_ns if sidecar_stat else 0,
             sidecar_stat.st_size if sidecar_stat else 0,
         )
         if cache_key in self._cache:
