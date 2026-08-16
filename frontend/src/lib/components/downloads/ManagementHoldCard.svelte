@@ -77,7 +77,7 @@
 				return "The active profile's tagging or naming rules could not process this file safely.";
 			case 'PROFILE_CHANGED':
 			case 'POLICY_CHANGED':
-				return 'The Library Management configuration changed while this album was being prepared. Review it, then retry.';
+				return 'The file organization configuration changed while this album was being prepared. Review it, then retry.';
 			case 'PATH_COLLISION_DIFFERENT':
 			case 'POSITION_COLLISION':
 			case 'SIDECAR_COLLISION':
@@ -96,11 +96,11 @@
 			case 'BUNDLE_BLOCKED':
 			case 'RECOVERY_NEEDS_ATTENTION':
 			case 'RECYCLE_UNAVAILABLE':
-				return 'The durable writer could not safely commit or recover this album. Review Library Management, then retry.';
+				return 'The durable writer could not safely commit or recover this album. Review file organization, then retry.';
 			case 'TRACK_NOT_MAPPED':
 				return 'The exact release-track identity was no longer available when publication began.';
 			default:
-				return 'Library Management stopped before writing because one of its safety checks needs attention.';
+				return 'File organization stopped before writing because one of its safety checks needs attention.';
 		}
 	});
 
@@ -120,7 +120,7 @@
 					retryError =
 						error instanceof Error && error.message
 							? error.message
-							: 'Library Management still needs attention.';
+							: 'File organization still needs attention.';
 				}
 			}
 		);
@@ -241,7 +241,7 @@
 							/>
 							{retry.isPending ? 'Retrying organizer…' : 'Retry organizer'}
 						</button>
-						<a href="/library/management#management-settings" class="btn btn-ghost btn-sm">
+						<a href="/library/management?tab=automation" class="btn btn-ghost btn-sm">
 							<Settings2 class="size-4" aria-hidden="true" /> Review automation
 						</a>
 						<button

@@ -346,12 +346,10 @@
 					tabindex="-1"
 					class="font-display text-xl font-semibold"
 				>
-					{mode === 'baseline_restore'
-						? 'Restore first-management baselines'
-						: 'Preview Library Management'}
+					{mode === 'baseline_restore' ? 'Restore original state' : 'Preview file organization'}
 				</h2>
 				<p class="mt-1 text-sm text-base-content/55">
-					This creates a read-only durable preview. It does not change a music file.
+					This creates a saved read-only preview. No music file changes.
 				</p>
 			</div>
 			<button
@@ -637,16 +635,14 @@
 					<div>
 						<h3 class="font-display text-lg font-semibold">Review expansion</h3>
 						<p class="text-sm text-base-content/55">
-							Generating the preview performs reads and durable planning only.
+							Generating the preview only reads files and saves a plan.
 						</p>
 					</div>
 					<div class="management-review-grid">
 						<div><span>Scope</span><strong>{scopeLabel()}</strong></div>
 						<div>
 							<span>Profile</span><strong
-								>{mode === 'baseline_restore'
-									? 'Original first-management state'
-									: profile?.name}</strong
+								>{mode === 'baseline_restore' ? 'Original state' : profile?.name}</strong
 							>
 						</div>
 						<div>
@@ -675,14 +671,13 @@
 							class="alert alert-warning items-start"
 						>
 							<ShieldAlert class="mt-0.5 h-5 w-5" /><span
-								>Restore means “how files were before DroppedNeedle first managed them.” It is
-								separate from Undo, and restored files remain unmanaged until deliberately enabled
-								again.</span
+								>Restore returns files to how they were before DroppedNeedle first managed them. It
+								is separate from Undo; restored files stay unmanaged until you enable them again.</span
 							>
 						</div>{/if}
 					<p class="text-sm text-base-content/55">
-						A later page shows every eligible, warning, blocked, preserved, and no-change item
-						before any Apply button exists.
+						Before you can apply anything, the next page lists every file marked eligible, warning,
+						blocked, preserved, or unchanged.
 					</p>
 				</section>
 			{/if}

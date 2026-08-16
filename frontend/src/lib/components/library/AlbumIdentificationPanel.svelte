@@ -459,7 +459,7 @@
 					<div class="min-w-0 flex-1">
 						<p class="identification-kicker">Currently attached · Custom edition</p>
 						<h3 class="hero-title text-lg font-bold">
-							Library Management uses your local track list
+							File organization uses your local track list
 						</h3>
 						<p>
 							{album.custom_manifest_recognized_track_count} of {album.custom_manifest_track_count}
@@ -478,7 +478,7 @@
 			{/if}
 
 			{#if album.management_excluded}
-				<section class="identification-current-edition" aria-label="Library Management excluded">
+				<section class="identification-current-edition" aria-label="File organization excluded">
 					<div class="identification-current-edition-mark"><CirclePause class="h-5 w-5" /></div>
 					<div class="min-w-0 flex-1">
 						<p class="identification-kicker">Left unmanaged</p>

@@ -803,7 +803,18 @@ def _downgrade_operation_kind_check(path: Path) -> None:
         )
         connection.execute(
             "INSERT INTO library_operation_jobs__old "
-            "SELECT * FROM library_operation_jobs"
+            "(id, kind, state, requested_by_user_id, input_catalog_revision, "
+            "expected_work_count, completed_count, succeeded_count, failed_count, "
+            "skipped_count, control_request, terminal_code, idempotency_key, "
+            "lease_owner, lease_expires_at, heartbeat_at, created_at, started_at, "
+            "phase_started_at, phase_timings_json, updated_at, terminal_at, "
+            "row_revision, event_revision) "
+            "SELECT id, kind, state, requested_by_user_id, input_catalog_revision, "
+            "expected_work_count, completed_count, succeeded_count, failed_count, "
+            "skipped_count, control_request, terminal_code, idempotency_key, "
+            "lease_owner, lease_expires_at, heartbeat_at, created_at, started_at, "
+            "phase_started_at, phase_timings_json, updated_at, terminal_at, "
+            "row_revision, event_revision FROM library_operation_jobs"
         )
         connection.execute("DROP TABLE library_operation_jobs")
         connection.execute(

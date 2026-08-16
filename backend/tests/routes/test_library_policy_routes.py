@@ -11,7 +11,10 @@ from api.v1.schemas.library_policies import (
     LibraryRootSettings,
     LibrarySettingsResponse,
 )
-from core.dependencies import get_library_policy_service
+from core.dependencies import (
+    get_legacy_pending_migration_service,
+    get_library_policy_service,
+)
 from core.exceptions import ConfigurationError
 from middleware import _get_current_admin
 from tests.helpers import build_test_client, mock_admin_user
@@ -49,10 +52,16 @@ def service() -> MagicMock:
     return mock
 
 
-def _client(service: MagicMock, admin_override=None):
+def _client(service: MagicMock, admin_override=None, pending_migration=None):
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_library_policy_service] = lambda: service
+    if pending_migration is None:
+        pending_migration = MagicMock()
+        pending_migration.schedule = AsyncMock(return_value=False)
+    app.dependency_overrides[get_legacy_pending_migration_service] = (
+        lambda: pending_migration
+    )
     if admin_override is not None:
         app.dependency_overrides[_get_current_admin] = admin_override
     return build_test_client(app)
@@ -114,6 +123,23 @@ def test_library_policy_route_contracts(service) -> None:
     assert tree.json()["roots"] == []
     assert impact.json()["affected_scope_ids"] == ["root-1"]
     assert mapping.json()["blocking"] is False
+
+
+def test_library_policy_save_schedules_pending_migration(service) -> None:
+    pending = MagicMock()
+    pending.schedule = AsyncMock(return_value=True)
+    client = _client(service, admin_override=mock_admin_user, pending_migration=pending)
+
+    response = client.put(
+        "/settings/library/roots",
+        json={
+            "settings": {"library_roots": []},
+            "expected_policy_revision": "revision-1",
+        },
+    )
+
+    assert response.status_code == 200
+    pending.schedule.assert_awaited_once()
 
 
 def test_library_policy_validation_uses_error_envelope(service) -> None:

@@ -82,6 +82,22 @@ Picard-style Organizer. The performance relationship for work
 therefore be nullable and must not make an otherwise valid canonical release
 fail decoding.
 
+## Nullable status and release-group primary-type identifiers
+
+Re-verified against the live production API on 2026-08-15 with the minimal
+reconciliation include set (`artist-credits`, `recordings`, and
+`release-groups`). Release `04cd3c24-5622-4470-a77a-a338b7998b34` ("I Fought the
+Law") returned both `status` and `status-id` explicitly set to JSON null, and
+release `8f1dd604-321c-4376-a383-818f4e5ab3f5` ("Haunt Me", release-group
+`9e984086-d190-4a3d-a137-adaf1617327a`) returned both `primary-type` and
+`primary-type-id` explicitly set to JSON null on its release group. Each of
+these pairs previously split: the display string was nullable while the
+identifier was modelled as required, and the deterministic decode failure
+poisoned the shared circuit breaker. Identifier fields for both must therefore
+remain nullable. A relationship-rich probe of the same release on the same date
+returned null only for relation `begin`/`end` (already nullable), so relation
+`type-id` fields stay required until a live payload proves otherwise.
+
 ## Missing and malformed identifiers
 
 - A syntactically valid but nonexistent release UUID returned HTTP 404 with JSON

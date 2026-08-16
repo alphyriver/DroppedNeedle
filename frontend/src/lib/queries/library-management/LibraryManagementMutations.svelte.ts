@@ -158,8 +158,8 @@ export const confirmLibraryManagementActivationMutation = () =>
 				API.libraryManagement.activationConfirmations(),
 				request
 			),
-		onSuccess: showQueued('Library Management activation saved'),
-		onError: showActionError('Could not activate Library Management')
+		onSuccess: showQueued('File organization activated'),
+		onError: showActionError('Could not activate file organization')
 	}));
 
 export const createLibraryManagementPreviewMutation = () =>
@@ -169,7 +169,7 @@ export const createLibraryManagementPreviewMutation = () =>
 				API.libraryManagement.previews(),
 				request
 			),
-		onSuccess: showQueued('Library Management preview queued'),
+		onSuccess: showQueued('Organization preview queued'),
 		onError: showActionError('Could not queue the management preview')
 	}));
 
@@ -191,7 +191,7 @@ export const applyLibraryManagementPreviewMutation = () =>
 				API.libraryManagement.applyPreview(input.jobId),
 				input.request
 			),
-		onSuccess: showQueued('Library Management work queued'),
+		onSuccess: showQueued('Organization work queued'),
 		onError: showActionError('Could not apply this management preview')
 	}));
 
@@ -202,7 +202,7 @@ export const discardLibraryManagementPreviewMutation = () =>
 				API.libraryManagement.discardPreview(input.jobId),
 				input.request
 			),
-		onSuccess: showQueued('Library Management preview discarded'),
+		onSuccess: showQueued('Organization preview discarded'),
 		onError: showActionError('Could not discard this management preview')
 	}));
 
@@ -254,8 +254,8 @@ export const purgeLibraryManagementBaselinesMutation = () =>
 				API.libraryManagement.purgeBaselines(),
 				request
 			),
-		onSuccess: showQueued('Library Management baselines purged'),
-		onError: showActionError('Could not purge Library Management baselines')
+		onSuccess: showQueued('Organization baselines purged'),
+		onError: showActionError('Could not purge organization baselines')
 	}));
 
 export const controlLibraryManagementOperationMutation = (action: 'pause' | 'resume' | 'stop') =>
@@ -273,7 +273,7 @@ export const controlLibraryManagementOperationMutation = (action: 'pause' | 'res
 		},
 		onSuccess: async () => {
 			await invalidateLibraryManagementSurfaces();
-			toastStore.show({ message: `Library Management ${action} requested`, type: 'success' });
+			toastStore.show({ message: `Organization ${action} requested`, type: 'success' });
 		},
-		onError: showActionError(`Could not ${action} this Library Management operation`)
+		onError: showActionError(`Could not ${action} this organization operation`)
 	}));

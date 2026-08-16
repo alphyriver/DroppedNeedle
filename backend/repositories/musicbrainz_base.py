@@ -3,7 +3,7 @@ from typing import Any, TypeVar
 import httpx
 import msgspec
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, InvalidExternalPayloadError
 from infrastructure.resilience.retry import with_retry, CircuitBreaker
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.queue.priority_queue import RequestPriority, get_priority_queue
@@ -75,6 +75,8 @@ def get_mb_http_client() -> httpx.AsyncClient:
     max_attempts=3,
     circuit_breaker=mb_circuit_breaker,
     retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
+    non_breaking_exceptions=(InvalidExternalPayloadError,),
+    non_retriable_exceptions=(InvalidExternalPayloadError,),
 )
 async def mb_api_get(
     path: str,
@@ -105,7 +107,14 @@ async def mb_api_get(
             if decode_type is not None:
                 return _decode_typed_response(response, decode_type)
             return _decode_json_response(response)
-        except (msgspec.DecodeError, msgspec.ValidationError, TypeError) as exc:
+        except msgspec.ValidationError as exc:
+            # deterministic per payload (e.g. a field MusicBrainz sends as JSON
+            # null), so it says nothing about service health and never counts
+            # toward the circuit breaker
+            raise InvalidExternalPayloadError(
+                f"MusicBrainz returned an unexpected payload shape for {path}: {exc}"
+            ) from exc
+        except (msgspec.DecodeError, TypeError) as exc:
             raise ExternalServiceError(
                 f"MusicBrainz returned invalid JSON payload for {path}: {exc}"
             ) from exc

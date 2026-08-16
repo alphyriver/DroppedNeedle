@@ -174,15 +174,13 @@ describe('LibraryManagementOperationPage', () => {
 		render(LibraryManagementOperationPage, { jobId: 'job-1' });
 
 		await expect.element(page.getByRole('heading', { name: 'Undo this operation' })).toBeVisible();
+		await expect.element(page.getByRole('heading', { name: 'Original baseline' })).toBeVisible();
 		await expect
-			.element(page.getByRole('heading', { name: 'First-management baseline' }))
-			.toBeVisible();
-		await expect
-			.element(page.getByText(/9 files have an available first-management baseline/))
+			.element(page.getByText(/9 files have an available original baseline/))
 			.toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Open baseline restore...' }))
-			.toHaveAttribute('href', '/library/management?runner=baseline_restore#management-controls');
+			.toHaveAttribute('href', '/library/management?runner=baseline_restore');
 		await page.getByRole('button', { name: 'Preview Undo...' }).click();
 		await expect
 			.element(page.getByRole('heading', { name: 'Generate an Undo preview?' }))
@@ -227,7 +225,7 @@ describe('LibraryManagementOperationPage', () => {
 			)
 			.toBeVisible();
 		await expect
-			.element(page.getByText(/2 files have an available first-management baseline/))
+			.element(page.getByText(/2 files have an available original baseline/))
 			.toBeVisible();
 	});
 

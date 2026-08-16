@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -433,7 +434,148 @@ def test_real_legacy_installation_upgrades_once_with_normal_startup(
     assert state["evidence"]["embedded_art_reads"] == 0
 
 
-def test_real_unresolved_reference_reports_sanitized_failure_evidence(
+def test_real_upgrade_remaps_absent_legacy_paths_to_configured_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    historical_music = Path("/legacy-droppedneedle-test") / tmp_path.name / "Music"
+    current_music = tmp_path / "Current" / "Music"
+    compilation = current_music / "Compilation"
+    compilation.mkdir(parents=True)
+    (compilation / "01.flac").write_bytes(b"a" * 100)
+    (compilation / "02.flac").write_bytes(b"b" * 200)
+    database = root / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    _create_source(database, historical_music)
+    config = root / "config" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({"library_settings": {"library_paths": [str(current_music)]}}),
+        encoding="utf-8",
+    )
+
+    result = _run_real_upgrade(root)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    with sqlite3.connect(database) as connection:
+        target_paths = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT file_path FROM local_tracks ORDER BY file_path"
+            ).fetchall()
+        ]
+        legacy_paths = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT file_path FROM library_files ORDER BY file_path"
+            ).fetchall()
+        ]
+    assert all(path.startswith(str(current_music)) for path in target_paths)
+    assert all(path.startswith(str(historical_music)) for path in legacy_paths)
+    state = json.loads(
+        (root / "cache" / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reconciliation = state["evidence"]["path_reconciliation"]
+    assert reconciliation["mode"] == "remapped"
+    assert reconciliation["library_file_count"] == 2
+    assert reconciliation["review_row_count"] == 4
+    assert len(reconciliation["root_ids"]) == 1
+
+
+def test_real_upgrade_retargets_root_to_present_legacy_location(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    historical_base = Path.home() / f".droppedneedle-upgrade-test-{tmp_path.name}"
+    historical_music = historical_base / "Music"
+    configured_music = tmp_path / "Configured" / "Music"
+    compilation = historical_music / "Compilation"
+    compilation.mkdir(parents=True)
+    (compilation / "01.flac").write_bytes(b"a" * 100)
+    (compilation / "02.flac").write_bytes(b"b" * 200)
+    database = root / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    _create_source(database, historical_music)
+    config = root / "config" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({"library_settings": {"library_paths": [str(configured_music)]}}),
+        encoding="utf-8",
+    )
+
+    try:
+        result = _run_real_upgrade(root)
+    finally:
+        shutil.rmtree(historical_base, ignore_errors=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    with sqlite3.connect(database) as connection:
+        target_paths = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT file_path FROM local_tracks ORDER BY file_path"
+            ).fetchall()
+        ]
+    assert all(path.startswith(str(historical_music)) for path in target_paths)
+    persisted = json.loads(config.read_text(encoding="utf-8"))
+    saved_root_paths = [
+        entry["path"] for entry in persisted["library_settings"]["library_roots"]
+    ]
+    assert saved_root_paths == [str(historical_music)]
+    state = json.loads(
+        (root / "cache" / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reconciliation = state["evidence"]["path_reconciliation"]
+    assert reconciliation["mode"] == "exact"
+    assert reconciliation["library_file_count"] == 2
+    assert reconciliation["review_row_count"] == 4
+    assert len(reconciliation["root_ids"]) == 1
+
+
+def test_real_upgrade_records_sanitized_pending_path_reconciliation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    historical_music = Path("/legacy-droppedneedle-test") / tmp_path.name / "Music"
+    configured_music = tmp_path / "Current" / "Music"
+    configured_music.mkdir(parents=True)
+    database = root / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    _create_source(database, historical_music)
+    config = root / "config" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({"library_settings": {"library_paths": [str(configured_music)]}}),
+        encoding="utf-8",
+    )
+
+    result = _run_real_upgrade(root)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    state = json.loads(
+        (root / "cache" / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reconciliation = state["evidence"]["path_reconciliation"]
+    assert reconciliation == {
+        "mode": "blocked",
+        "library_file_count": 2,
+        "review_row_count": 4,
+        "failure_reason": "unverified_path_remap",
+    }
+    assert state["evidence"]["skipped"]["library_file"] == 2
+    assert state["evidence"]["skipped"]["review_row"] == 4
+    serialized = json.dumps(reconciliation)
+    assert str(historical_music) not in serialized
+    assert str(configured_music) not in serialized
+
+
+def test_real_upgrade_skips_unresolvable_references(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "app"
@@ -456,42 +598,22 @@ def test_real_unresolved_reference_reports_sanitized_failure_evidence(
 
     result = _run_real_upgrade(root)
 
-    assert result.returncode == 1
+    assert result.returncode == 0, result.stdout + result.stderr
     state = json.loads(
         (root / "cache" / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
             encoding="utf-8"
         )
     )
-    assert state["failure_evidence"] == {
-        "reason": "unresolved_references",
-        "blocker_count": 1,
-        "unresolved_reference_counts": {"favorite": 1},
-        "blocker_reason_counts": {"favorite_unresolved": 1},
-        "details": [
-            {
-                "kind": "favorite",
-                "item_kind": "album",
-                "item_id": "private-missing-reference",
-            }
-        ],
-    }
-    assert "reasons: favorite_unresolved=1" in result.stdout
-    serialized_evidence = json.dumps(state["failure_evidence"])
-    assert "alice" not in serialized_evidence
-    assert str(music) not in serialized_evidence
-    assert not automatic_upgrade._database_has_marker(database)
+    assert state["evidence"]["skipped"]["favorite"] == 1
+    serialized = json.dumps(state["evidence"])
+    assert "alice" not in serialized
+    assert "private-missing-reference" not in serialized
+    assert str(music) not in serialized
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM user_favorites WHERE item_id = ?",
             ("private-missing-reference",),
         ).fetchone() == (1,)
-
-    retry = _run_real_upgrade(root)
-
-    assert retry.returncode == 1
-    assert "previous attempt by this image" in retry.stdout
-    assert "Failure reason: unresolved_references" in retry.stdout
-    assert "corrected image" in retry.stdout
 
 
 def test_real_upgrade_retains_unresolved_history_and_completes(

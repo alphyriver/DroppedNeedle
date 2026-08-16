@@ -84,6 +84,22 @@ def test_partial_provider_document_uses_tolerant_defaults() -> None:
     assert release.label_info[0].label is None
 
 
+def test_nullable_status_and_primary_type_identifiers_decode_as_none() -> None:
+    """Live-verified 2026-08-15: MusicBrainz can send ``status-id`` and
+    ``release-group.primary-type-id`` as explicit JSON null (see
+    musicbrainz_MANAGEMENT_API_NOTES.md); both must decode instead of failing."""
+    release = msgspec.json.decode(
+        b'{"id":"release-id","status":null,"status-id":null,'
+        b'"release-group":{"id":"group-id","primary-type":null,'
+        b'"primary-type-id":null}}',
+        type=MbManagementRelease,
+    )
+    assert release.status is None
+    assert release.status_id is None
+    assert release.release_group.primary_type is None
+    assert release.release_group.primary_type_id is None
+
+
 def test_work_type_identifier_may_be_explicitly_null() -> None:
     release = msgspec.json.decode(
         b'{"id":"release-id","media":[{"tracks":[{"recording":{"relations":['

@@ -8,17 +8,16 @@
 		ArrowRight,
 		CirclePause,
 		CirclePlay,
-		FolderCog,
 		History,
 		RotateCcw,
 		Settings2,
-		ShieldAlert,
 		Sparkles
 	} from 'lucide-svelte';
 
 	import LibraryManagementRunner from './LibraryManagementRunner.svelte';
 	import LibraryManagementDiscardPreview from './LibraryManagementDiscardPreview.svelte';
 	import LibraryManagementIdentityReadiness from './LibraryManagementIdentityReadiness.svelte';
+	import LibraryRepairPanel from './LibraryRepairPanel.svelte';
 	import { getTargetLibrarySettingsQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { createLibraryManagementEvents } from '$lib/queries/library-management/LibraryManagementEvents';
@@ -136,32 +135,48 @@
 	}
 </script>
 
-<section class="management-control-room" aria-labelledby="management-control-title">
-	<header class="management-control-header">
-		<div class="management-write-mark"><FolderCog class="h-6 w-6" /></div>
-		<div class="min-w-0 flex-1">
-			<p class="management-kicker"><ShieldAlert class="h-3.5 w-3.5" /> Separate write system</p>
-			<h2 id="management-control-title" class="font-display text-xl font-semibold">
-				Library Management
-			</h2>
-			<p class="mt-1 text-sm text-base-content/60">
-				Writes tags and organizes files. Scanning and identification above remain read-only.
-			</p>
+<section id="management-controls" class="space-y-5" aria-label="Organize files">
+	<div
+		class="rounded-3xl border border-warning/20 bg-gradient-to-br from-warning/8 via-base-200/50 to-base-200/40 p-5 sm:p-6"
+	>
+		<p class="management-kicker">Optional write access</p>
+		<div class="mt-2 flex flex-wrap items-center justify-between gap-4">
+			<div class="max-w-2xl">
+				<h2 class="font-display text-2xl font-bold">Organize files</h2>
+				<p class="mt-1 text-sm text-base-content/60">
+					Writes tags and organizes files on disk - nothing changes until you review and apply a
+					preview.
+				</p>
+			</div>
+			<div class="flex flex-wrap items-center gap-2">
+				<button
+					class="btn management-btn"
+					disabled={recoveryUnavailable || !settingsQuery.data || !policyQuery.data}
+					onclick={(event) => openRunner('manage', event.currentTarget)}
+					><Sparkles class="h-4 w-4" /> Preview organization...</button
+				>
+				<button
+					class="btn btn-outline"
+					disabled={recoveryUnavailable || !settingsQuery.data || !policyQuery.data}
+					onclick={(event) => openRunner('baseline_restore', event.currentTarget)}
+					><RotateCcw class="h-4 w-4" /> Restore original state...</button
+				>
+				<a href="/library/management?tab=automation" class="btn btn-ghost btn-sm"
+					><Settings2 class="h-4 w-4" /> Automation</a
+				>
+			</div>
 		</div>
-		<a href="#management-settings" class="btn btn-ghost btn-sm"
-			><Settings2 class="h-4 w-4" /> Settings</a
-		>
-	</header>
+	</div>
 
 	{#if settingsQuery.isLoading || policyQuery.isLoading || operationsQuery.isLoading || recoveryQuery.isLoading}
-		<div class="space-y-3 p-5">
+		<div class="space-y-3">
 			<div class="skeleton h-28 rounded-xl"></div>
 			<div class="skeleton h-44 rounded-xl"></div>
 		</div>
 	{:else if settingsQuery.isError || policyQuery.isError || operationsQuery.isError}
-		<div class="m-5 alert alert-error">Could not load Library Management control state.</div>
+		<div class="alert alert-error">Could not load file-organization state.</div>
 	{:else if settingsQuery.data && policyQuery.data}
-		<div class="space-y-5 p-5 sm:p-6">
+		<div class="space-y-5">
 			<div class="grid gap-3 sm:grid-cols-3">
 				<div class="management-control-stat">
 					<span>Automatic write access</span><strong
@@ -190,6 +205,8 @@
 			</div>
 
 			<LibraryManagementIdentityReadiness roots={policyQuery.data.library_roots} />
+
+			<LibraryRepairPanel />
 
 			{#if active}
 				<article class="management-active-card">
@@ -239,21 +256,6 @@
 				</article>
 			{/if}
 
-			<div class="flex flex-wrap gap-2">
-				<button
-					class="btn management-btn"
-					disabled={recoveryUnavailable}
-					onclick={(event) => openRunner('manage', event.currentTarget)}
-					><Sparkles class="h-4 w-4" /> Preview library management...</button
-				>
-				<button
-					class="btn btn-outline"
-					disabled={recoveryUnavailable}
-					onclick={(event) => openRunner('baseline_restore', event.currentTarget)}
-					><RotateCcw class="h-4 w-4" /> Restore first-management state...</button
-				>
-			</div>
-
 			{#if readyPreviews.length}
 				<section class="space-y-2" aria-labelledby="ready-management-previews">
 					<div class="flex items-end justify-between">
@@ -294,7 +296,7 @@
 			<section class="space-y-2" aria-labelledby="recent-management-work">
 				<div class="flex items-end justify-between">
 					<div>
-						<p class="management-step">Durable audit trail</p>
+						<p class="management-step">Audit trail</p>
 						<h3 id="recent-management-work" class="font-semibold">Recent management work</h3>
 					</div>
 					<a class="link text-xs" href="/library/management/history">All history</a>
@@ -319,7 +321,7 @@
 						>{/each}{:else}<div
 						class="rounded-xl border border-dashed border-base-content/15 p-4 text-sm text-base-content/45"
 					>
-						No Library Management work has run yet.
+						No organization work has run yet.
 					</div>{/if}
 			</section>
 

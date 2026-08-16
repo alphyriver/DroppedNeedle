@@ -9,7 +9,7 @@ const phaseLabels: Record<string, string> = {
 	ready: 'Ready for review',
 	applying: 'Applying planned changes',
 	undoing: 'Restoring the previous file state',
-	restoring: 'Restoring first-management state',
+	restoring: 'Restoring original state',
 	preparing_snapshots: 'Preparing recovery snapshots',
 	writing_staged_files: 'Writing staged files',
 	validating_staged_files: 'Validating staged files',
@@ -35,14 +35,14 @@ export function libraryWorkTitle(item: LibraryWorkItem): string {
 	if (item.kind === 'maintenance') return 'Maintaining the library catalog';
 	if (item.kind === 'library_management') {
 		if (item.state === 'failed') {
-			if (item.mode === 'preview') return 'Library Management preview failed';
-			if (item.mode === 'undo') return 'Library Management Undo failed';
-			if (item.mode === 'baseline_restore') return 'First-management restore failed';
+			if (item.mode === 'preview') return 'Organization preview failed';
+			if (item.mode === 'undo') return 'Organization Undo failed';
+			if (item.mode === 'baseline_restore') return 'Original-state restore failed';
 			if (item.mode === 'duplicate_resolution') return 'Duplicate resolution failed';
-			return 'Applying Library Management changes failed';
+			return 'Applying organization changes failed';
 		}
-		if (item.mode === 'undo') return 'Undoing Library Management changes';
-		if (item.mode === 'baseline_restore') return 'Restoring first-management state';
+		if (item.mode === 'undo') return 'Undoing organization changes';
+		if (item.mode === 'baseline_restore') return 'Restoring original state';
 		if (item.mode === 'duplicate_resolution') return 'Resolving duplicate files';
 		if (item.effect === 'file_writing') return 'Writing tags and organizing files';
 		return 'Preparing a Picard-style preview';
@@ -106,10 +106,10 @@ export function libraryWorkHref(item: LibraryWorkItem): string {
 		item.kind === 'reidentification' ||
 		item.kind === 'identity_review'
 	) {
-		return '/library/management#identity-readiness';
+		return '/library/management?tab=organize';
 	}
-	if (item.kind === 'recovery') return '/library/management#management-controls';
-	return '/library/management#scanning-controls';
+	if (item.kind === 'recovery') return '/library/management?tab=organize';
+	return '/library/management?tab=scanning';
 }
 
 export function libraryWorkContext(item: LibraryWorkItem): string | null {

@@ -149,7 +149,7 @@
 	const baselineStatus = $derived.by(() => {
 		if (!operation || operation.baseline_available_count <= 0) return '';
 		const count = operation.baseline_available_count;
-		return `${count.toLocaleString()} ${count === 1 ? 'file has' : 'files have'} an available first-management baseline.`;
+		return `${count.toLocaleString()} ${count === 1 ? 'file has' : 'files have'} an available original baseline.`;
 	});
 	const terminalPresentation = $derived.by(() => {
 		if (!operation) return null;
@@ -298,7 +298,7 @@
 	}
 </script>
 
-<svelte:head><title>Library Management operation · DroppedNeedle</title></svelte:head>
+<svelte:head><title>Organization operation · DroppedNeedle</title></svelte:head>
 
 {#snippet resultInspector(ordinal: number)}
 	{@const result = results.find((candidate) => candidate.plan.ordinal === ordinal)}
@@ -310,7 +310,7 @@
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-7xl space-y-5">
-		<BackButton fallback="/library/management#management-controls" />
+		<BackButton fallback="/library/management?tab=organize" />
 
 		{#if operationQuery.isLoading || redirectingReadyPreview}
 			<div class="space-y-4">
@@ -318,7 +318,7 @@
 				<div class="skeleton h-72 rounded-2xl"></div>
 			</div>
 		{:else if operationQuery.isError}
-			<div class="alert alert-error">Could not load this Library Management operation.</div>
+			<div class="alert alert-error">Could not load this Organization operation.</div>
 		{:else if operation}
 			<header class="management-control-room p-5 sm:p-7">
 				<div class="flex flex-wrap items-start gap-4">
@@ -475,7 +475,7 @@
 			<section class="management-operation-panel space-y-3">
 				<div class="flex flex-wrap items-end justify-between gap-2">
 					<div>
-						<p class="management-step">Durable audit trail</p>
+						<p class="management-step">Audit trail</p>
 						<h2 class="font-display text-xl font-semibold">Per-file results</h2>
 					</div>
 					<a href="/library/management/history" class="btn btn-ghost btn-sm"
@@ -532,7 +532,7 @@
 				</div>
 				<div class="management-operation-panel">
 					<Clock3 class="h-5 w-5 text-base-content/50" />
-					<h2 class="mt-2 font-semibold">First-management baseline</h2>
+					<h2 class="mt-2 font-semibold">Original baseline</h2>
 					<p class="mt-1 text-sm text-base-content/55">
 						Restore files to how they were before DroppedNeedle first managed them. This is broader
 						than Undo and leaves restored files unmanaged.
@@ -540,9 +540,8 @@
 					{#if operation.baseline_available_count > 0}<p class="mt-2 text-xs text-base-content/55">
 							{baselineStatus}
 						</p>{/if}
-					<a
-						href="/library/management?runner=baseline_restore#management-controls"
-						class="btn btn-ghost btn-sm mt-3">Open baseline restore...</a
+					<a href="/library/management?runner=baseline_restore" class="btn btn-ghost btn-sm mt-3"
+						>Open baseline restore...</a
 					>
 				</div>
 			</section>

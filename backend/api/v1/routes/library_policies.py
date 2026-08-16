@@ -10,7 +10,7 @@ from api.v1.schemas.library_policies import (
     LibrarySettingsResponse,
     LibrarySettingsUpdateRequest,
 )
-from core.dependencies import LibraryPolicyServiceDep
+from core.dependencies import LegacyPendingMigrationServiceDep, LibraryPolicyServiceDep
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep
 
@@ -36,12 +36,15 @@ async def get_typed_library_settings(
 @router.put("/roots", response_model=LibrarySettingsResponse)
 async def update_typed_library_settings(
     service: LibraryPolicyServiceDep,
+    pending_migration: LegacyPendingMigrationServiceDep,
     request: LibrarySettingsUpdateRequest = MsgSpecBody(LibrarySettingsUpdateRequest),
 ) -> LibrarySettingsResponse:
-    return service.save_settings(
+    response = service.save_settings(
         request.settings,
         expected_policy_revision=request.expected_policy_revision,
     )
+    await pending_migration.schedule()
+    return response
 
 
 @router.get("/policy-tree", response_model=LibraryPolicyTreeResponse)

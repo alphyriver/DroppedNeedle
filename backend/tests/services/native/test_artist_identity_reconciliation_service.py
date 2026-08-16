@@ -32,6 +32,7 @@ from repositories.musicbrainz_management_models import (
     MbManagementTrack,
 )
 from services.native.artist_identity_reconciliation_service import (
+    _PROVIDER_DEFER_RETRY_SECONDS,
     ArtistIdentityReconciliationService,
 )
 from services.native.background_workload_gate import BackgroundWorkloadGate
@@ -738,6 +739,45 @@ async def test_provider_failure_defers_without_catalog_mutation(
             ).fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_defer_retries_after_backoff_not_immediately(
+    store: NativeLibraryStore,
+) -> None:
+    """The defer must not be instantly re-claimable: re-claiming the same item
+    in a tight loop was the stuck-maintenance hot spin."""
+    await store.create_catalog_membership(_membership("1", "Artist"))
+    await _accept_exact_identity(store, "1")
+    provider = AsyncMock()
+    provider.get_canonical_release.side_effect = ExternalServiceError("unavailable")
+    service = ArtistIdentityReconciliationService(store, provider, clock=lambda: 3)
+
+    await service.enqueue_album("album-1")
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    deferred = await service.run_claimed(claimed, "worker")
+
+    assert deferred["state"] == "queued"
+    assert deferred["next_attempt_at"] == 3 + _PROVIDER_DEFER_RETRY_SECONDS
+    assert (
+        await store.claim_operation_job("worker", now=4, lease_seconds=60, kind="repair")
+        is None
+    )
+
+    provider.get_canonical_release.side_effect = None
+    provider.get_canonical_release.return_value = _release()
+    reclaimed = await store.claim_operation_job(
+        "worker",
+        now=3 + _PROVIDER_DEFER_RETRY_SECONDS,
+        lease_seconds=60,
+        kind="repair",
+    )
+    assert reclaimed is not None
+    assert reclaimed["next_attempt_at"] is None
+    terminal = await service.run_claimed(reclaimed, "worker")
+    assert terminal["state"] == "succeeded"
 
 
 @pytest.mark.asyncio

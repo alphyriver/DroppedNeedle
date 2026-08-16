@@ -38,10 +38,10 @@ export function createLibraryRepair() {
 			}),
 		onSuccess: async () => {
 			await invalidateRepairs();
-			toastStore.show({ message: 'Existing-match check started', type: 'success' });
+			toastStore.show({ message: 'Identity recheck started', type: 'success' });
 		},
 		onError: () =>
-			toastStore.show({ message: 'Could not start the existing-match check', type: 'error' })
+			toastStore.show({ message: 'Could not start the identity recheck', type: 'error' })
 	}));
 }
 

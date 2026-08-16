@@ -1882,6 +1882,37 @@ async def test_operation_materialization_claim_heartbeat_recovery_and_work_compl
 
 
 @pytest.mark.asyncio
+async def test_claim_operation_job_defers_until_retry_not_before(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A job deferred with next_attempt_at must not be re-claimed before it is
+    due (the provider-defer hot-spin regression), and claiming clears it."""
+    await store.create_catalog_membership(_membership())
+    await store.create_operation_with_work(
+        OperationJob(id="operation-deferred", kind="repair", created_at=1),
+        [
+            OperationWorkItem(
+                ordinal=0,
+                local_album_id="album-1",
+                expected_subject_revision=1,
+                expected_input_revision="input-1",
+                action="repair",
+                idempotency_key="album-1",
+            )
+        ],
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_operation_jobs SET next_attempt_at = 50 "
+            "WHERE id = 'operation-deferred'"
+        )
+    assert await store.claim_operation_job("worker", now=49, lease_seconds=10) is None
+    claimed = await store.claim_operation_job("worker", now=50, lease_seconds=10)
+    assert claimed is not None
+    assert claimed["next_attempt_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_start_repair_apply_wakes_sleeping_operation_worker(
     store: NativeLibraryStore, db_path: Path
 ) -> None:

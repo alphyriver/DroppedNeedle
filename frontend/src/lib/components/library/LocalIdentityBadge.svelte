@@ -30,7 +30,7 @@
 			return {
 				label: 'Custom edition',
 				description:
-					'Library Management uses this administrator-sealed local track list as the edition.'
+					'File organization uses this administrator-sealed local track list as the edition.'
 			};
 		}
 		if (state === 'release_linked' || state === 'musicbrainz_linked') {

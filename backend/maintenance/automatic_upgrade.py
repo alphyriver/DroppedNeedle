@@ -488,19 +488,49 @@ async def _perform_target_migration() -> dict[str, Any]:
     from services.native.bounded_legacy_catalog_migrator import (
         BoundedLegacyCatalogMigrator,
     )
+    from services.native.legacy_path_reconciler import LegacyPathReconciler
     from services.native.target_startup_validator import TargetStartupValidator
 
     print("[upgrade] Preparing migrated settings and library roots.", flush=True)
     migrate_legacy_config()
     preferences = get_preferences_service()
-    preferences.get_typed_library_settings()
+    typed_settings = preferences.get_typed_library_settings()
+    store = get_native_library_store()
+    reconciliation = await LegacyPathReconciler(store, typed_settings).reconcile()
+    if reconciliation.mode == "exact":
+        preferences.retarget_library_roots_for_upgrade(
+            dict(reconciliation.root_retargets)
+        )
+        get_library_policy_resolver.cache_clear()
     resolver = get_library_policy_resolver()
+    if reconciliation.mode in {"exact", "remapped"}:
+        print(
+            "[upgrade] Reconciled legacy library paths "
+            f"for {reconciliation.library_file_count:,} catalog files and "
+            f"{reconciliation.review_row_count:,} review rows.",
+            flush=True,
+        )
     outcome = await BoundedLegacyCatalogMigrator(
-        get_native_library_store(),
+        store,
         resolver,
         emit_progress=lambda message: print(message, flush=True),
+        path_projector=(
+            reconciliation.project if reconciliation.mode == "remapped" else None
+        ),
+        skip_unmappable_paths=True,
     ).migrate(MIGRATION_ID)
     report = outcome.report
+    if outcome.skipped_counts:
+        skipped = ", ".join(
+            f"{kind}={count:,}"
+            for kind, count in sorted(outcome.skipped_counts.items())
+        )
+        print(
+            f"[upgrade] Left {sum(outcome.skipped_counts.values()):,} legacy records "
+            f"pending ({skipped}). Re-add their library roots and they will be "
+            "imported automatically.",
+            flush=True,
+        )
     if outcome.blocker_count:
         blocker_reason_counts = {
             key: value for key, value in outcome.blocker_reason_counts.items() if value
@@ -517,6 +547,9 @@ async def _perform_target_migration() -> dict[str, Any]:
         }
         if outcome.blocker_details:
             failure_evidence["details"] = outcome.blocker_details
+        reconciliation_evidence = reconciliation.evidence()
+        if reconciliation_evidence is not None:
+            failure_evidence["path_reconciliation"] = reconciliation_evidence
         _write_state(
             get_settings().cache_dir / _FAILURE_EVIDENCE_FILE,
             failure_evidence,
@@ -563,7 +596,7 @@ async def _perform_target_migration() -> dict[str, Any]:
         emit_progress=lambda message: print(f"[upgrade] {message}", flush=True),
     ).validate("cutover")
     print("[upgrade] Working-copy migration checks passed.", flush=True)
-    return {
+    evidence = {
         "source_revision": report.source_revision,
         "root_revision": report.root_revision,
         "reference_counts": len(report.reference_counts),
@@ -573,6 +606,12 @@ async def _perform_target_migration() -> dict[str, Any]:
         "fingerprints": report.fingerprints,
         "embedded_art_reads": report.embedded_art_reads,
     }
+    reconciliation_evidence = reconciliation.evidence()
+    if reconciliation_evidence is not None:
+        evidence["path_reconciliation"] = reconciliation_evidence
+    if outcome.skipped_counts:
+        evidence["skipped"] = dict(outcome.skipped_counts)
+    return evidence
 
 
 def run_automatic_copy_upgrade(

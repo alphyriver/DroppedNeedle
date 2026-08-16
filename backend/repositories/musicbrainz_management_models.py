@@ -148,7 +148,10 @@ class MbManagementReleaseGroup(msgspec.Struct):
         name="first-release-date", default=None
     )
     primary_type: str | None = msgspec.field(name="primary-type", default=None)
-    primary_type_id: str = msgspec.field(name="primary-type-id", default="")
+    # Nullable: live-verified 2026-08-15 (release 8f1dd604-321c-4376-a383-818f4e5ab3f5,
+    # release-group 9e984086-d190-4a3d-a137-adaf1617327a) - see
+    # musicbrainz_MANAGEMENT_API_NOTES.md.
+    primary_type_id: str | None = msgspec.field(name="primary-type-id", default=None)
     secondary_types: list[str] = msgspec.field(
         name="secondary-types", default_factory=list
     )
@@ -195,7 +198,9 @@ class MbManagementRelease(msgspec.Struct):
     id: str = ""
     title: str = ""
     status: str | None = None
-    status_id: str = msgspec.field(name="status-id", default="")
+    # Nullable: live-verified 2026-08-15 (release 04cd3c24-5622-4470-a77a-a338b7998b34)
+    # - see musicbrainz_MANAGEMENT_API_NOTES.md.
+    status_id: str | None = msgspec.field(name="status-id", default=None)
     quality: str | None = None
     date: str | None = None
     country: str | None = None

@@ -47,6 +47,7 @@ class BoundedMigrationOutcome:
     invariants: dict[str, int] | None = None
     blocker_reason_counts: dict[str, int] = field(default_factory=dict)
     blocker_details: list[dict[str, str]] = field(default_factory=list)
+    skipped_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -91,21 +92,31 @@ class BoundedLegacyCatalogMigrator:
         *,
         emit_progress: Callable[[str], None] = print,
         batch_size: int = BATCH_SIZE,
+        path_projector: Callable[[str], str] | None = None,
+        skip_unmappable_paths: bool = False,
+        migrated_source_keys: dict[str, set[str]] | None = None,
     ) -> None:
         self._store = store
         self._resolver = resolver
         self._batch_size = max(1, batch_size)
+        self._path_projector = path_projector or (lambda path: path)
+        self._skip_unmappable = skip_unmappable_paths
+        self._migrated_source_keys = migrated_source_keys
         self._progress = _ProgressReporter(emit_progress)
         self._builder = LegacyCatalogImporter(
             store,
             resolver,
             _NoCoverReader(),
             embedded_art_read_limit=0,
+            path_projector=self._path_projector,
         )
         self._blockers: list[str] = []
         self._blocker_details: list[dict[str, str]] = []
         self._blocker_count = 0
         self._blocker_reason_counts: Counter[str] = Counter()
+        self._skipped: Counter[str] = Counter()
+        self._scan_owned_file_ids: set[str] = set()
+        self._copy_playlists = True
         self._counts: dict[tuple[str, str | None], MigrationReferenceCount] = {
             (kind, None): MigrationReferenceCount(kind=kind) for kind in REFERENCE_KINDS
         }
@@ -114,6 +125,27 @@ class BoundedLegacyCatalogMigrator:
         self._local_only_albums = 0
         self._local_only_tracks = 0
         self._artists = 0
+
+    async def migrate_pending(
+        self, migration_id: str, *, now: float | None = None
+    ) -> BoundedMigrationOutcome:
+        """Re-run the bounded migration over rows that have no provenance yet."""
+        self._copy_playlists = False
+        self._migrated_source_keys = await self._store.get_migrated_legacy_source_keys(
+            {
+                "library_file",
+                "review_row",
+                "favorite",
+                "history",
+                "playlist_track",
+                "album_release_pin",
+                "compat_bookmark",
+                "compat_play_queue",
+                "compat_play_queue_item",
+                "jellyfin_id_map",
+            }
+        )
+        return await self.migrate(migration_id, now=now)
 
     async def migrate(
         self, migration_id: str, *, now: float | None = None
@@ -175,9 +207,11 @@ class BoundedLegacyCatalogMigrator:
                 blocker_count=self._blocker_count,
                 blocker_reason_counts=dict(self._blocker_reason_counts),
                 blocker_details=list(self._blocker_details),
+                skipped_counts=dict(self._skipped),
             )
 
-        await self._migrate_roots(migration_id, source_revision, migrated_at)
+        if self._migrated_source_keys is None:
+            await self._migrate_roots(migration_id, source_revision, migrated_at)
         await self._migrate_identified_catalog(
             migration_id,
             source_revision,
@@ -222,6 +256,7 @@ class BoundedLegacyCatalogMigrator:
                 blocker_count=self._blocker_count,
                 blocker_reason_counts=dict(self._blocker_reason_counts),
                 blocker_details=list(self._blocker_details),
+                skipped_counts=dict(self._skipped),
             )
 
         self._progress.message("Validating migrated catalog.")
@@ -265,6 +300,7 @@ class BoundedLegacyCatalogMigrator:
             report=report,
             blocker_count=0,
             invariants=invariants,
+            skipped_counts=dict(self._skipped),
         )
 
     async def _preflight_catalog(self, total: int) -> _CatalogPreflight:
@@ -274,6 +310,10 @@ class BoundedLegacyCatalogMigrator:
         processed = 0
         identified = 0
         local_only = 0
+        pending = self._migrated_source_keys is not None
+        migrated_ids = (
+            self._migrated_source_keys.get("library_file", set()) if pending else set()
+        )
         while True:
             batch = await self._store.get_bounded_legacy_library_file_preflight_batch(
                 after_id=after_id,
@@ -284,11 +324,30 @@ class BoundedLegacyCatalogMigrator:
             staged: list[
                 tuple[str, str, str, str, str, str, str, int, str]
             ] = []
+            existing_paths: set[str] = set()
+            if pending:
+                target_paths = [
+                    self._target_path(row.get("file_path")) for row in batch
+                ]
+                existing_paths = await self._store.get_existing_local_track_paths(
+                    target_paths
+                )
             for row in batch:
                 after_id = str(row.get("id") or "")
-                resolved = self._resolver.resolve(str(row.get("file_path") or ""))
+                file_id = str(row.get("id") or "")
+                if pending and file_id in migrated_ids:
+                    continue
+                target_path = self._target_path(row.get("file_path"))
+                if target_path in existing_paths:
+                    self._scan_owned_file_ids.add(file_id)
+                    self._skipped["scan_owned_library_file"] += 1
+                    continue
+                resolved = self._resolver.resolve(target_path)
                 if resolved is None:
                     self._increment("library_file", mapped=False)
+                    if self._skip_unmappable:
+                        self._skipped["library_file"] += 1
+                        continue
                     self._add_blocker(
                         f"Library file {row.get('id')} is outside every typed root.",
                         reason="library_file_outside_roots",
@@ -341,6 +400,11 @@ class BoundedLegacyCatalogMigrator:
         self._progress.start(phase, total)
         after_rowid = MIN_SQLITE_ROWID
         processed = 0
+        migrated_ids = (
+            self._migrated_source_keys.get("review_row", set())
+            if self._migrated_source_keys is not None
+            else set()
+        )
         while True:
             batch = await self._store.get_bounded_legacy_rows(
                 "manual_review_queue",
@@ -351,9 +415,17 @@ class BoundedLegacyCatalogMigrator:
                 break
             after_rowid = int(batch[-1]["__migration_rowid"])
             for row in batch:
-                if self._resolver.resolve(str(row.get("file_path") or "")) is not None:
+                if str(row.get("id") or "") in migrated_ids:
+                    continue
+                if (
+                    self._resolver.resolve(self._target_path(row.get("file_path")))
+                    is not None
+                ):
                     continue
                 self._increment("review_row", mapped=False)
+                if self._skip_unmappable:
+                    self._skipped["review_row"] += 1
+                    continue
                 self._add_blocker(
                     f"Review row {row.get('id')} is outside every typed root.",
                     reason="review_row_outside_roots",
@@ -413,6 +485,8 @@ class BoundedLegacyCatalogMigrator:
                 key = str(raw.pop("__migration_release_group"))
                 after_release_group = key
                 after_id = str(raw.get("id") or "")
+                if str(raw.get("id") or "") in self._scan_owned_file_ids:
+                    continue
                 if not segments or segments[-1][0] != key:
                     segments.append((key, []))
                 segments[-1][1].append(raw)
@@ -449,6 +523,22 @@ class BoundedLegacyCatalogMigrator:
         group_context: dict[str, Any] | None,
         first_segment: bool,
     ) -> None:
+        if self._skip_unmappable or self._migrated_source_keys is not None:
+            migrated_ids = (
+                self._migrated_source_keys.get("library_file", set())
+                if self._migrated_source_keys is not None
+                else set()
+            )
+            rows = [
+                row
+                for row in rows
+                if str(row.get("id") or "")
+                not in self._scan_owned_file_ids | migrated_ids
+                and self._resolver.resolve(self._target_path(row.get("file_path")))
+                is not None
+            ]
+            if not rows:
+                return
         if not _valid_mbid(release_group):
             raise ValidationError(
                 "The catalog preflight left an invalid identified album group."
@@ -497,7 +587,9 @@ class BoundedLegacyCatalogMigrator:
             group_context.get("created_at"), migrated_at
         )
         group_first = group_context["first"]
-        group_root = self._resolver.resolve(str(group_first.get("file_path") or ""))
+        group_root = self._resolver.resolve(
+            self._target_path(group_first.get("file_path"))
+        )
         if group_root is not None:
             bundle.membership.album.root_id = group_root.root_id
         if bundle.album_identity is not None:
@@ -661,16 +753,28 @@ class BoundedLegacyCatalogMigrator:
                 break
             after_rowid = int(batch[-1]["__migration_rowid"])
             clean = [self._without_rowid(row) for row in batch]
+            lookup_rows = [self._projected_row(row) for row in clean]
             targets = await self._store.resolve_bounded_legacy_references(
-                "review_row", clean
+                "review_row", lookup_rows
             )
             staged: list[tuple[int, str]] = []
             linked_reviews: list[MigrationReview] = []
             linked_provenance: list[MigrationProvenance] = []
+            migrated_ids = (
+                self._migrated_source_keys.get("review_row", set())
+                if self._migrated_source_keys is not None
+                else set()
+            )
             for raw, row, target in zip(batch, clean, targets, strict=True):
+                if str(row.get("id") or "") in migrated_ids:
+                    continue
                 if target is None:
-                    resolved = self._resolver.resolve(str(row.get("file_path") or ""))
+                    target_path = self._target_path(row.get("file_path"))
+                    resolved = self._resolver.resolve(target_path)
                     if resolved is None:
+                        # preflight already counted unmappable rows
+                        if self._skip_unmappable:
+                            continue
                         self._increment("review_row", mapped=False)
                         self._add_blocker(
                             f"Review row {row.get('id')} is outside every typed root.",
@@ -680,7 +784,7 @@ class BoundedLegacyCatalogMigrator:
                     parent = Path(resolved.relative_path).parent.as_posix()
                     album = str(
                         row.get("extracted_album")
-                        or Path(str(row.get("file_path") or "")).parent.name
+                        or Path(target_path).parent.name
                         or "Unknown Album"
                     )
                     staged.append(
@@ -800,7 +904,7 @@ class BoundedLegacyCatalogMigrator:
             for row in rows:
                 if row.get("resolution") is None:
                     continue
-                track_id = targets.get(str(row.get("file_path") or ""))
+                track_id = targets.get(self._target_path(row.get("file_path")))
                 if track_id is None:
                     continue
                 provenance.append(
@@ -844,11 +948,13 @@ class BoundedLegacyCatalogMigrator:
             [],
             migration_run_id=migration_id,
             source_revision=source_revision,
-            copy_playlists=True,
+            copy_playlists=self._copy_playlists,
         )
         processed = 0
+        migrated_keys = self._migrated_source_keys or {}
         for table, kind in sources:
             after_rowid = MIN_SQLITE_ROWID
+            migrated_ids = migrated_keys.get(kind, set())
             while True:
                 batch = await self._store.get_bounded_legacy_rows(
                     table,
@@ -867,6 +973,8 @@ class BoundedLegacyCatalogMigrator:
                 unlinked_history: list[dict[str, Any]] = []
                 for row, target in zip(rows, targets, strict=True):
                     source_key, user_id = self._reference_key(kind, row)
+                    if source_key in migrated_ids:
+                        continue
                     if target is None and kind == "history":
                         unlinked_history.append(row)
                         self._increment(
@@ -877,6 +985,10 @@ class BoundedLegacyCatalogMigrator:
                         )
                         continue
                     if target is None and kind in {"playlist_track", "jellyfin_id_map"}:
+                        if self._skip_unmappable:
+                            self._skipped[kind] += 1
+                            self._increment(kind, mapped=False, user_id=user_id)
+                            continue
                         tombstone = self._tombstone(kind, source_key, row, migrated_at)
                         tombstones.append(tombstone)
                         target = "reference_tombstone", tombstone.id
@@ -902,6 +1014,9 @@ class BoundedLegacyCatalogMigrator:
                             retained=retained,
                         )
                     if target is None:
+                        if self._skip_unmappable:
+                            self._skipped[kind] += 1
+                            continue
                         self._add_blocker(
                             f"{kind} reference {source_key} cannot be resolved.",
                             reason=f"{kind}_unresolved",
@@ -1243,6 +1358,12 @@ class BoundedLegacyCatalogMigrator:
     def _without_rowid(row: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in row.items() if key != "__migration_rowid"}
 
+    def _target_path(self, value: object) -> str:
+        return self._path_projector(str(value or ""))
+
+    def _projected_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {**row, "file_path": self._target_path(row.get("file_path"))}
+
     def _report(
         self,
         migration_id: str,
@@ -1271,6 +1392,7 @@ class BoundedLegacyCatalogMigrator:
             ),
             blockers=blockers,
             warnings=[],
+            skipped=dict(self._skipped),
             network_calls=0,
             tag_reads=0,
             fingerprints=0,

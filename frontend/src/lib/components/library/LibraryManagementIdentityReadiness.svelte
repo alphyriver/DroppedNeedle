@@ -210,7 +210,7 @@
 				Identity readiness
 			</h3>
 			<p class="mt-1 max-w-3xl text-sm text-base-content/60">
-				Give Library Management the exact MusicBrainz edition and per-track map it needs. The check
+				Give file organization the exact MusicBrainz edition and per-track map it needs. The check
 				never changes tags, paths, or audio.
 			</p>
 		</div>
@@ -326,8 +326,8 @@
 
 			{#if report.state === 'succeeded'}
 				<div class="alert alert-success mt-3 text-sm">
-					<Tags class="h-4 w-4" /> Catalog mappings are ready. Run a fresh Library Management preview
-					to see what is now eligible.
+					<Tags class="h-4 w-4" /> Catalog mappings are ready. Run a fresh organization preview to see
+					what is now eligible.
 				</div>
 			{/if}
 
@@ -350,8 +350,7 @@
 				{/each}
 			</div>
 			<p class="mt-3 text-xs leading-5 text-base-content/50">
-				Counts and rows reflect work that is still current. Resolved and superseded findings remain
-				in the audit history.
+				Only current findings are listed. Resolved and superseded ones stay in the audit history.
 			</p>
 
 			{#if findingsQuery.isLoading}
@@ -538,7 +537,7 @@
 		{#if confirmAction === 'apply'}
 			<p class="mt-3 text-sm text-base-content/65">
 				This writes only verified MusicBrainz identities to DroppedNeedle's catalog. It does not
-				change tags, paths, or audio. Releases may become eligible for a future Library Management
+				change tags, paths, or audio. Releases may become eligible for a future organization
 				preview.
 			</p>
 		{:else}

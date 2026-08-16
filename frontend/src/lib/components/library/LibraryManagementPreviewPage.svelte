@@ -164,19 +164,19 @@
 					button: `Undo this operation for ${applyFileLabel}`,
 					kicker: 'Undo confirmation',
 					title: 'Undo this operation from this exact preview?',
-					detail: `DroppedNeedle will restore this operation's before-state for ${applyFileLabel}. Later edits are preserved and this does not restore the broader first-management baseline.`,
+					detail: `DroppedNeedle will restore this operation's before-state for ${applyFileLabel}. Later edits are preserved and this does not restore the broader original baseline.`,
 					confirmButton: 'Undo operation'
 				};
 			case 'baseline_restore':
 				return {
 					barTitle: 'Baseline restore changes files only after confirmation',
 					barDetail:
-						'Restored files leave Library Management and can be managed again only through a new preview.',
-					button: `Restore first-management state for ${applyFileLabel}`,
-					kicker: 'First-management baseline confirmation',
-					title: 'Restore these first-management baselines?',
+						'Restored files leave file organization and can be managed again only through a new preview.',
+					button: `Restore original state for ${applyFileLabel}`,
+					kicker: 'Original baseline confirmation',
+					title: 'Restore these original baselines?',
 					detail: `DroppedNeedle will restore ${applyFileLabel} to their earliest saved state from before it first managed them. This is broader than Undo and leaves those files unmanaged.`,
-					confirmButton: 'Restore first-management state'
+					confirmButton: 'Restore original state'
 				};
 			case 'duplicate_resolution':
 				return {
@@ -317,9 +317,7 @@
 	}
 
 	function previewHeading(mode: string): string {
-		return mode === 'preview'
-			? 'Library Management preview'
-			: `${titleManagementValue(mode)} preview`;
+		return mode === 'preview' ? 'Organization preview' : `${titleManagementValue(mode)} preview`;
 	}
 
 	function quantity(value: number, singular: string, plural = `${singular}s`): string {
@@ -441,7 +439,7 @@
 	}
 </script>
 
-<svelte:head><title>Library Management preview · DroppedNeedle</title></svelte:head>
+<svelte:head><title>Organization preview · DroppedNeedle</title></svelte:head>
 
 {#snippet previewInspector(ordinal: number)}
 	{@const item = items.find((candidate) => candidate.ordinal === ordinal)}
@@ -458,7 +456,7 @@
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-7xl space-y-5">
-		<BackButton fallback="/library/management#management-controls" />
+		<BackButton fallback="/library/management?tab=organize" />
 
 		{#if previewQuery.isLoading || settingsQuery.isLoading || policyQuery.isLoading}
 			<div class="space-y-4">
@@ -466,7 +464,7 @@
 				<div class="skeleton h-72 rounded-2xl"></div>
 			</div>
 		{:else if previewQuery.isError || settingsQuery.isError || policyQuery.isError}
-			<div class="alert alert-error">Could not load this Library Management preview.</div>
+			<div class="alert alert-error">Could not load this Organization preview.</div>
 		{:else if preview}
 			<header class="management-control-room p-5 sm:p-7">
 				<div class="flex flex-wrap items-start gap-4">
@@ -584,7 +582,7 @@
 							Selecting a root chooses files; it does not choose each release's exact MusicBrainz
 							edition. Prepare identities first, then generate a fresh management preview.
 						</p>
-						<a class="btn btn-outline btn-sm mt-3" href="/library/management#identity-readiness"
+						<a class="btn btn-outline btn-sm mt-3" href="/library/management?tab=organize"
 							>Open identity readiness <ArrowRight class="h-4 w-4" /></a
 						>
 					</div>
@@ -789,8 +787,8 @@
 							<div>
 								<strong>Activation dry run</strong>
 								<p class="text-xs text-base-content/55">
-									This page is read-only. Return to the Library settings dialog to use this dry run
-									when enabling Library Management.
+									This page is read-only. Return to the Automation tab to use this dry run when
+									enabling file organization.
 								</p>
 							</div>
 						</div>
@@ -799,7 +797,7 @@
 								{jobId}
 								expectedRevision={preview.operation_row_revision}
 								profileName={preview.profile_name}
-								ondiscard={() => goto('/library/management#management-controls')}
+								ondiscard={() => goto('/library/management?tab=organize')}
 							/>
 							<a href="/settings?tab=library" class="btn btn-ghost btn-sm">Library settings</a>
 						</div>
@@ -826,7 +824,7 @@
 								{jobId}
 								expectedRevision={preview.operation_row_revision}
 								profileName={preview.profile_name}
-								ondiscard={() => goto('/library/management#management-controls')}
+								ondiscard={() => goto('/library/management?tab=organize')}
 							/>
 							<button
 								class="btn management-btn"

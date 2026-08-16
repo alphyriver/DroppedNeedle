@@ -635,6 +635,7 @@ CREATE TABLE IF NOT EXISTS library_operation_jobs (
     lease_owner TEXT,
     lease_expires_at REAL,
     heartbeat_at REAL,
+    next_attempt_at REAL,
     created_at REAL NOT NULL,
     started_at REAL,
     phase_started_at REAL,

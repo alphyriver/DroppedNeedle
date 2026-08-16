@@ -61,6 +61,12 @@ vi.mock('$lib/queries/library/LibraryPolicyQueries.svelte', () => ({
 		},
 		isLoading: false,
 		isError: false
+	}),
+	getLibraryPolicyTreeQuery: () => ({
+		data: { policy_revision: 'policy-1', roots: [] },
+		isSuccess: true,
+		isLoading: false,
+		isError: false
 	})
 }));
 vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
@@ -107,6 +113,20 @@ vi.mock('$lib/queries/library/LibraryIdentityPreparationMutations.svelte', () =>
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
 	controlLibraryOperation: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
+vi.mock('$lib/queries/library/LibraryRepairQueries.svelte', () => ({
+	getLibraryRepairsQuery: () => ({ data: { pages: [{ items: [] }] }, isLoading: false }),
+	getLibraryRepairEstimateQuery: () => ({ data: undefined, isLoading: false, isError: false }),
+	getLibraryRepairFindingsQuery: () => ({
+		data: { pages: [{ items: [] }] },
+		isLoading: false,
+		isError: false,
+		hasNextPage: false
+	})
+}));
+vi.mock('$lib/queries/library/LibraryRepairMutations.svelte', () => ({
+	createLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	applyLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
 
 import LibraryManagementControlRoom from './LibraryManagementControlRoom.svelte';
 
@@ -124,22 +144,28 @@ beforeEach(() => {
 });
 
 describe('LibraryManagementControlRoom', () => {
-	it('presents management as a separate opt-in write system', async () => {
+	it('presents organization as a separate opt-in write system', async () => {
 		render(LibraryManagementControlRoom);
-		await expect.element(page.getByRole('heading', { name: 'Library Management' })).toBeVisible();
-		await expect.element(page.getByText('Separate write system')).toBeVisible();
+		await expect.element(page.getByRole('heading', { name: 'Organize files' })).toBeVisible();
 		await expect
 			.element(
 				page.getByText(
-					'Writes tags and organizes files. Scanning and identification above remain read-only.'
+					'Writes tags and organizes files on disk - nothing changes until you review and apply a preview.'
 				)
 			)
 			.toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'Automation' }))
+			.toHaveAttribute('href', '/library/management?tab=automation');
 		await expect.element(page.getByText('Off everywhere')).toBeVisible();
 		await expect.element(page.getByRole('heading', { name: 'Identity readiness' })).toBeVisible();
+		await expect.element(page.getByRole('heading', { name: 'Repair' })).toBeVisible();
 		await expect.element(page.getByText('Need exact track maps')).toBeVisible();
 		await expect
-			.element(page.getByRole('button', { name: 'Preview library management...' }))
+			.element(page.getByRole('button', { name: 'Preview organization...' }))
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Restore original state...' }))
 			.toBeVisible();
 	});
 
@@ -152,7 +178,7 @@ describe('LibraryManagementControlRoom', () => {
 			.element(page.getByRole('alert').getByText('Recovery status is unavailable'))
 			.toBeVisible();
 		await expect
-			.element(page.getByRole('button', { name: 'Preview library management...' }))
+			.element(page.getByRole('button', { name: 'Preview organization...' }))
 			.toBeDisabled();
 	});
 
@@ -163,7 +189,7 @@ describe('LibraryManagementControlRoom', () => {
 		render(LibraryManagementControlRoom);
 
 		await expect
-			.element(page.getByRole('heading', { name: 'Restore first-management baselines' }))
+			.element(page.getByRole('heading', { name: 'Restore original state' }))
 			.toHaveFocus();
 		await page.getByRole('button', { name: 'Close manual management runner' }).click();
 

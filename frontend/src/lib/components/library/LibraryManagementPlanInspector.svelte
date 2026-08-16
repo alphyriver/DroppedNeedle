@@ -77,9 +77,7 @@
 	}
 
 	function restorationScopeLabel(value: string): string {
-		return value === 'first_management_baseline'
-			? 'First-management baseline'
-			: 'Operation before-state';
+		return value === 'first_management_baseline' ? 'Original baseline' : 'Operation before-state';
 	}
 
 	function artworkSnapshotDescription(value: ManagementRestorationArtwork): string {

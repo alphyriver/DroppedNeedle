@@ -640,7 +640,7 @@ describe('SettingsLibraryManagement', () => {
 
 	it('round-trips the explicit per-root multi-disc script mode', async () => {
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByText('Per-root profile overrides').click();
 		await page.getByRole('checkbox', { name: /Override selected profile values/ }).click();
 
@@ -673,7 +673,7 @@ describe('SettingsLibraryManagement', () => {
 
 	it('serializes the per-root effective-standard mode without a script ID', async () => {
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByText('Per-root profile overrides').click();
 		await page.getByRole('checkbox', { name: /Override selected profile values/ }).click();
 		await page.getByRole('combobox', { name: 'Multi-disc naming' }).selectOptions('standard');
@@ -802,7 +802,7 @@ describe('SettingsLibraryManagement', () => {
 		await expect.element(page.getByText(/files found/)).toHaveTextContent(/1,000.*files found/);
 		await expect.element(page.getByRole('button', { name: 'View dry run' })).toBeVisible();
 		await expect
-			.element(page.getByRole('checkbox', { name: /Configure Library Management/ }))
+			.element(page.getByRole('checkbox', { name: /Configure file organization/ }))
 			.toBeChecked();
 	});
 
@@ -889,7 +889,7 @@ describe('SettingsLibraryManagement', () => {
 			.element(page.getByRole('button', { name: 'Validate and save' }))
 			.not.toBeInTheDocument();
 
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await expect.element(page.getByRole('button', { name: 'Validate and save' })).toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Review dry run' }))
@@ -1095,14 +1095,12 @@ describe('SettingsLibraryManagement', () => {
 
 	it('blocks profile import while Library Management has unsaved changes', async () => {
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 
 		await expect.element(page.getByRole('button', { name: 'Import profile' })).toBeDisabled();
 		await expect
 			.element(
-				page.getByText(
-					'Save or discard current Library Management changes before importing a profile.'
-				)
+				page.getByText('Save or discard current organization changes before importing a profile.')
 			)
 			.toBeVisible();
 	});
@@ -1134,7 +1132,7 @@ describe('SettingsLibraryManagement', () => {
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
 		const profileRegion = page.getByRole('region', {
-			name: 'Saved Library Management profiles'
+			name: 'Saved organization profiles'
 		});
 		await expect.element(profileRegion).toHaveAttribute('tabindex', '0');
 		expect(profileRegion.getByRole('button', { name: /^Delete Profile/ }).all()).toHaveLength(4);
@@ -1385,13 +1383,13 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 
 		expect(h.update).not.toHaveBeenCalled();
 		await expect
-			.element(page.getByRole('heading', { name: 'Enable Library Management' }))
+			.element(page.getByRole('heading', { name: 'Enable file organization' }))
 			.toHaveFocus();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
 		await expect.element(page.getByText('Eligible').first()).toBeVisible();
@@ -1401,9 +1399,9 @@ describe('SettingsLibraryManagement', () => {
 			.toHaveAttribute('href', '/library/management/previews/preview-1');
 		await page.getByRole('button', { name: 'Use this dry run' }).click();
 
-		const enableButton = page.getByRole('button', { name: 'Enable Library Management' });
+		const enableButton = page.getByRole('button', { name: 'Enable file organization' });
 		await expect.element(enableButton).toBeDisabled();
-		await page.getByRole('textbox', { name: /Type CONFIRM/ }).fill('Enable Library Management');
+		await page.getByRole('textbox', { name: /Type CONFIRM/ }).fill('Enable file organization');
 		await expect.element(enableButton).toBeDisabled();
 		await page.getByRole('textbox', { name: /Type CONFIRM/ }).fill('CONFIRM');
 		await expect.element(enableButton).toBeEnabled();
@@ -1473,7 +1471,7 @@ describe('SettingsLibraryManagement', () => {
 			})
 		);
 		await expect
-			.element(page.getByRole('heading', { name: 'Enable Library Management' }))
+			.element(page.getByRole('heading', { name: 'Enable file organization' }))
 			.not.toBeInTheDocument();
 		await expect.element(page.getByText('Configuration saved')).toBeVisible();
 	});
@@ -1540,7 +1538,7 @@ describe('SettingsLibraryManagement', () => {
 		h.activation = { data: ready, isLoading: false, refetch };
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1591,7 +1589,7 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1642,7 +1640,7 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1695,12 +1693,12 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
 
-		const dialog = page.getByRole('dialog', { name: 'Enable Library Management' });
+		const dialog = page.getByRole('dialog', { name: 'Enable file organization' });
 		await expect.element(dialog.getByRole('alert')).toHaveTextContent(/stopped responding/i);
 		await expect.element(dialog.getByRole('alert')).toHaveTextContent(/1,500 files/i);
 		await expect.element(dialog.getByText('Eligible', { exact: true })).not.toBeInTheDocument();
@@ -1747,7 +1745,7 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1785,7 +1783,7 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1822,7 +1820,7 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1852,7 +1850,7 @@ describe('SettingsLibraryManagement', () => {
 		};
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 		await page.getByRole('button', { name: 'Run dry run' }).click();
@@ -1876,13 +1874,13 @@ describe('SettingsLibraryManagement', () => {
 		h.confirmActivationPending = true;
 
 		render(SettingsLibraryManagement, { roots, policyRevision: 'policy-1' });
-		await page.getByRole('checkbox', { name: /Configure Library Management/ }).click();
+		await page.getByRole('checkbox', { name: /Configure file organization/ }).click();
 		await page.getByRole('checkbox', { name: /Acquisitions/ }).click();
 		await page.getByRole('button', { name: 'Validate and save' }).click();
 
 		await expect.element(page.getByRole('button', { name: 'Close', exact: true })).toBeDisabled();
 		await expect
-			.element(page.getByRole('button', { name: 'Close Library Management activation' }))
+			.element(page.getByRole('button', { name: 'Close organization activation' }))
 			.toBeDisabled();
 	});
 
@@ -1908,7 +1906,7 @@ describe('SettingsLibraryManagement', () => {
 		await page.getByText('Retention, recycle, and refresh').click();
 		await page.getByRole('button', { name: 'Purge baselines...' }).click();
 		await expect
-			.element(page.getByRole('heading', { name: 'Purge first-management baselines?' }))
+			.element(page.getByRole('heading', { name: 'Purge original baselines?' }))
 			.toHaveFocus();
 		await expect.element(page.getByText(/permanently removes 14 baselines/)).toBeVisible();
 		await expect

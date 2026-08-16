@@ -266,7 +266,7 @@ describe('LibraryManagementPreviewPage', () => {
 			.toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Open identity readiness' }))
-			.toHaveAttribute('href', '/library/management#identity-readiness');
+			.toHaveAttribute('href', '/library/management?tab=organize');
 		await expect.element(page.getByText('TRACK NOT MAPPED')).not.toBeInTheDocument();
 		await expect.element(page.getByRole('heading', { name: 'Hot Wire' })).toBeVisible();
 		await expect.element(page.getByText('Trapeze · 1 file')).toBeVisible();
@@ -573,9 +573,7 @@ describe('LibraryManagementPreviewPage', () => {
 		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('Read-only plan · no files changed')).toBeVisible();
-		await expect
-			.element(page.getByRole('heading', { name: 'Library Management preview' }))
-			.toBeVisible();
+		await expect.element(page.getByRole('heading', { name: 'Organization preview' })).toBeVisible();
 		await expect.element(page.getByText('1 tag change', { exact: true })).toBeVisible();
 		await expect.element(page.getByText('1 path change', { exact: true })).toBeVisible();
 		await expect.element(page.getByText('0 artwork changes', { exact: true })).toBeVisible();
@@ -913,7 +911,7 @@ describe('LibraryManagementPreviewPage', () => {
 		expect(
 			sessionStorage.getItem('droppedneedle:library-management:preview-token:preview-1')
 		).toBeNull();
-		expect(h.goto).toHaveBeenCalledWith('/library/management#management-controls');
+		expect(h.goto).toHaveBeenCalledWith('/library/management?tab=organize');
 	});
 
 	it('renders a discarded audit plan without any write action', async () => {
@@ -991,13 +989,13 @@ describe('LibraryManagementPreviewPage', () => {
 			button: 'Undo this operation for 1 file',
 			title: 'Undo this operation from this exact preview?',
 			confirm: 'Undo operation',
-			detail: /does not restore the broader first-management baseline/
+			detail: /does not restore the broader original baseline/
 		},
 		{
 			mode: 'baseline_restore',
-			button: 'Restore first-management state for 1 file',
-			title: 'Restore these first-management baselines?',
-			confirm: 'Restore first-management state',
+			button: 'Restore original state for 1 file',
+			title: 'Restore these original baselines?',
+			confirm: 'Restore original state',
 			detail: /broader than Undo and leaves those files unmanaged/
 		},
 		{

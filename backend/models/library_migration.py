@@ -106,6 +106,7 @@ class MigrationDryRunReport(AppStruct):
     )
     blockers: list[str] = msgspec.field(default_factory=list)
     warnings: list[str] = msgspec.field(default_factory=list)
+    skipped: dict[str, int] = msgspec.field(default_factory=dict)
     network_calls: int = 0
     tag_reads: int = 0
     fingerprints: int = 0

@@ -86,11 +86,11 @@ export function reenableAlbumManagement() {
 			}),
 		onSuccess: async () => {
 			await invalidateLibraryCatalog();
-			toastStore.show({ message: 'Library Management re-enabled', type: 'success' });
+			toastStore.show({ message: 'File organization re-enabled', type: 'success' });
 		},
 		onError: (error) =>
 			toastStore.show({
-				message: error instanceof Error ? error.message : 'Could not re-enable Library Management',
+				message: error instanceof Error ? error.message : 'Could not re-enable file organization',
 				type: 'error'
 			})
 	}));

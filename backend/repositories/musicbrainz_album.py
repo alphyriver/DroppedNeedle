@@ -466,7 +466,10 @@ class MusicBrainzAlbumMixin:
             )
             return results
         except Exception as e:  # noqa: BLE001
-            logger.error(f"MusicBrainz album search failed: {e}")
+            # CircuitOpenError is expected while the breaker is open; the
+            # degradation record is the signal, an error log per call is spam.
+            if not isinstance(e, CircuitOpenError):
+                logger.error(f"MusicBrainz album search failed: {e}")
             _record_mb_degradation(f"album search failed: {e}")
             return []
 
@@ -513,9 +516,10 @@ class MusicBrainzAlbumMixin:
             )
             return results
         except Exception as e:  # noqa: BLE001
-            logger.error(
-                f"MusicBrainz release group tag search failed for '{tag}': {e}"
-            )
+            if not isinstance(e, CircuitOpenError):
+                logger.error(
+                    f"MusicBrainz release group tag search failed for '{tag}': {e}"
+                )
             _record_mb_degradation(f"release group tag search failed: {e}")
             return []
 
@@ -568,7 +572,8 @@ class MusicBrainzAlbumMixin:
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to fetch release group {mbid}: {e}")
+            if not isinstance(e, CircuitOpenError):
+                logger.error(f"Failed to fetch release group {mbid}: {e}")
             _record_mb_degradation(f"release group fetch failed: {e}")
             return None
 
@@ -870,7 +875,8 @@ class MusicBrainzAlbumMixin:
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to fetch release {release_id}: {e}")
+            if not isinstance(e, CircuitOpenError):
+                logger.error(f"Failed to fetch release {release_id}: {e}")
             _record_mb_degradation(f"release fetch failed: {e}")
             return None
 
@@ -1009,7 +1015,8 @@ class MusicBrainzAlbumMixin:
             )
             return matches
         except Exception as e:  # noqa: BLE001
-            logger.error(f"MusicBrainz recording search failed: {e}")
+            if not isinstance(e, CircuitOpenError):
+                logger.error(f"MusicBrainz recording search failed: {e}")
             _record_mb_degradation(f"recording search failed: {e}")
             return []
 
@@ -1054,9 +1061,10 @@ class MusicBrainzAlbumMixin:
             await self._cache.set(cache_key, rg_id or "", ttl_seconds=86400)
             return rg_id
         except Exception as e:  # noqa: BLE001
-            logger.error(
-                f"Failed to resolve recording {recording_mbid} to release group: {e}"
-            )
+            if not isinstance(e, CircuitOpenError):
+                logger.error(
+                    f"Failed to resolve recording {recording_mbid} to release group: {e}"
+                )
             _record_mb_degradation(f"recording-to-rg lookup failed: {e}")
             await self._cache.set(cache_key, "", ttl_seconds=3600)
             return None
@@ -1120,6 +1128,7 @@ class MusicBrainzAlbumMixin:
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to fetch recording {recording_id}: {e}")
+            if not isinstance(e, CircuitOpenError):
+                logger.error(f"Failed to fetch recording {recording_id}: {e}")
             _record_mb_degradation(f"recording fetch failed: {e}")
             return None

@@ -1442,6 +1442,36 @@ class PreferencesService:
         with self._cache_lock:
             self._save_typed_library_settings(settings)
 
+    def retarget_library_roots_for_upgrade(self, replacements: dict[str, str]) -> None:
+        """Retarget existing root IDs during the isolated legacy upgrade only."""
+
+        with self._cache_lock:
+            current = self.get_typed_library_settings()
+            known_ids = {root.id for root in current.library_roots}
+            if not replacements or not set(replacements).issubset(known_ids):
+                raise ConfigurationError(
+                    "The automatic upgrade supplied an unknown library root."
+                )
+            roots = [
+                LibraryRootSettings(
+                    id=root.id,
+                    path=replacements.get(root.id, root.path),
+                    label=root.label,
+                    policy=root.policy,
+                    rules=root.rules,
+                )
+                for root in current.library_roots
+            ]
+            self._save_typed_library_settings(
+                TypedLibrarySettings(
+                    library_roots=roots,
+                    staging_path=current.staging_path,
+                    naming_template=current.naming_template,
+                    acoustid_api_key=current.acoustid_api_key,
+                ),
+                allow_root_path_changes=True,
+            )
+
     def save_typed_library_settings_if_current(
         self,
         settings: TypedLibrarySettings,
@@ -1460,7 +1490,12 @@ class PreferencesService:
                 )
             self._save_typed_library_settings(settings)
 
-    def _save_typed_library_settings(self, settings: TypedLibrarySettings) -> None:
+    def _save_typed_library_settings(
+        self,
+        settings: TypedLibrarySettings,
+        *,
+        allow_root_path_changes: bool = False,
+    ) -> None:
         try:
             from services.native.library_policy_resolver import LibraryPolicyResolver
 
@@ -1468,9 +1503,12 @@ class PreferencesService:
             current_by_id = {root.id: root for root in current_settings.library_roots}
             for root in settings.library_roots:
                 previous = current_by_id.get(root.id)
-                if previous is not None and Path(previous.path).resolve(
-                    strict=False
-                ) != Path(root.path).resolve(strict=False):
+                if (
+                    not allow_root_path_changes
+                    and previous is not None
+                    and Path(previous.path).resolve(strict=False)
+                    != Path(root.path).resolve(strict=False)
+                ):
                     raise ConfigurationError(
                         f"Library root {previous.label} cannot be moved. Add a new root instead."
                     )

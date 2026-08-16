@@ -99,6 +99,7 @@ from .repo_providers import (  # noqa: F401
 from .service_providers import (  # noqa: F401
     get_library_policy_resolver,
     get_library_policy_service,
+    get_legacy_pending_migration_service,
     get_library_management_profile_service,
     get_library_management_preview_service,
     get_library_management_undo_service,
@@ -269,6 +270,7 @@ from .type_aliases import (  # noqa: F401
     CachedLocalArtworkServiceDep,
     PreferencesServiceDep,
     LibraryPolicyServiceDep,
+    LegacyPendingMigrationServiceDep,
     LibraryManagementProfileServiceDep,
     LibraryManagementPreviewServiceDep,
     LibraryManagementUndoServiceDep,

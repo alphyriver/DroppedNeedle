@@ -111,7 +111,7 @@
 </script>
 
 <section
-	class="rounded-box border border-base-content/10 bg-base-100"
+	class="rounded-box border border-base-content/15 bg-base-200/40"
 	aria-labelledby="run-history-title"
 >
 	<div class="flex items-center justify-between gap-3 border-b border-base-content/10 px-4 py-3">

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -335,6 +336,7 @@ def _service(
     fingerprinter: FakeFingerprinter,
     invalidate: AsyncMock | None = None,
     on_identified: AsyncMock | None = None,
+    provider_available: Callable[[], bool] | None = None,
 ) -> AlbumIdentificationService:
     queue = IdentificationQueueService(store)
     return AlbumIdentificationService(
@@ -345,6 +347,7 @@ def _service(
         ConditionalFingerprintService(store, fingerprinter),
         invalidate,
         on_identified,
+        provider_available=provider_available,
     )
 
 
@@ -628,6 +631,60 @@ async def test_identified_album_schedules_scan_management_after_identity_commit(
 
     assert outcome == "identified"
     callback.assert_awaited_once_with("album-1", expected_policy_revision)
+
+
+@pytest.mark.asyncio
+async def test_provider_unavailable_defers_before_candidate_recall(
+    store: NativeLibraryStore,
+) -> None:
+    """With the provider down (open breaker), a job that needs recall defers with
+    the queue's backoff instead of recalling only to short-circuit every call."""
+    await _seed_album(store)
+    job = await _claimed_job(store)
+    provider = FakeProvider()
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+        provider_available=lambda: False,
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "provider_deferred"
+    assert provider.calls == []
+    queue = IdentificationQueueService(store)
+    assert await queue.claim("worker", now=4) is None
+    assert await queue.claim("worker", now=3 + 31) is not None
+
+
+@pytest.mark.asyncio
+async def test_embedded_identity_still_identifies_while_provider_unavailable(
+    store: NativeLibraryStore,
+) -> None:
+    """Beets-style libraries (complete embedded MBIDs) must keep draining with
+    MusicBrainz fully down: the local decisions run before the provider gate."""
+    await _seed_album(
+        store,
+        embedded_group=EMBEDDED_GROUP,
+        embedded_release=EMBEDDED_RELEASE,
+        embedded_recording=EMBEDDED_RECORDING,
+        embedded_release_track=EMBEDDED_RELEASE_TRACK,
+        policy="local_metadata",
+    )
+    job = await _claimed_job(store, kind="post_processing")
+    provider = FakeProvider()
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(
+            FingerprintResult(status=FingerprintStatus.DISABLED), enabled=False
+        ),
+        provider_available=lambda: False,
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    assert provider.calls == []
 
 
 @pytest.mark.asyncio

@@ -531,6 +531,22 @@ async def lifespan(app: FastAPI):
     cache_task.add_done_callback(handle_cache_warming_error)
     TaskRegistry.get_instance().register("library-cache-warmup", cache_task)
 
+    from core.dependencies import get_legacy_pending_migration_service
+
+    pending_migration_task = asyncio.create_task(
+        get_legacy_pending_migration_service().schedule()
+    )
+    pending_migration_task.add_done_callback(
+        lambda task: logger.error(
+            "Legacy pending migration scheduling failed: %s", task.exception()
+        )
+        if not task.cancelled() and task.exception()
+        else None
+    )
+    TaskRegistry.get_instance().register(
+        "legacy-pending-migration-startup", pending_migration_task
+    )
+
     from services.cache_status_service import CacheStatusService
 
     sync_state_store = get_sync_state_store()

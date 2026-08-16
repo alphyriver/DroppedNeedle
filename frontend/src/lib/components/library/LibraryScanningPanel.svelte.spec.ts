@@ -44,7 +44,6 @@ const h = vi.hoisted(() => ({
 		isFetchingNextPage: false,
 		fetchNextPage: vi.fn()
 	} as Record<string, unknown>,
-	repairs: { data: { pages: [{ items: [] }] }, isLoading: false } as Record<string, unknown>,
 	pauseRun: vi.fn(),
 	resumeRun: vi.fn(),
 	stopRun: vi.fn(),
@@ -147,32 +146,7 @@ vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
 	}),
 	getLibraryStatsQuery: () => ({ data: { local_only_count: 9 } })
 }));
-vi.mock('$lib/queries/library/LibraryRepairQueries.svelte', () => ({
-	getLibraryRepairsQuery: () => h.repairs,
-	getLibraryRepairEstimateQuery: () => ({ data: undefined, isLoading: false, isError: false }),
-	getLibraryRepairFindingsQuery: () => ({
-		data: { pages: [{ items: [] }] },
-		isLoading: false,
-		isError: false,
-		hasNextPage: false
-	})
-}));
-vi.mock('$lib/queries/library/LibraryRepairMutations.svelte', () => ({
-	createLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	applyLibraryRepair: () => ({ mutateAsync: vi.fn(), isPending: false })
-}));
-vi.mock('./LibraryManagementControlRoom.svelte', () => {
-	const Comp = function () {};
-	Comp.prototype = {};
-	return { default: Comp };
-});
-vi.mock('./LibraryManagementActionDesk.svelte', () => {
-	const Comp = function () {};
-	Comp.prototype = {};
-	return { default: Comp };
-});
-
-import LibraryOperationsPanel from './LibraryOperationsPanel.svelte';
+import LibraryScanningPanel from './LibraryScanningPanel.svelte';
 
 function activity(
 	kind: 'scan' | 'identification',
@@ -244,23 +218,26 @@ beforeEach(() => {
 	h.requestRun.mockResolvedValue({});
 });
 
-describe('LibraryOperationsPanel', () => {
-	it('starts detailed controls expanded and keeps them collapsible', async () => {
-		render(LibraryOperationsPanel);
-		const scanDetails = page
-			.getByRole('region', { name: 'Library Scanning & Identification' })
-			.element() as HTMLDetailsElement;
-		const managementDetails = page
-			.getByRole('region', { name: 'Management details' })
-			.element() as HTMLDetailsElement;
-		expect(scanDetails.open).toBe(true);
-		expect(managementDetails.open).toBe(true);
-
-		const scanSummary = page.getByText('Scan details', { exact: true });
-		await scanSummary.click();
-		expect(scanDetails.open).toBe(false);
-		await scanSummary.click();
-		expect(scanDetails.open).toBe(true);
+describe('LibraryScanningPanel', () => {
+	it('shows the hero band with one primary action and explained secondaries', async () => {
+		h.activity = {
+			data: { items: [activity('scan'), activity('identification')] },
+			isLoading: false,
+			isError: false
+		};
+		h.runs = { data: { active: run(), queued: null }, isLoading: false, isError: false };
+		render(LibraryScanningPanel);
+		await expect.element(page.getByRole('heading', { name: 'Scan & identify' })).toBeVisible();
+		await expect.element(page.getByText(/Nothing here writes to your files/)).toBeVisible();
+		expect(page.getByRole('button', { name: 'Scan for changes' }).elements()).toHaveLength(1);
+		await expect.element(page.getByText(/Deep re-read of selected folders/)).toBeVisible();
+		await expect.element(page.getByText(/Re-runs matching for albums still waiting/)).toBeVisible();
+		await expect.element(page.getByText(/Next scan: 09:00/)).toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'Settings' }))
+			.toHaveAttribute('href', '/settings?tab=library');
+		expect(page.getByRole('button', { name: 'Pause all' }).query()).toBeNull();
+		expect(page.getByRole('button', { name: 'Resume all' }).query()).toBeNull();
 	});
 
 	it('shows separate stacked workload cards and truthful metrics', async () => {
@@ -288,10 +265,7 @@ describe('LibraryOperationsPanel', () => {
 				}
 			}
 		};
-		render(LibraryOperationsPanel);
-		await expect
-			.element(page.getByRole('region', { name: 'Library Scanning & Identification' }))
-			.toBeVisible();
+		render(LibraryScanningPanel);
 		await expect.element(page.getByRole('heading', { name: 'Local files' })).toBeVisible();
 		await expect
 			.element(page.getByRole('heading', { name: 'Identification', exact: true }))
@@ -300,11 +274,9 @@ describe('LibraryOperationsPanel', () => {
 		await expect.element(page.getByText('25 of 100')).toBeVisible();
 		await page.getByText('Root progress and phase details').click();
 		await expect.element(page.getByText('Main library · automatic')).toBeVisible();
-		await expect.element(page.getByText('12', { exact: true })).toBeVisible();
-		await expect.element(page.getByText(/It never writes tags, renames, or moves/)).toBeVisible();
 	});
 
-	it('shows identification as idle while foreground repair keeps the panel expanded', async () => {
+	it('shows identification as idle while foreground repair work runs', async () => {
 		h.activity = {
 			data: {
 				items: [
@@ -323,7 +295,7 @@ describe('LibraryOperationsPanel', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await expect.element(page.getByText('Idle').nth(1)).toBeVisible();
 		await expect.element(page.getByText('12 of 12')).toBeVisible();
 		await expect
@@ -363,12 +335,11 @@ describe('LibraryOperationsPanel', () => {
 				}
 			}
 		};
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await expect.element(page.getByText(/Whole library/).first()).toBeVisible();
 		await expect.element(page.getByText(/Queued follow-up: rescan files/)).toBeVisible();
 		await expect.element(page.getByText('Administrator retries')).toBeVisible();
 		await expect.element(page.getByText(/provider to become available/)).toBeVisible();
-		await expect.element(page.getByText(/9 local-only/)).toBeVisible();
 	});
 
 	it('projects a persisted pausing state and sends the current revision', async () => {
@@ -382,35 +353,12 @@ describe('LibraryOperationsPanel', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await expect.element(page.getByText('Pausing after the current file...')).toBeVisible();
 		await expect
 			.element(page.getByRole('button', { name: 'Pause local scan' }))
 			.not.toBeInTheDocument();
 		await expect.element(page.getByRole('button', { name: 'Stop local scan' })).toBeVisible();
-	});
-
-	it('reports each Pause all outcome when one workload fails', async () => {
-		h.activity = {
-			data: { items: [activity('scan'), activity('identification')] },
-			isLoading: false,
-			isError: false
-		};
-		h.runs = {
-			data: { active: run({ row_revision: 9 }), queued: null },
-			isLoading: false,
-			isError: false
-		};
-		h.pauseRun.mockResolvedValue({});
-		h.pauseIdentification.mockRejectedValue(new Error('stale control revision'));
-		render(LibraryOperationsPanel);
-		await page.getByRole('button', { name: 'Pause all' }).click();
-		expect(h.pauseRun).toHaveBeenCalledWith({ runId: 'run-1', expectedRevision: 9 });
-		expect(h.pauseIdentification).toHaveBeenCalledWith(7);
-		expect(h.toast).toHaveBeenCalledWith({
-			message: 'local scan paused; identification needs attention',
-			type: 'error'
-		});
 	});
 
 	it('shows exact stop confirmation and controls the durable run', async () => {
@@ -420,7 +368,7 @@ describe('LibraryOperationsPanel', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await page.getByRole('button', { name: 'Stop local scan' }).click();
 		await expect.element(page.getByRole('heading', { name: 'Stop this scan?' })).toBeVisible();
 		await expect.element(page.getByText(/Files already indexed will stay available/)).toBeVisible();
@@ -442,7 +390,7 @@ describe('LibraryOperationsPanel', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await expect
 			.element(page.getByText('Stopped because library policy changed').first())
 			.toBeVisible();
@@ -453,7 +401,7 @@ describe('LibraryOperationsPanel', () => {
 
 	it('opens the shared scoped retry preview with immutable policy IDs', async () => {
 		h.reviews = { data: { pages: [{ filtered_total: 12, catalog_revision: 42 }] } };
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await page.getByRole('button', { name: 'Retry identification...' }).click();
 		await expect.element(page.getByRole('heading', { name: 'Retry identification' })).toBeVisible();
 		await page.getByRole('checkbox').nth(1).click();
@@ -487,7 +435,7 @@ describe('LibraryOperationsPanel', () => {
 				row_revision: 2
 			}
 		};
-		render(LibraryOperationsPanel);
+		render(LibraryScanningPanel);
 		await page.getByRole('button', { name: 'Retry identification...' }).click();
 		await expect.element(page.getByText('Identification retry succeeded')).toBeVisible();
 		expect(sessionStorage.getItem('droppedneedle:identification-retry:admin-1')).toBeNull();

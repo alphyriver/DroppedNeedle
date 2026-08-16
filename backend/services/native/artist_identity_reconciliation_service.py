@@ -48,6 +48,11 @@ from services.native.background_workload_gate import BackgroundWorkloadGate
 ARTIST_RECONCILIATION_PURPOSE = "artist_identity_reconciliation"
 ARTIST_RECONCILIATION_VERSION = "musicbrainz-artist-credit-v3"
 _BACKFILL_IDEMPOTENCY_KEY = "artist-identity-reconciliation:v3:backfill"
+# Provider-deferred work must not be retried immediately: the defer re-queues the
+# job, and without a not-before the operation worker instantly re-claims the same
+# item and hot-spins against an open circuit breaker. 120 s gives the shared
+# MusicBrainz breaker (60 s timeout) a recovery window between attempts.
+_PROVIDER_DEFER_RETRY_SECONDS = 120.0
 _GROUP_NAMESPACE = uuid.UUID("4f2de7c1-3e43-53bf-9d04-0e0f7755394e")
 
 
@@ -409,6 +414,7 @@ class ArtistIdentityReconciliationService:
                         input_revision=revision,
                         reason_code="PROVIDER_DEFERRED",
                         now=now,
+                        retry_not_before=now + _PROVIDER_DEFER_RETRY_SECONDS,
                     )
             try:
                 projection = self._projection(

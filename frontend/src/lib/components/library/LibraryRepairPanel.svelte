@@ -125,7 +125,7 @@
 </script>
 
 <section
-	class="rounded-box border border-base-content/10 bg-base-100"
+	class="rounded-box border border-base-content/15 bg-base-200/40"
 	aria-labelledby="repair-title"
 >
 	<div class="flex flex-wrap items-center gap-3 p-4">
@@ -135,7 +135,7 @@
 		<div class="min-w-0 flex-1">
 			<h3 id="repair-title" class="font-semibold">Repair</h3>
 			<p class="text-sm text-base-content/55">
-				Check identities created before the safer matching rules.
+				Re-check albums matched by older identification rules.
 			</p>
 		</div>
 		<button class="btn btn-outline btn-sm" onclick={openStart}>Check existing matches</button>
@@ -149,7 +149,7 @@
 				<div class="grid gap-3 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
 					<div>
 						<div class="flex flex-wrap items-center gap-2">
-							<strong>Existing-match check</strong>
+							<strong>Identity recheck</strong>
 							<span class="badge badge-ghost badge-sm">{visibleState(repair)}</span>
 						</div>
 						<p class="mt-1 text-sm text-base-content/60">
@@ -232,7 +232,7 @@
 	{#if selected?.repair_summary}
 		<section class="border-t border-base-content/10 p-4" aria-labelledby="repair-report-title">
 			<div class="flex flex-wrap items-center justify-between gap-2">
-				<h4 id="repair-report-title" class="font-semibold">Existing-match report</h4>
+				<h4 id="repair-report-title" class="font-semibold">Recheck report</h4>
 				<button class="btn btn-ghost btn-xs" onclick={() => (selected = null)}>Close report</button>
 			</div>
 			<dl class="mt-3 grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
@@ -344,7 +344,7 @@
 			<ShieldCheck class="h-5 w-5 text-primary" /> Check existing matches
 		</h2>
 		<p class="mt-3 text-sm text-base-content/70">
-			Check current album identities against the safer matching rules. This scan does not change
+			Check current album identities against the latest matching rules. This scan does not change
 			your library or files.
 		</p>
 		<fieldset class="mt-4 space-y-2">

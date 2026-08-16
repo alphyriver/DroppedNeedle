@@ -265,6 +265,20 @@ def get_library_policy_service() -> "LibraryPolicyService":
 
 
 @singleton
+def get_legacy_pending_migration_service() -> "LegacyPendingMigrationService":
+    from services.native.legacy_pending_migration_service import (
+        LegacyPendingMigrationService,
+    )
+
+    from .cache_providers import get_native_library_store
+
+    return LegacyPendingMigrationService(
+        get_native_library_store(),
+        get_library_policy_resolver,
+    )
+
+
+@singleton
 def get_library_management_profile_service() -> "LibraryManagementProfileService":
     from services.native.library_management_profile_service import (
         LibraryManagementProfileService,
@@ -482,6 +496,7 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
     from services.native.conditional_fingerprint_service import (
         ConditionalFingerprintService,
     )
+    from repositories.musicbrainz_base import mb_circuit_breaker
 
     from .cache_providers import get_native_library_store
 
@@ -505,6 +520,7 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
         ConditionalFingerprintService(store, get_audio_fingerprinter()),
         invalidate,
         _schedule_identified_album_work,
+        provider_available=lambda: not mb_circuit_breaker.is_open(),
     )
 
 

@@ -181,7 +181,7 @@ describe('LibraryManagementRunner', () => {
 		});
 
 		await expect
-			.element(page.getByRole('heading', { name: 'Preview Library Management' }))
+			.element(page.getByRole('heading', { name: 'Preview file organization' }))
 			.toHaveFocus();
 		await page.getByRole('button', { name: 'Tracks' }).click();
 		await page.getByRole('textbox', { name: 'Search library tracks' }).fill('track');
@@ -223,7 +223,7 @@ describe('LibraryManagementRunner', () => {
 			onclose: vi.fn()
 		});
 		await expect
-			.element(page.getByRole('heading', { name: 'Restore first-management baselines' }))
+			.element(page.getByRole('heading', { name: 'Restore original state' }))
 			.toBeVisible();
 		await page.getByRole('button', { name: /Continue/ }).click();
 		await expect.element(page.getByText(/separate from Undo/)).toBeVisible();

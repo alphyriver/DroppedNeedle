@@ -304,8 +304,8 @@
 				<section class="space-y-2">
 					<h3 class="font-semibold">Legacy import naming template</h3>
 					<p class="text-xs text-base-content/60">
-						Fallback for downloaded imports that Library Management does not handle. Once management
-						is enabled, its assigned profile controls managed paths. Variables:
+						Fallback for downloaded imports that file organization does not handle. Once
+						organization is enabled, its assigned profile controls managed paths. Variables:
 						{'{albumartist} {album} {year} {disc} {track} {title} {ext}'}.
 					</p>
 					<input
@@ -428,14 +428,14 @@
 				<div class="management-write-mark"><FolderCog class="h-6 w-6" /></div>
 				<div class="min-w-0 flex-1">
 					<p class="management-kicker">Administrator workspace</p>
-					<h3 class="font-display text-lg font-semibold">Library Management</h3>
+					<h3 class="font-display text-lg font-semibold">Organize files</h3>
 					<p class="mt-1 text-sm text-base-content/60">
-						Profiles, automatic write access, dry runs, recovery and operation history now live
-						together in the Library Management control room.
+						Profiles, automatic write access, dry runs, and recovery live in the Library Management
+						workspace under the Automation tab.
 					</p>
 				</div>
-				<a href="/library/management#management-settings" class="btn management-btn btn-sm"
-					>Open Library Management <ArrowRight class="h-4 w-4" /></a
+				<a href="/library/management?tab=automation" class="btn management-btn btn-sm"
+					>Open Organize files settings <ArrowRight class="h-4 w-4" /></a
 				>
 			</section>
 		{/if}

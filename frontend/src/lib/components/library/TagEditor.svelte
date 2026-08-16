@@ -202,7 +202,7 @@
 					Edit tags for {track.title}
 				</h2>
 				<p class="mt-1 text-sm text-base-content/55">
-					Changes are previewed, journalled, validated, and published through Library Management.
+					Changes are previewed, journalled, validated, and published through file organization.
 				</p>
 			</div>
 			<button

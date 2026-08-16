@@ -94,6 +94,7 @@ NPM    ?= pnpm
 	backend-test-subsonic-security backend-test-subsonic-hosted backend-test-navidrome-folders \
 	test-subsonic \
 	backend-test-peer-review-fixes \
+	backend-test-upgrade-path-reconciliation \
 	backend-test-feedback-fixes \
 	frontend-test-feedback-fixes \
 	backend-test-local-only-mbsub-phase1 \
@@ -556,6 +557,15 @@ backend-test-username-login: $(BACKEND_VENV_STAMP) ## Run Phase 1 username-login
 backend-test-peer-review-fixes: $(BACKEND_VENV_STAMP) ## Run peer review fix regression tests
 	$(PYTEST) tests/test_peer_review_fixes.py -v
 
+backend-test-upgrade-path-reconciliation: $(BACKEND_VENV_STAMP) ## Run automatic upgrade path reconciliation tests
+	$(PYTEST) tests/infrastructure/test_legacy_path_reconciler.py \
+		tests/infrastructure/test_legacy_pending_migration.py \
+		tests/infrastructure/test_legacy_catalog_importer.py \
+		tests/infrastructure/test_bounded_legacy_catalog_migrator.py \
+		tests/infrastructure/test_automatic_upgrade.py \
+		tests/services/test_preferences_library_settings.py \
+		tests/routes/test_library_policy_routes.py -v
+
 backend-test-feedback-fixes: $(BACKEND_VENV_STAMP) ## Feedback Fixes focused backend tests
 	$(PYTEST) tests/services/native tests/benchmarks \
 		tests/compat/test_feedback_fixes_contract.py \
@@ -563,6 +573,7 @@ backend-test-feedback-fixes: $(BACKEND_VENV_STAMP) ## Feedback Fixes focused bac
 		tests/infrastructure/test_native_library_store_dependencies.py \
 		tests/infrastructure/test_legacy_catalog_importer.py \
 		tests/infrastructure/test_bounded_legacy_catalog_migrator.py \
+		tests/infrastructure/test_legacy_path_reconciler.py \
 		tests/infrastructure/test_maintenance_manifest.py \
 		tests/infrastructure/test_feedback_fixes_maintenance.py \
 		tests/infrastructure/test_automatic_upgrade.py \

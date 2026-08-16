@@ -86,11 +86,11 @@
 	}
 </script>
 
-<svelte:head><title>Library Management history · DroppedNeedle</title></svelte:head>
+<svelte:head><title>Organization history · DroppedNeedle</title></svelte:head>
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-6xl space-y-5">
-		<BackButton fallback="/library/management#management-controls" />
+		<BackButton fallback="/library/management?tab=organize" />
 
 		<header class="management-control-room p-5 sm:p-7">
 			<div class="flex items-start gap-4">
@@ -99,12 +99,10 @@
 					<p class="management-kicker">
 						<ShieldAlert class="h-3.5 w-3.5" /> Administrator audit trail
 					</p>
-					<h1 class="mt-1 font-display text-2xl font-bold sm:text-3xl">
-						Library Management history
-					</h1>
+					<h1 class="mt-1 font-display text-2xl font-bold sm:text-3xl">Organization history</h1>
 					<p class="mt-2 text-sm text-base-content/60">
-						Durable previews, writes, undo, baseline restores, and collision resolutions. Ordinary
-						scans are not mixed into this history.
+						Previews, writes, undo, baseline restores, and collision resolutions. Scans are not
+						included here.
 					</p>
 				</div>
 			</div>
@@ -203,13 +201,13 @@
 				<div class="skeleton h-24 rounded-xl"></div>
 			</div>
 		{:else if historyQuery.isError || settingsQuery.isError || policyQuery.isError}
-			<div class="alert alert-error">Could not load Library Management history.</div>
+			<div class="alert alert-error">Could not load organization history.</div>
 		{:else if historyItems.length === 0}
 			<div class="rounded-2xl border border-dashed border-base-content/15 p-10 text-center">
 				<FolderCog class="mx-auto h-7 w-7 text-base-content/35" />
 				<p class="mt-2 font-semibold">No matching management work</p>
 				<p class="text-sm text-base-content/50">
-					Change the filters or create a manual preview from the Library control room.
+					Change the filters or create a manual preview from the Organize files tab.
 				</p>
 			</div>
 		{:else}

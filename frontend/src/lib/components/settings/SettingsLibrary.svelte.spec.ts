@@ -167,15 +167,15 @@ describe('SettingsLibrary target policy UI', () => {
 		render(SettingsLibrary);
 		await expect.element(page.getByText('Scanning & identification')).toBeVisible();
 		await expect
-			.element(page.getByRole('link', { name: /Open Library Management/ }))
+			.element(page.getByRole('link', { name: /Open Organize files settings/ }))
 			.not.toBeInTheDocument();
 	});
 
 	it('sends administrators to the dedicated Library Management configuration', async () => {
 		render(SettingsLibrary);
 		await expect
-			.element(page.getByRole('link', { name: /Open Library Management/ }))
-			.toHaveAttribute('href', '/library/management#management-settings');
+			.element(page.getByRole('link', { name: /Open Organize files settings/ }))
+			.toHaveAttribute('href', '/library/management?tab=automation');
 		await expect.element(page.getByText('Administrator workspace')).toBeVisible();
 	});
 

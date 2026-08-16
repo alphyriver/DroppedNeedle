@@ -85,7 +85,7 @@
 			No music file, tag, baseline, or completed operation is changed.
 		</p>
 		<p class="mt-2 text-xs text-base-content/50">
-			The discarded plan remains in Library Management history as an audit record.
+			The discarded plan remains in organization history as an audit record.
 		</p>
 		{#if errorMessage}<div class="alert alert-error mt-3 text-sm" role="alert">
 				{errorMessage}

@@ -266,7 +266,7 @@
 				artists.
 			</p>
 		</div>
-		<a href="/library/management#scanning-controls" class="btn btn-ghost btn-sm">
+		<a href="/library/management?tab=scanning" class="btn btn-ghost btn-sm">
 			Back to Scan &amp; identify
 		</a>
 	</header>

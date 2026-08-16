@@ -7,6 +7,7 @@ import hashlib
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID as UUIDType, uuid5
@@ -200,11 +201,13 @@ class LegacyCatalogImporter:
         cover_reader: EmbeddedCoverReaderProtocol,
         *,
         embedded_art_read_limit: int = MAX_EMBEDDED_ART_READS_PER_REHEARSAL,
+        path_projector: Callable[[str], str] | None = None,
     ) -> None:
         self._store = store
         self._resolver = policy_resolver
         self._cover_reader = cover_reader
         self._embedded_art_read_limit = max(0, embedded_art_read_limit)
+        self._path_projector = path_projector or (lambda path: path)
 
     async def prepare(
         self, migration_id: str, *, now: float | None = None
@@ -329,7 +332,8 @@ class LegacyCatalogImporter:
         by_release_group: dict[str, list[dict[str, object]]] = defaultdict(list)
         local_only_rows: list[tuple[dict[str, object], str, str]] = []
         for row in active_files:
-            resolved = self._resolver.resolve(str(row.get("file_path") or ""))
+            path = self._path_projector(str(row.get("file_path") or ""))
+            resolved = self._resolver.resolve(path)
             if resolved is None:
                 plan.blockers.append(
                     f"Library file {row.get('id')} is outside every typed root."
@@ -623,14 +627,15 @@ class LegacyCatalogImporter:
         provenance: list[MigrationProvenance] = []
         for row in rows:
             file_id = str(row.get("id"))
-            resolved = self._resolver.resolve(str(row.get("file_path") or ""))
+            path = self._path_projector(str(row.get("file_path") or ""))
+            resolved = self._resolver.resolve(path)
             if resolved is None:
                 plan.blockers.append(
                     f"Library file {file_id} is outside every typed root."
                 )
                 self._increment(counts, "library_file", mapped=False)
                 continue
-            path_map[str(row.get("file_path"))] = (file_id, album_id)
+            path_map[path] = (file_id, album_id)
             track_map[file_id] = file_id
             mtime_ns = int(_as_float(row.get("file_mtime")) * 1_000_000_000)
             stat_revision = exact_stat_revision(
@@ -651,7 +656,7 @@ class LegacyCatalogImporter:
                     id=file_id,
                     local_album_id=album_id,
                     root_id=resolved.root_id,
-                    file_path=str(row.get("file_path")),
+                    file_path=path,
                     relative_path=resolved.relative_path,
                     path_hash=_hash([resolved.root_id, resolved.relative_path]),
                     file_size_bytes=_as_int(row.get("file_size_bytes")),
@@ -977,7 +982,7 @@ class LegacyCatalogImporter:
     ) -> None:
         grouped: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
         for row in snapshot["manual_review_queue"]:
-            path = str(row.get("file_path") or "")
+            path = self._path_projector(str(row.get("file_path") or ""))
             resolution = row.get("resolution")
             linked = path_map.get(path)
             if linked is not None:
@@ -1041,9 +1046,10 @@ class LegacyCatalogImporter:
                 ),
             ):
                 review_id = str(row.get("id"))
-                path = str(row.get("file_path"))
+                source_path = str(row.get("file_path") or "")
+                path = self._path_projector(source_path)
                 resolved = self._resolver.resolve(path)
-                track_id = _stable_id("review-track", f"{review_id}:{path}")
+                track_id = _stable_id("review-track", f"{review_id}:{source_path}")
                 track_map[track_id] = track_id
                 path_map[path] = (track_id, album_id)
                 excluded = row.get("resolution") == "rejected"
@@ -1422,7 +1428,7 @@ class LegacyCatalogImporter:
             if row.get("resolution") is not None
         ]
         for row in decisions:
-            linked = path_map.get(str(row.get("file_path")))
+            linked = path_map.get(self._path_projector(str(row.get("file_path") or "")))
             self._reference(
                 plan,
                 counts,

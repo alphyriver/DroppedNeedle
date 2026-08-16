@@ -286,7 +286,7 @@ export function retryHeldManagementUnit() {
 		onError: (err: unknown) => {
 			void invalidateTasks();
 			toastStore.show({
-				message: errorMessage(err, 'Library Management still needs attention'),
+				message: errorMessage(err, 'File organization still needs attention'),
 				type: 'error'
 			});
 		}

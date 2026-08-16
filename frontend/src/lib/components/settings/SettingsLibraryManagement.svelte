@@ -485,8 +485,7 @@
 				settings: proposed,
 				expected_settings_revision: sourceRevision
 			});
-			if (impact.stale)
-				throw new Error('Library Management settings changed. Reload and try again.');
+			if (impact.stale) throw new Error('Organization settings changed. Reload and try again.');
 			const activeAffected = impact.affected_root_ids.filter((rootId) => {
 				const assignment = proposed.root_assignments.find((value) => value.root_id === rootId);
 				return Boolean(
@@ -524,8 +523,7 @@
 			sourceRevision = saved.settings_revision;
 			resetActivationSession();
 		} catch (error) {
-			saveError =
-				error instanceof Error ? error.message : 'Could not save Library Management settings.';
+			saveError = error instanceof Error ? error.message : 'Could not save organization settings.';
 			throw error;
 		}
 	}
@@ -729,7 +727,7 @@
 			activationDialog.close();
 		} catch (error) {
 			activationError =
-				error instanceof Error ? error.message : 'Could not enable Library Management.';
+				error instanceof Error ? error.message : 'Could not enable file organization.';
 		}
 	}
 
@@ -799,7 +797,7 @@
 				tabindex="-1"
 				class="font-display text-xl font-semibold"
 			>
-				Library Management
+				Automation
 			</h2>
 			<p class="mt-1 text-sm text-base-content/65">
 				Writes tags and moves files. It is separate from scanning and remains off until an
@@ -818,7 +816,7 @@
 			<div class="skeleton h-48 rounded-xl"></div>
 		</div>
 	{:else if settingsQuery.isError || !draft}
-		<div class="m-5 alert alert-error">Could not load Library Management settings.</div>
+		<div class="m-5 alert alert-error">Could not load organization settings.</div>
 	{:else}
 		<div class="space-y-6 p-5 sm:p-6">
 			<section class="space-y-3" aria-labelledby="management-profiles-title">
@@ -826,10 +824,10 @@
 					<div>
 						<p class="management-step">01 · Profiles</p>
 						<h3 id="management-profiles-title" class="font-display text-lg font-semibold">
-							Choose what “managed” means
+							Choose what "managed" means
 						</h3>
 						<p class="text-xs text-base-content/55">
-							Choose one library default below. Profiles remain inert until a root is activated.
+							Choose one library default below. Profiles do nothing until you assign one to a root.
 						</p>
 					</div>
 				</div>
@@ -838,7 +836,7 @@
 				<div
 					class="management-profile-grid"
 					role="region"
-					aria-label="Saved Library Management profiles"
+					aria-label="Saved organization profiles"
 					tabindex="0"
 				>
 					{#each profiles as profile (profile.id)}
@@ -967,14 +965,14 @@
 						class="btn btn-outline btn-sm"
 						disabled={hasUnsavedSettings}
 						title={hasUnsavedSettings
-							? 'Save or discard current Library Management changes before importing.'
+							? 'Save or discard current organization changes before importing.'
 							: undefined}
 						onclick={() => (importProfileOpen = true)}
 						><FileUp class="h-4 w-4" /> Import profile</button
 					>
 				</div>
 				{#if hasUnsavedSettings}<p class="text-xs text-warning">
-						Save or discard current Library Management changes before importing a profile.
+						Save or discard current organization changes before importing a profile.
 					</p>{/if}
 			</section>
 
@@ -982,11 +980,11 @@
 				<div>
 					<p class="management-step">02 · Root automation</p>
 					<h3 id="management-roots-title" class="font-display text-lg font-semibold">
-						Assign deliberately
+						Choose where writes are allowed
 					</h3>
 					<p class="text-xs text-base-content/55">
-						Scanning reads and identifies. These controls separately authorize future writes within
-						each root.
+						Scanning reads and identifies. These controls separately allow future writes in each
+						root.
 					</p>
 				</div>
 				<div class="space-y-3">
@@ -1040,7 +1038,7 @@
 												enabled: event.currentTarget.checked
 											}))}
 									/><span
-										><strong>Configure Library Management for this root</strong><small
+										><strong>Configure file organization for this root</strong><small
 											>This alone starts nothing. Choose and confirm automatic triggers below.</small
 										></span
 									></label
@@ -1061,7 +1059,9 @@
 													automatic_acquisitions: event.currentTarget.checked
 												}))}
 										/><span
-											><strong>Acquisitions</strong><small>Soulseek and Usenet units.</small></span
+											><strong>Acquisitions</strong><small
+												>Applies to new Soulseek and Usenet downloads.</small
+											></span
 										></label
 									>
 									<label class="management-trigger"
@@ -1338,7 +1338,7 @@
 					<div class="rounded-xl border border-error/20 bg-error/5 p-3 sm:col-span-2">
 						<div class="flex flex-wrap items-center justify-between gap-3">
 							<div>
-								<strong class="text-sm">First-management baselines</strong>
+								<strong class="text-sm">Original baselines</strong>
 								<p class="text-xs text-base-content/55">
 									Independent of Undo. Purging permanently removes the oldest restoration point.
 								</p>
@@ -1479,7 +1479,7 @@
 			tabindex="-1"
 			class="font-display text-xl font-semibold"
 		>
-			Enable Library Management
+			Enable file organization
 		</h2>
 		<p class="mt-2 text-sm text-base-content/65">
 			Nothing is enabled until a current dry run exists for every affected root and you confirm the
@@ -1504,8 +1504,8 @@
 			<section class="mt-5 rounded-xl border border-base-content/10 bg-base-100/65 p-4">
 				<h3 class="font-semibold">Dry run · {currentActivationRoot.label}</h3>
 				<p class="mt-1 text-xs text-base-content/55">
-					Previews the selected profile against this root. It reads files and writes only the
-					durable preview.
+					Previews the selected profile against this root. It reads files and writes only the saved
+					preview.
 				</p>
 				{#if activationProfile}
 					<div
@@ -1573,7 +1573,7 @@
 								aria-hidden="true"
 							></span><span
 								><strong class="block text-base-content/80">Discovering the root</strong>File and
-								release totals appear after the first durable planning checkpoint.</span
+								release totals appear after the first planning checkpoint.</span
 							>
 						</div>{/if}
 					{#if activationReady}<div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -1651,12 +1651,10 @@
 							role="alert"
 						>
 							<ShieldAlert class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" /><span
-								><strong class="block">Planning stopped responding</strong>The last durable
-								checkpoint contains {(
-									activationQuery.data.summary.item_count ?? 0
-								).toLocaleString()}
-								files. No music files changed. Stop this dry run, then start a fresh one; planning will
-								safely resume from a new durable operation.</span
+								><strong class="block">Planning stopped responding</strong>The last saved checkpoint
+								contains {(activationQuery.data.summary.item_count ?? 0).toLocaleString()}
+								files. No music files changed. Stop this dry run, then start a fresh one; planning resumes
+								from a new operation.</span
 							>
 						</div>
 					{:else if activationQuery.data.state === 'queued'}<div
@@ -1732,14 +1730,12 @@
 						!activationCoversCurrentDraft}
 					onclick={() => void enableManagement()}
 					>{#if confirmActivation.isPending}<span class="loading loading-spinner loading-sm"
-						></span>{/if} Enable Library Management</button
+						></span>{/if} Enable file organization</button
 				>{/if}
 		</div>
 	</div>
 	<form method="dialog" class="modal-backdrop">
-		<button aria-label="Close Library Management activation" disabled={activationPending}
-			>close</button
-		>
+		<button aria-label="Close organization activation" disabled={activationPending}>close</button>
 	</form>
 </dialog>
 
@@ -1803,7 +1799,7 @@
 			tabindex="-1"
 			class="text-lg font-bold"
 		>
-			Purge first-management baselines?
+			Purge original baselines?
 		</h2>
 		{#if purgeImpact.data}<div class="mt-3 space-y-3 text-sm">
 				<p>

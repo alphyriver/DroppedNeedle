@@ -242,9 +242,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 		await expect
 			.element(page.getByText('Compilation or live edition needs confirmation'))
 			.toBeVisible();
-		await expect
-			.element(page.getByText(/Counts and rows reflect work that is still current/))
-			.toBeVisible();
+		await expect.element(page.getByText(/Only current findings are listed/)).toBeVisible();
 		await expect.element(page.getByRole('link', { name: 'Open release' })).not.toBeInTheDocument();
 	});
 

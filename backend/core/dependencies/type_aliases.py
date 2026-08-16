@@ -147,6 +147,7 @@ from .repo_providers import (
 )
 from .service_providers import (
     get_library_policy_service,
+    get_legacy_pending_migration_service,
     get_library_management_profile_service,
     get_library_management_preview_service,
     get_library_management_undo_service,
@@ -226,6 +227,10 @@ CachedLocalArtworkServiceDep = Annotated[
 PreferencesServiceDep = Annotated[PreferencesService, Depends(get_preferences_service)]
 LibraryPolicyServiceDep = Annotated[
     LibraryPolicyService, Depends(get_library_policy_service)
+]
+LegacyPendingMigrationServiceDep = Annotated[
+    "LegacyPendingMigrationService",
+    Depends(get_legacy_pending_migration_service),
 ]
 LibraryManagementProfileServiceDep = Annotated[
     LibraryManagementProfileService,

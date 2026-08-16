@@ -351,6 +351,7 @@ class AlbumIdentificationService:
         fingerprints: ConditionalFingerprintService,
         invalidate: CacheInvalidator | None = None,
         on_identified: PostIdentificationCallback | None = None,
+        provider_available: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._queue = queue
@@ -359,6 +360,7 @@ class AlbumIdentificationService:
         self._fingerprints = fingerprints
         self._invalidate = invalidate
         self._on_identified = on_identified
+        self._provider_available = provider_available
 
     async def run_claimed_job(
         self,
@@ -414,6 +416,21 @@ class AlbumIdentificationService:
                         reason_code="NO_EXTERNAL_RESULT",
                     )
             if decision is None:
+                # Fail fast while the provider is down: defer (with the queue's
+                # backoff) instead of recalling candidates only for every call to
+                # short-circuit on the open breaker. Embedded/local-metadata
+                # decisions above are unaffected and keep draining.
+                if (
+                    self._provider_available is not None
+                    and not self._provider_available()
+                ):
+                    await self._queue.defer(
+                        job,
+                        worker_id,
+                        "PROVIDER_TEMPORARILY_UNAVAILABLE",
+                        now=timestamp,
+                    )
+                    return "provider_deferred"
                 cached_release_groups: list[str] = []
                 for track, row in zip(tracks, raw_tracks, strict=True):
                     cached = await self._store.get_fingerprint_outcome(

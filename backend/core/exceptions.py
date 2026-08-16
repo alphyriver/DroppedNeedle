@@ -36,6 +36,16 @@ class ServiceDisabledUpstreamError(DroppedNeedleException):
     provider's endpoints are healthy)."""
 
 
+class InvalidExternalPayloadError(ExternalServiceError):
+    """A provider answered successfully but its payload violates the verified
+    response schema (e.g. a MusicBrainz field that arrives as JSON null but was
+    modelled as required). Deterministic per payload: it must not count as a
+    service-health failure on the shared circuit breaker (pass through
+    ``non_breaking_exceptions`` at the ``with_retry`` call site) - the service is
+    healthy, the schema expectation was wrong. Stays an ExternalServiceError so
+    callers degrade through their normal paths."""
+
+
 class ResourceNotFoundError(DroppedNeedleException):
     pass
 
