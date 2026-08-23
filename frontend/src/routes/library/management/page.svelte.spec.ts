@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
 					rules: []
 				}
 			],
+			enabled: true,
 			policy_revision: 'policy-1'
 		},
 		isLoading: false,
@@ -169,6 +170,22 @@ describe('Library Management route page', () => {
 			})
 		);
 		expect(h.scanningRender).not.toHaveBeenCalled();
+	});
+
+	it('shows disabled states for organize and automation when the library is off', async () => {
+		h.settings = {
+			data: { ...(h.settings.data as Record<string, unknown>), enabled: false },
+			isLoading: false,
+			isError: false
+		};
+		h.appPage.url = new URL('https://music.example.test/library/management?tab=organize');
+		render(LibraryManagementPage);
+		await expect.element(page.getByText('The local library is disabled').first()).toBeVisible();
+		expect(h.organizeRender).not.toHaveBeenCalled();
+		h.appPage.url = new URL('https://music.example.test/library/management?tab=automation');
+		render(LibraryManagementPage);
+		await expect.element(page.getByText('The local library is disabled').nth(1)).toBeVisible();
+		expect(h.settingsRender).not.toHaveBeenCalled();
 	});
 
 	it('shows live-work badges on the matching tab labels', async () => {

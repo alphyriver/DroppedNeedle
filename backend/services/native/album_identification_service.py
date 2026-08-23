@@ -374,10 +374,12 @@ class AlbumIdentificationService:
             str(job["local_album_id"])
         )
         if context is None:
-            await self._queue.defer(
+            # The album row is gone or retired: durable catalog state, so fail
+            # terminally (auditable) instead of deferring until the cap.
+            await self._queue.fail(
                 job, worker_id, "SUBJECT_NOT_AVAILABLE", now=timestamp
             )
-            return "provider_deferred"
+            return "attention"
         raw_tracks: list[dict] = [
             row for row in context["tracks"] if row["availability"] == "indexed"
         ]

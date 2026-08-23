@@ -299,6 +299,19 @@
 		await applyCandidate(candidate, true, 'leave_unmanaged');
 	}
 
+	async function leaveUnmanagedWithoutCandidate(): Promise<void> {
+		const job = operation.data;
+		if (!job) return;
+		await selectCandidate.mutateAsync({
+			jobId: job.id,
+			expectedRevision: job.row_revision,
+			candidateKey: '',
+			confirmation: true,
+			decisionMode: 'leave_unmanaged'
+		});
+		dialog.close();
+	}
+
 	async function prepareEditionConversion(candidate: Candidate): Promise<void> {
 		if (!candidate.evidence.release_mbid) return;
 		const result = await conversionPreflight.mutateAsync({
@@ -1130,6 +1143,17 @@
 							oncheck={checkFoundEdition}
 							checking={start.isPending}
 						/>
+						<div class="mt-3 flex items-center gap-2">
+							<button
+								class="btn btn-outline btn-sm"
+								disabled={selectCandidate.isPending}
+								onclick={() => void leaveUnmanagedWithoutCandidate().catch(() => undefined)}
+								>Leave unmanaged</button
+							>
+							<p class="text-xs text-base-content/50">
+								Keep valid release-group and recording links and pause management warnings.
+							</p>
+						</div>
 					</div>
 				{/if}
 

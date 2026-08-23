@@ -1,4 +1,4 @@
-import { page } from '@vitest/browser/context';
+import { cdp, page } from '@vitest/browser/context';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
@@ -33,6 +33,22 @@ import BaseImage from './BaseImage.svelte';
 
 const validMbid = 'b1392450-e666-3926-a536-22c65f834433';
 const cdnUrl = 'https://r2.theaudiodb.com/images/media/artist/thumb/abc123.jpg';
+
+interface FetchCdpSession {
+	send(
+		method: 'Fetch.enable',
+		params: { patterns: Array<{ urlPattern: string }> }
+	): Promise<unknown>;
+	send(method: 'Fetch.disable'): Promise<unknown>;
+}
+
+// hold CDN requests so the remote img deterministically stalls: the fake key 404s whenever
+// the real network beats the fake-timer clock, and then the stall path is never exercised
+async function holdCdnRequests(): Promise<() => Promise<unknown>> {
+	const session = cdp() as unknown as FetchCdpSession;
+	await session.send('Fetch.enable', { patterns: [{ urlPattern: 'https://r2.theaudiodb.com/*' }] });
+	return () => session.send('Fetch.disable');
+}
 
 function renderComponent(
 	overrides: Partial<{
@@ -213,15 +229,44 @@ describe('BaseImage.svelte - warming skeleton', () => {
 		vi.useRealTimers();
 	});
 
-	it('settles an unresolved direct image even when the browser emits no load or error event', async () => {
+	it('falls back to the covers proxy when a direct image emits neither load nor error', async () => {
+		const releaseCdn = await holdCdnRequests();
 		vi.useFakeTimers();
-		renderComponent({ remoteUrl: cdnUrl, imageType: 'artist', lazy: false });
+		try {
+			renderComponent({ remoteUrl: cdnUrl, imageType: 'artist', lazy: false });
 
-		await vi.advanceTimersByTimeAsync(6500);
+			await vi.advanceTimersByTimeAsync(6500);
 
-		await expect.element(page.getByTestId('cover-fallback')).toBeInTheDocument();
-		await expect.element(page.getByTestId('cover-skeleton')).not.toBeInTheDocument();
-		vi.useRealTimers();
+			// the CDN branch must be gone: shimmer is back and the img points at the covers proxy
+			await expect.element(page.getByTestId('cover-fallback')).not.toBeInTheDocument();
+			await expect.element(page.getByTestId('cover-skeleton')).toBeInTheDocument();
+			await expect
+				.element(page.getByAltText('Test Image'))
+				.toHaveAttribute('src', `/api/v1/covers/artist/${validMbid}?size=250`);
+		} finally {
+			vi.useRealTimers();
+			await releaseCdn();
+		}
+	});
+
+	it('keeps the direct image when it loads before the settle deadline', async () => {
+		const releaseCdn = await holdCdnRequests();
+		vi.useFakeTimers();
+		try {
+			renderComponent({ remoteUrl: cdnUrl, imageType: 'artist', lazy: false });
+
+			await vi.advanceTimersByTimeAsync(4000);
+			page.getByAltText('Test Image').element().dispatchEvent(new Event('load'));
+			await vi.advanceTimersByTimeAsync(3000);
+
+			await expect
+				.element(page.getByAltText('Test Image'))
+				.toHaveAttribute('src', `${cdnUrl}/small`);
+			await expect.element(page.getByTestId('cover-fallback')).not.toBeInTheDocument();
+		} finally {
+			vi.useRealTimers();
+			await releaseCdn();
+		}
 	});
 
 	it('replaces a settled fallback when shared warming succeeds later', async () => {

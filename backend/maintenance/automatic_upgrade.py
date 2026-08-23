@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 UPGRADE_ID = "feedback-fixes-v1"
 MIGRATION_ID = "automatic-feedback-fixes-v1"
+_PUBLISH_VERIFY_ATTEMPTS = 10
+_PUBLISH_VERIFY_INTERVAL_SECONDS = 0.25
 _MARKER = "legacy_catalog_import_complete"
 _SOURCE_REVISION_PATH = Path("/app/.droppedneedle-source-revision")
 _ADMISSION_TOKEN_ENV = "DROPPEDNEEDLE_TARGET_ADMISSION_TOKEN"
@@ -109,6 +111,15 @@ def _sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _wait_for_content(path: Path, expected_sha256: str) -> bool:
+    for attempt in range(_PUBLISH_VERIFY_ATTEMPTS):
+        if _sha256(path) == expected_sha256:
+            return True
+        if attempt + 1 < _PUBLISH_VERIFY_ATTEMPTS:
+            time.sleep(_PUBLISH_VERIFY_INTERVAL_SECONDS)
+    return False
+
+
 def _database_has_marker(database: Path) -> bool:
     if not database.is_file():
         return False
@@ -145,10 +156,38 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
 
 def _write_state(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, payload)
+    try:
+        atomic_write_json(path, payload)
+    except OSError:
+        logger.warning("automatic_upgrade.state_rename_failed_using_direct_write")
+        _write_state_direct(path, payload)
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
     _fsync_directory(path.parent)
+    if _wait_for_state(path, payload):
+        return
+    logger.warning("automatic_upgrade.state_write_result_stale_using_direct_write")
+    _write_state_direct(path, payload)
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+    if not _wait_for_state(path, payload):
+        raise OSError(
+            "The upgrade state file could not be verified after writing: " + str(path)
+        )
+
+
+def _write_state_direct(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _wait_for_state(path: Path, payload: dict[str, Any]) -> bool:
+    for attempt in range(_PUBLISH_VERIFY_ATTEMPTS):
+        if _read_state(path) == payload:
+            return True
+        if attempt + 1 < _PUBLISH_VERIFY_ATTEMPTS:
+            time.sleep(_PUBLISH_VERIFY_INTERVAL_SECONDS)
+    return False
 
 
 def _read_state(path: Path) -> dict[str, Any] | None:
@@ -301,6 +340,15 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _copy_file_in_place(source: Path, destination: Path) -> None:
+    with source.open("rb") as source_handle, destination.open("wb") as target_handle:
+        shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+        target_handle.flush()
+        os.fsync(target_handle.fileno())
+    shutil.copystat(source, destination)
+    _fsync_directory(destination.parent)
+
+
 def _replace_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(
@@ -312,8 +360,26 @@ def _replace_file(source: Path, destination: Path) -> None:
             target_handle.flush()
             os.fsync(target_handle.fileno())
         shutil.copystat(source, temporary)
-        os.replace(temporary, destination)
-        _fsync_directory(destination.parent)
+        expected = _sha256(temporary)
+        try:
+            os.replace(temporary, destination)
+        except OSError:
+            logger.warning("automatic_upgrade.file_rename_failed_using_copy_fallback")
+            renamed = False
+        else:
+            _fsync_directory(destination.parent)
+            renamed = _wait_for_content(destination, expected)
+            if not renamed:
+                logger.warning(
+                    "automatic_upgrade.file_rename_result_stale_using_copy_fallback"
+                )
+        if not renamed:
+            _copy_file_in_place(source, destination)
+            if not _wait_for_content(destination, expected):
+                raise OSError(
+                    "The upgraded file could not be verified after installation: "
+                    + str(destination)
+                )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -327,10 +393,35 @@ def _replace_database(source: Path, destination: Path) -> None:
         _sqlite_backup(source, temporary)
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
+        expected = _sha256(temporary)
         for suffix in ("-wal", "-shm"):
             Path(f"{destination}{suffix}").unlink(missing_ok=True)
-        os.replace(temporary, destination)
-        _fsync_directory(destination.parent)
+        try:
+            os.replace(temporary, destination)
+        except OSError:
+            logger.warning("automatic_upgrade.file_rename_failed_using_copy_fallback")
+            renamed = False
+        else:
+            _fsync_directory(destination.parent)
+            renamed = _wait_for_content(destination, expected)
+            if not renamed:
+                logger.warning(
+                    "automatic_upgrade.file_rename_result_stale_using_copy_fallback"
+                )
+        if not renamed:
+            # truncate first: a backup onto an existing database rewrites header
+            # counters, so it would never hash-match the temporary
+            with destination.open("wb") as destination_handle:
+                destination_handle.truncate(0)
+                destination_handle.flush()
+                os.fsync(destination_handle.fileno())
+            _sqlite_backup(source, destination)
+            _fsync_directory(destination.parent)
+            if not _wait_for_content(destination, expected):
+                raise OSError(
+                    "The upgraded library database could not be verified "
+                    "after installation."
+                )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -749,6 +840,7 @@ def run_automatic_copy_upgrade(
             "image_version": image_version,
             "backup_directory": str(backup.directory),
             "error_type": type(error).__name__,
+            "error_message": str(error),
             "restored_signature": _current_signature(database, config),
         }
         failure_evidence = getattr(error, "evidence", None)
@@ -760,8 +852,9 @@ def run_automatic_copy_upgrade(
         except OSError:
             logger.error("automatic_upgrade.failure_state_write_failed")
         logger.error(
-            "automatic_upgrade.failed error_type=%s",
+            "automatic_upgrade.failed error_type=%s error_message=%s",
             type(error).__name__,
+            str(error),
         )
         raise AutomaticUpgradeError(
             "The library upgrade could not be completed. Your previous database and "

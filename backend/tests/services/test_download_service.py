@@ -1097,6 +1097,38 @@ async def test_import_held_places_and_resolves(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_import_held_without_library_root_propagates_and_stays_held(tmp_path):
+    """No library root configured: the ConfigurationError propagates to the route's
+    400 mapping and the row stays held - the user restores a root and retries."""
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    fp.place_held_file = AsyncMock(
+        side_effect=ConfigurationError(
+            "No library root is configured - restore one in Settings → Library, then try again."
+        )
+    )
+    svc = _held_service(store, fp)
+    store.resolve_held_import = AsyncMock()
+
+    with pytest.raises(ConfigurationError, match="No library root is configured"):
+        await svc.import_held(hid, "user-a", "user")
+
+    store.resolve_held_import.assert_not_awaited()  # NOT resolved: retry stays possible
+    svc._orchestrator.settle_after_manual_import.assert_not_awaited()
+    held = await store.list_held_imports("user-a", "user")
+    assert [value.id for value in held] == [hid]
+    assert await store.has_unresolved_held_for_task("t-1") is True
+
+
+@pytest.mark.asyncio
 async def test_import_held_unknown_id_raises_not_found(tmp_path):
     import threading
 

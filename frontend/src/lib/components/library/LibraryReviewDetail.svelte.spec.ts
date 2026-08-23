@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
 	detach: vi.fn(),
 	exclude: vi.fn(),
 	restore: vi.fn(),
+	dismiss: vi.fn(),
 	retry: vi.fn(),
 	accept: vi.fn()
 }));
@@ -24,7 +25,9 @@ vi.mock('$lib/queries/library/LibraryReviewMutations.svelte', () => ({
 					? h.detach
 					: action === 'exclude'
 						? h.exclude
-						: h.restore,
+						: action === 'dismiss'
+							? h.dismiss
+							: h.restore,
 		isPending: false
 	}),
 	acceptLibraryReviewCandidate: () => ({ mutateAsync: h.accept, isPending: false }),
@@ -352,5 +355,33 @@ describe('LibraryReviewDetail', () => {
 			window.removeEventListener('unhandledrejection', recordUnhandled);
 			restoreRandomUuid();
 		}
+	});
+
+	it('dismisses a review directly without a confirmation dialog', async () => {
+		const data = detail(false);
+		data.available_actions = ['dismiss', 'exclude', 'retry', 'keep_tagged'];
+		h.query = { data, isLoading: false, isError: false };
+		h.dismiss.mockResolvedValue(undefined);
+		render(LibraryReviewDetail, {
+			props: { reviewId: 'review-1', onclose: vi.fn() }
+		} as unknown as Parameters<typeof render>[1]);
+
+		const dismissButton = page.getByRole('button', { name: 'Dismiss' });
+		await expect.element(dismissButton).toBeVisible();
+		await dismissButton.click();
+		expect(h.dismiss).toHaveBeenCalledWith(
+			expect.objectContaining({
+				reviewId: 'review-1',
+				body: expect.objectContaining({
+					expected_review_revision: 4,
+					expected_catalog_revision: 9,
+					expected_identity_revision: null,
+					confirmation: false
+				})
+			})
+		);
+		await expect
+			.element(page.getByRole('heading', { name: 'Dismiss review?' }))
+			.not.toBeInTheDocument();
 	});
 });

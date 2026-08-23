@@ -16,6 +16,7 @@ MB_RECORDING_PREFIX = "mb:recording:"
 MB_RECORDING_SEARCH_PREFIX = "mb:recording:search:"
 MB_RECORDING_TO_RG_PREFIX = "mb:recording_to_rg:"
 MB_ARTIST_RELS_PREFIX = "mb:artist_rels:"
+MB_ARTIST_RGS_PREFIX = "mb:artist_rgs:"
 MB_ARTISTS_BY_TAG_PREFIX = "mb_artists_by_tag:"
 MB_RG_BY_TAG_PREFIX = "mb_rg_by_tag:"
 MB_URL_RESOLUTION_PREFIX = "mb:url:resolution:"
@@ -152,6 +153,7 @@ def musicbrainz_prefixes() -> list[str]:
         MB_RECORDING_SEARCH_PREFIX,
         MB_RECORDING_TO_RG_PREFIX,
         MB_ARTIST_RELS_PREFIX,
+        MB_ARTIST_RGS_PREFIX,
         MB_ARTISTS_BY_TAG_PREFIX,
         MB_RG_BY_TAG_PREFIX,
         MB_URL_RESOLUTION_PREFIX,
@@ -286,6 +288,10 @@ def mb_album_search_key(
 
 def mb_artist_detail_key(mbid: str) -> str:
     return f"{MB_ARTIST_DETAIL_PREFIX}{mbid}"
+
+
+def mb_artist_release_groups_key(artist_mbid: str) -> str:
+    return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}"
 
 
 def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str:

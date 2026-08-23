@@ -44,16 +44,18 @@ class NavidromePlaybackService:
     def get_stream_url(self, song_id: str) -> str:
         return self._navidrome.build_stream_url(song_id)
 
-    async def proxy_head(self, item_id: str) -> Response:
+    async def proxy_head(self, item_id: str, user_id: str | None = None) -> Response:
         """Proxy a HEAD request to Navidrome and return a FastAPI Response."""
-        result: StreamProxyResult = await self._navidrome.proxy_head_stream(item_id)
+        repo = await self._repo_for(user_id)
+        result: StreamProxyResult = await repo.proxy_head_stream(item_id)
         return Response(status_code=200, headers=result.headers)
 
     async def proxy_stream(
-        self, item_id: str, range_header: str | None = None
+        self, item_id: str, range_header: str | None = None, user_id: str | None = None
     ) -> StreamingResponse:
         """Proxy a GET stream from Navidrome and return a FastAPI StreamingResponse."""
-        result: StreamProxyResult = await self._navidrome.proxy_get_stream(
+        repo = await self._repo_for(user_id)
+        result: StreamProxyResult = await repo.proxy_get_stream(
             item_id, range_header=range_header
         )
         return StreamingResponse(

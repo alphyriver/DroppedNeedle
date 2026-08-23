@@ -424,9 +424,14 @@ async def warm_navidrome_mbid_cache(service_getter=None) -> None:
         try:
             service = service_getter()
             await service.warm_mbid_cache()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error("Navidrome MBID cache warming failed: %s", e, exc_info=True)
-        await asyncio.sleep(14400)
+        try:
+            await asyncio.sleep(14400)
+        except asyncio.CancelledError:
+            break
 
 
 async def warm_plex_mbid_cache(service_getter=None) -> None:
@@ -441,9 +446,14 @@ async def warm_plex_mbid_cache(service_getter=None) -> None:
             service = service_getter()
             await service.warm_mbid_cache()
             await service.persist_if_dirty()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error("Plex MBID cache warming failed: %s", e, exc_info=True)
-        await asyncio.sleep(14400)
+        try:
+            await asyncio.sleep(14400)
+        except asyncio.CancelledError:
+            break
 
 
 async def warm_artist_discovery_cache_periodically(
@@ -762,154 +772,159 @@ async def warm_audiodb_cache_periodically(
 
     while True:
         try:
-            await asyncio.sleep(_AUDIODB_SWEEP_INTERVAL)
-
-            if workload_gate is not None:
-                await workload_gate.wait_until_available()
-
-            settings = preferences_service.get_advanced_settings()
-            if not settings.audiodb_enabled:
-                continue
-
-            cursor = preferences_service.get_setting("audiodb_sweep_cursor")
-            all_items = await library_db.get_enrichment_candidates(
-                after_mbid=cursor,
-                limit=_AUDIODB_SWEEP_MAX_ITEMS,
+            await _run_audiodb_sweep_cycle(
+                audiodb_image_service,
+                library_db,
+                preferences_service,
+                precache_service,
+                workload_gate,
             )
-            if not all_items:
-                preferences_service.save_setting("audiodb_sweep_cursor", None)
-                preferences_service.save_setting("audiodb_sweep_last_completed", time())
-                continue
-
-            items_needing_refresh: list[tuple[str, str, dict]] = []
-            inspected_cursor = cursor
-            inspection_complete = True
-            for entity_type, mbid, data in all_items:
-                if workload_gate is not None and workload_gate.scan_active:
-                    inspection_complete = False
-                    break
-                inspected_cursor = f"{entity_type}:{mbid}"
-                if len(items_needing_refresh) >= _AUDIODB_SWEEP_MAX_ITEMS:
-                    break
-                if entity_type == "artist":
-                    cached = await audiodb_image_service.get_cached_artist_images(mbid)
-                else:
-                    cached = await audiodb_image_service.get_cached_album_images(mbid)
-                if cached is None:
-                    items_needing_refresh.append((entity_type, mbid, data))
-
-            if not items_needing_refresh:
-                page_complete = inspection_complete and (
-                    len(all_items) < _AUDIODB_SWEEP_MAX_ITEMS
-                )
-                preferences_service.save_setting(
-                    "audiodb_sweep_cursor", None if page_complete else inspected_cursor
-                )
-                if page_complete:
-                    preferences_service.save_setting(
-                        "audiodb_sweep_last_completed", time()
-                    )
-                continue
-
-            processed = 0
-            processed_cursor = cursor
-            bytes_ok = 0
-            bytes_fail = 0
-            for entity_type, mbid, data in items_needing_refresh:
-                if workload_gate is not None and workload_gate.scan_active:
-                    break
-                if not preferences_service.get_advanced_settings().audiodb_enabled:
-                    break
-
-                try:
-                    if entity_type == "artist":
-                        name = data.get("name") if isinstance(data, dict) else None
-                        result = (
-                            await audiodb_image_service.fetch_and_cache_artist_images(
-                                mbid,
-                                name,
-                                is_monitored=True,
-                            )
-                        )
-                        if (
-                            result
-                            and not result.is_negative
-                            and result.thumb_url
-                            and precache_service
-                        ):
-                            if await precache_service._download_audiodb_bytes(
-                                result.thumb_url, "artist", mbid
-                            ):
-                                bytes_ok += 1
-                            else:
-                                bytes_fail += 1
-                    else:
-                        artist_name = (
-                            data.get("artist_name")
-                            if isinstance(data, dict)
-                            else getattr(data, "artist_name", None)
-                        )
-                        album_name = (
-                            data.get("title")
-                            if isinstance(data, dict)
-                            else getattr(data, "title", None)
-                        )
-                        result = (
-                            await audiodb_image_service.fetch_and_cache_album_images(
-                                mbid,
-                                artist_name=artist_name,
-                                album_name=album_name,
-                                is_monitored=True,
-                            )
-                        )
-                        if (
-                            result
-                            and not result.is_negative
-                            and result.album_thumb_url
-                            and precache_service
-                        ):
-                            if await precache_service._download_audiodb_bytes(
-                                result.album_thumb_url, "album", mbid
-                            ):
-                                bytes_ok += 1
-                            else:
-                                bytes_fail += 1
-                except Exception as e:
-                    logger.error(
-                        "audiodb.sweep action=item_error entity_type=%s mbid=%s error=%s",
-                        entity_type,
-                        mbid[:8],
-                        e,
-                        exc_info=True,
-                    )
-
-                processed += 1
-                processed_cursor = f"{entity_type}:{mbid}"
-                if processed % _AUDIODB_SWEEP_CURSOR_PERSIST_INTERVAL == 0:
-                    preferences_service.save_setting(
-                        "audiodb_sweep_cursor", processed_cursor
-                    )
-
-                await asyncio.sleep(_AUDIODB_SWEEP_INTER_ITEM_DELAY)
-
-            if processed >= len(items_needing_refresh) and inspection_complete:
-                page_complete = len(all_items) < _AUDIODB_SWEEP_MAX_ITEMS
-                preferences_service.save_setting(
-                    "audiodb_sweep_cursor", None if page_complete else inspected_cursor
-                )
-                if page_complete:
-                    preferences_service.save_setting(
-                        "audiodb_sweep_last_completed", time()
-                    )
-            else:
-                preferences_service.save_setting(
-                    "audiodb_sweep_cursor", processed_cursor
-                )
-
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error("AudioDB sweep cycle failed: %s", e, exc_info=True)
+        try:
+            await asyncio.sleep(_AUDIODB_SWEEP_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
+async def _run_audiodb_sweep_cycle(
+    audiodb_image_service: "AudioDBImageService",
+    library_db: "LibraryDB",
+    preferences_service: "PreferencesService",
+    precache_service: "LibraryPrecacheService | None",
+    workload_gate: "BackgroundWorkloadGate | None",
+) -> None:
+    if workload_gate is not None:
+        await workload_gate.wait_until_available()
+
+    settings = preferences_service.get_advanced_settings()
+    if not settings.audiodb_enabled:
+        return
+
+    cursor = preferences_service.get_setting("audiodb_sweep_cursor")
+    all_items = await library_db.get_enrichment_candidates(
+        after_mbid=cursor,
+        limit=_AUDIODB_SWEEP_MAX_ITEMS,
+    )
+    if not all_items:
+        preferences_service.save_setting("audiodb_sweep_cursor", None)
+        preferences_service.save_setting("audiodb_sweep_last_completed", time())
+        return
+
+    items_needing_refresh: list[tuple[str, str, dict]] = []
+    inspected_cursor = cursor
+    inspection_complete = True
+    for entity_type, mbid, data in all_items:
+        if workload_gate is not None and workload_gate.scan_active:
+            inspection_complete = False
+            break
+        inspected_cursor = f"{entity_type}:{mbid}"
+        if len(items_needing_refresh) >= _AUDIODB_SWEEP_MAX_ITEMS:
+            break
+        if entity_type == "artist":
+            cached = await audiodb_image_service.get_cached_artist_images(mbid)
+        else:
+            cached = await audiodb_image_service.get_cached_album_images(mbid)
+        if cached is None:
+            items_needing_refresh.append((entity_type, mbid, data))
+
+    if not items_needing_refresh:
+        page_complete = inspection_complete and (
+            len(all_items) < _AUDIODB_SWEEP_MAX_ITEMS
+        )
+        preferences_service.save_setting(
+            "audiodb_sweep_cursor", None if page_complete else inspected_cursor
+        )
+        if page_complete:
+            preferences_service.save_setting("audiodb_sweep_last_completed", time())
+        return
+
+    processed = 0
+    processed_cursor = cursor
+    bytes_ok = 0
+    bytes_fail = 0
+    for entity_type, mbid, data in items_needing_refresh:
+        if workload_gate is not None and workload_gate.scan_active:
+            break
+        if not preferences_service.get_advanced_settings().audiodb_enabled:
+            break
+
+        try:
+            if entity_type == "artist":
+                name = data.get("name") if isinstance(data, dict) else None
+                result = await audiodb_image_service.fetch_and_cache_artist_images(
+                    mbid,
+                    name,
+                    is_monitored=True,
+                )
+                if (
+                    result
+                    and not result.is_negative
+                    and result.thumb_url
+                    and precache_service
+                ):
+                    if await precache_service._download_audiodb_bytes(
+                        result.thumb_url, "artist", mbid
+                    ):
+                        bytes_ok += 1
+                    else:
+                        bytes_fail += 1
+            else:
+                artist_name = (
+                    data.get("artist_name")
+                    if isinstance(data, dict)
+                    else getattr(data, "artist_name", None)
+                )
+                album_name = (
+                    data.get("title")
+                    if isinstance(data, dict)
+                    else getattr(data, "title", None)
+                )
+                result = await audiodb_image_service.fetch_and_cache_album_images(
+                    mbid,
+                    artist_name=artist_name,
+                    album_name=album_name,
+                    is_monitored=True,
+                )
+                if (
+                    result
+                    and not result.is_negative
+                    and result.album_thumb_url
+                    and precache_service
+                ):
+                    if await precache_service._download_audiodb_bytes(
+                        result.album_thumb_url, "album", mbid
+                    ):
+                        bytes_ok += 1
+                    else:
+                        bytes_fail += 1
+        except Exception as e:
+            logger.error(
+                "audiodb.sweep action=item_error entity_type=%s mbid=%s error=%s",
+                entity_type,
+                mbid[:8],
+                e,
+                exc_info=True,
+            )
+
+        processed += 1
+        processed_cursor = f"{entity_type}:{mbid}"
+        if processed % _AUDIODB_SWEEP_CURSOR_PERSIST_INTERVAL == 0:
+            preferences_service.save_setting("audiodb_sweep_cursor", processed_cursor)
+
+        await asyncio.sleep(_AUDIODB_SWEEP_INTER_ITEM_DELAY)
+
+    if processed >= len(items_needing_refresh) and inspection_complete:
+        page_complete = len(all_items) < _AUDIODB_SWEEP_MAX_ITEMS
+        preferences_service.save_setting(
+            "audiodb_sweep_cursor", None if page_complete else inspected_cursor
+        )
+        if page_complete:
+            preferences_service.save_setting("audiodb_sweep_last_completed", time())
+    else:
+        preferences_service.save_setting("audiodb_sweep_cursor", processed_cursor)
 
 
 def start_audiodb_sweep_task(
@@ -1342,18 +1357,19 @@ async def prune_recycle_bin_periodically(
     await asyncio.sleep(600)
     while True:
         try:
-            policy = preferences_service.get_download_policy()
             library = preferences_service.get_typed_library_settings()
-            bin_path = resolve_bin_path(
-                policy.recycle_bin_path,
-                [root.path for root in library.library_roots],
-            )
-            if bin_path is not None:
-                removed = await asyncio.to_thread(
-                    prune, bin_path, policy.recycle_retention_days
+            if library.enabled:
+                policy = preferences_service.get_download_policy()
+                bin_path = resolve_bin_path(
+                    policy.recycle_bin_path,
+                    [root.path for root in library.library_roots],
                 )
-                if removed:
-                    logger.info("Recycle bin prune removed %d entries", removed)
+                if bin_path is not None:
+                    removed = await asyncio.to_thread(
+                        prune, bin_path, policy.recycle_retention_days
+                    )
+                    if removed:
+                        logger.info("Recycle bin prune removed %d entries", removed)
         except asyncio.CancelledError:
             break
         except Exception as e:

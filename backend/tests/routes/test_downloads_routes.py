@@ -10,6 +10,7 @@ from api.v1.routes import downloads
 from core.dependencies import get_download_service
 from core.exceptions import (
     ConflictError,
+    ConfigurationError,
     PermissionDeniedError,
     ResourceNotFoundError,
     ValidationError,
@@ -536,6 +537,21 @@ def test_discard_management_hold_returns_album_level_result():
     assert response.status_code == 200
     assert response.json() == {"status": "discarded", "files": 10}
     service.discard_management_hold.assert_awaited_once_with("t1", "admin-1", "admin")
+
+
+def test_import_held_without_library_root_is_400_configuration_error():
+    """Empty roots at 'Import anyway' time surfaces as an actionable 400, not a 500."""
+    service = AsyncMock()
+    service.import_held.side_effect = ConfigurationError(
+        "No library root is configured - restore one in Settings → Library, then try again."
+    )
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/import")
+
+    assert response.status_code == 400
+    body = response.json()["error"]
+    assert body["code"] == "CONFIGURATION_ERROR"
+    assert "library root" in body["message"]
 
 
 def test_held_audio_streams_file_and_supports_range(tmp_path):

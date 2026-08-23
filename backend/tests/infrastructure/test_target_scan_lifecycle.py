@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
@@ -110,14 +112,16 @@ def _coordinator(
     *,
     tag_read_timeout_seconds: float = 30.0,
     max_detached_tag_reads: int = 4,
+    walk_deadline_seconds: float = 30.0,
     on_indexed_album: Callable[[str], Awaitable[object]] | None = None,
     clock: Callable[[], float] = lambda: 1_800_000_000.0,
 ) -> LibraryScanCoordinator:
     reader = tag_reader or _TagReader()
-    scanner = (
-        LibraryInventoryScanner(store)
-        if directory_walker is None
-        else LibraryInventoryScanner(store, directory_walker=directory_walker)
+    walker_kwargs: dict[str, DirectoryWalker] = {}
+    if directory_walker is not None:
+        walker_kwargs["directory_walker"] = directory_walker
+    scanner = LibraryInventoryScanner(
+        store, walk_deadline_seconds=walk_deadline_seconds, **walker_kwargs
     )
     return LibraryScanCoordinator(
         store,
@@ -699,6 +703,80 @@ async def test_one_walk_incremental_tag_revisions_and_no_repeat(
         str(tracks[0]["local_album_id"]),
         str(tracks[0]["local_album_id"]),
     ]
+
+
+@pytest.mark.asyncio
+async def test_walk_permission_error_fails_run_and_records_failed_path(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+
+    def denied_walk(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "Permission denied", str(root / "secret"))
+        yield
+
+    coordinator = _coordinator(target_store, resolver, directory_walker=denied_walk)
+    await coordinator.request_run(_request(resolver))
+    failed = await coordinator.run_once({"root-a": root})
+
+    assert failed is not None and failed.state == "failed"
+    assert failed.terminal_code == "ROOT_PERMISSION_DENIED"
+    failures, next_cursor = await target_store.list_scan_run_failures(failed.id)
+    assert next_cursor is None
+    assert [
+        (failure.failure_code, failure.relative_path, failure.phase)
+        for failure in failures
+    ] == [("WALK_EACCES", "secret", "discovering")]
+
+
+@pytest.mark.asyncio
+async def test_wedged_walk_fails_bounded_and_the_next_run_claims(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track-1.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield (str(root), [], ["track-1.flac"])
+            wedged.wait()
+            return
+        yield from os.walk(str(root), followlinks=False)
+
+    coordinator = _coordinator(
+        target_store,
+        resolver,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    try:
+        await coordinator.request_run(_request(resolver))
+        started = time.monotonic()
+        failed = await asyncio.wait_for(
+            coordinator.run_once({"root-a": root}), timeout=10
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        wedged.set()
+
+    assert elapsed < 5.0
+    assert failed is not None and failed.state == "failed"
+    assert failed.terminal_code == "WALK_TIMEOUT"
+    failures, _cursor = await target_store.list_scan_run_failures(failed.id)
+    assert [failure.failure_code for failure in failures] == ["WALK_TIMEOUT"]
+    assert await coordinator.run_once({"root-a": root}) is None
+
+    await coordinator.request_run(_request(resolver, trigger="automatic"))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
 
 
 @pytest.mark.asyncio

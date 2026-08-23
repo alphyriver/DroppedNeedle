@@ -99,7 +99,7 @@ async def test_non_image_payload_is_not_stored_in_memory_cache(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_artist_transient_fetch_failure_does_not_write_negative_cache(tmp_path, monkeypatch):
+async def test_artist_transient_fetch_failure_writes_transient_negative(tmp_path, monkeypatch):
     async with httpx.AsyncClient() as http_client:
         cache = MagicMock()
         repo = CoverArtRepository(http_client=http_client, cache=cache, cache_dir=tmp_path)
@@ -116,7 +116,11 @@ async def test_artist_transient_fetch_failure_does_not_write_negative_cache(tmp_
         result = await repo.get_artist_image(ARTIST_MBID, size=500)
 
         assert result is None
-        repo._disk_cache.write_negative.assert_not_awaited()
+        repo._disk_cache.write_negative.assert_awaited_once()
+        assert (
+            repo._disk_cache.write_negative.await_args.kwargs["ttl_seconds"]
+            == coverart_repository_module.COVER_TRANSIENT_NEGATIVE_TTL_SECONDS
+        )
 
 
 @pytest.mark.asyncio

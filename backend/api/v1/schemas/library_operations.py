@@ -347,6 +347,17 @@ class RepairApplyRequest(AppStruct):
     confirmation: bool
 
 
+class SuggestedEditionSummary(AppStruct):
+    release_mbid: str
+    release_group_mbid: str
+    title: str
+    track_count: int
+    competing_count: int
+    date: str | None = None
+    country: str | None = None
+    status: str | None = None
+
+
 class RepairFindingResponse(AppStruct):
     id: str
     local_album_id: str
@@ -362,6 +373,7 @@ class RepairFindingResponse(AppStruct):
     apply_eligible: bool
     state: str
     apply_result: str | None = None
+    suggested_edition: SuggestedEditionSummary | None = None
     updated_at: float = 0.0
     row_revision: int = 1
 

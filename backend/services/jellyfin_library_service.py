@@ -239,6 +239,20 @@ class JellyfinLibraryService:
             tracks=tracks,
         )
 
+    async def resolve_album_mbid(self, album_id: str) -> str | None:
+        """Map a Jellyfin album GUID to its MusicBrainz release-group MBID.
+
+        Reads ProviderIds.MusicBrainzReleaseGroup, falling back to
+        MusicBrainzAlbum - the same precedence JellyfinAlbumDetail uses.
+        Returns None when the album or its provider ids are unavailable
+        (get_album_detail degrades to None on upstream failure).
+        """
+        item = await self._jellyfin.get_album_detail(album_id)
+        if not item:
+            return None
+        pids = item.provider_ids or {}
+        return pids.get("MusicBrainzReleaseGroup") or pids.get("MusicBrainzAlbum")
+
     async def get_artists(
         self, limit: int = 50, offset: int = 0
     ) -> list[JellyfinArtistSummary]:
@@ -584,6 +598,21 @@ class JellyfinLibraryService:
                 return JellyfinImportResult(droppedneedle_playlist_id=re_check.id, already_imported=True)
             raise
 
+        # Map each distinct Jellyfin album GUID to its MusicBrainz MBID so the
+        # stored album_id can match the MBID-keyed local catalog (#150). One
+        # deduped fetch per album; failures keep the GUID (today's behavior).
+        album_mbids: dict[str, str] = {}
+        distinct_album_ids = sorted({t.album_id for t in detail.tracks if t.album_id})
+        if distinct_album_ids:
+            resolved = await asyncio.gather(
+                *(self.resolve_album_mbid(guid) for guid in distinct_album_ids)
+            )
+            album_mbids = {
+                guid: mbid
+                for guid, mbid in zip(distinct_album_ids, resolved)
+                if mbid
+            }
+
         track_dicts = []
         failed = 0
         for t in detail.tracks:
@@ -595,7 +624,7 @@ class JellyfinLibraryService:
                     "duration": t.duration_seconds,
                     "track_source_id": t.id,
                     "source_type": "jellyfin",
-                    "album_id": t.album_id,
+                    "album_id": album_mbids.get(t.album_id) or t.album_id,
                     "artist_id": t.artist_id,
                     "track_number": t.track_number,
                     "disc_number": t.disc_number,

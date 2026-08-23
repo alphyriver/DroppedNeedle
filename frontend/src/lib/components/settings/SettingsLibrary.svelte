@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { AlertTriangle, ArrowRight, CheckCircle2, FolderCog, ScanSearch } from 'lucide-svelte';
+	import { ApiError } from '$lib/api/client';
 	import {
 		getLibraryRestorableRootsQuery,
 		getTargetLibrarySettingsQuery
@@ -41,6 +42,7 @@
 	let template = $state('');
 	let acoustidKey = $state('');
 	let roots = $state<LibraryRootSettings[]>([]);
+	let libraryEnabled = $state(true);
 	let seeded = $state(false);
 	let savedSettings = $state<TargetLibrarySettingsResponse | null>(null);
 	let impactDialog: HTMLDialogElement;
@@ -67,6 +69,7 @@
 				...root,
 				rules: root.rules.map((rule) => ({ ...rule }))
 			}));
+			libraryEnabled = data.enabled ?? true;
 			seeded = true;
 		}
 	});
@@ -85,13 +88,29 @@
 		maxLibraryGb && maxLibraryGb > 0 ? Math.min(100, (usedGb / maxLibraryGb) * 100) : 0
 	);
 	const hasKey = $derived(Boolean(acoustidKey));
+	const settingsBlockedMessage = $derived(
+		!settingsQuery.isLoading && !seeded
+			? authStore.isAdmin
+				? 'Library settings could not be loaded yet. Reload the page to retry.'
+				: 'Sign in as an administrator to change library settings.'
+			: null
+	);
+	const impactErrorMessage = $derived.by((): string | null => {
+		if (!impact.isError) return null;
+		const error = impact.error;
+		if (error instanceof ApiError && error.status > 0 && error.status < 500) {
+			return error.message;
+		}
+		return 'Could not reach the server to preview these settings. Check your connection and try again. Nothing has been saved.';
+	});
 
 	function draft(): TypedLibrarySettings {
 		return {
 			library_roots: roots,
 			staging_path: settingsQuery.data?.staging_path ?? '',
 			naming_template: template,
-			acoustid_api_key: acoustidKey
+			acoustid_api_key: acoustidKey,
+			enabled: libraryEnabled
 		};
 	}
 
@@ -226,9 +245,22 @@
 			<div class="skeleton h-48 rounded-box"></div>
 			<div class="skeleton h-28 rounded-box"></div>
 		</div>
-	{:else if settingsQuery.isError}
-		<div class="alert alert-error">Could not load library settings.</div>
+	{:else if settingsQuery.isError && !settingsQuery.data}
+		<div class="alert alert-error">
+			<span
+				>Could not load library settings.{#if settingsQuery.error?.message}
+					{settingsQuery.error.message}{/if}</span
+			>
+		</div>
 	{:else}
+		{#if settingsQuery.isError}
+			<div class="alert alert-warning text-sm">
+				<AlertTriangle class="h-4 w-4" /><span
+					>Could not refresh library settings. You are seeing the last loaded values; saving still
+					checks for conflicting changes.</span
+				>
+			</div>
+		{/if}
 		<header class="library-scanning-header">
 			<div class="library-scanning-mark"><ScanSearch class="h-6 w-6" /></div>
 			<div>
@@ -297,6 +329,30 @@
 
 		<section class="card border border-base-300 bg-base-200/55">
 			<div class="card-body gap-6">
+				<section class="space-y-2">
+					<div class="flex flex-wrap items-center justify-between gap-3">
+						<div class="min-w-0 flex-1">
+							<h3 class="font-semibold">Local library</h3>
+							<p class="mt-1 text-xs text-base-content/60">
+								Scanning, identification, and file organization run while this is on. Turn it off to
+								pause the library without removing your roots. Existing catalog data and playback
+								keep working.
+							</p>
+						</div>
+						<label class="flex cursor-pointer items-center gap-2">
+							<span class="text-sm font-medium">{libraryEnabled ? 'Enabled' : 'Disabled'}</span>
+							<input
+								type="checkbox"
+								class="toggle toggle-primary"
+								bind:checked={libraryEnabled}
+								aria-label="Local library enabled"
+							/>
+						</label>
+					</div>
+				</section>
+
+				<div class="divider my-0"></div>
+
 				<LibraryRootPolicyEditor {roots} onchange={(value) => (roots = value)} />
 
 				<div class="divider my-0"></div>
@@ -332,13 +388,14 @@
 					/>
 				</section>
 
+				{#if settingsBlockedMessage}
+					<p class="text-sm text-warning">{settingsBlockedMessage}</p>
+				{/if}
 				<div
 					class="card-actions items-center justify-between gap-3 border-t border-base-content/10 pt-5"
 				>
-					{#if impact.isError}
-						<p class="text-sm text-error">
-							Could not preview these library settings. Nothing has been saved.
-						</p>
+					{#if impactErrorMessage}
+						<p class="text-sm text-error">{impactErrorMessage}</p>
 					{:else}
 						<span></span>
 					{/if}
@@ -414,11 +471,14 @@
 					<h3 class="font-semibold">Manual scan</h3>
 					<button
 						class="btn btn-outline btn-sm"
-						disabled={requestRun.isPending || roots.length === 0}
+						disabled={requestRun.isPending || roots.length === 0 || !libraryEnabled}
 						onclick={() => void scanForChanges()}
 						>{#if requestRun.isPending}<span class="loading loading-spinner loading-sm"></span>{/if} Scan
 						for changes</button
 					>
+					{#if !libraryEnabled}<p class="text-xs text-warning">
+							The local library is disabled. Re-enable it before starting a scan.
+						</p>{/if}
 				</section>
 			</div>
 		</section>
@@ -474,6 +534,9 @@
 					<CheckCircle2 class="h-4 w-4" /> Saving does not start a scan.
 				</p>
 			</div>{/if}
+		{#if save.error}
+			<p class="mt-3 text-sm text-error">{save.error.message}</p>
+		{/if}
 		<div class="modal-action">
 			<button class="btn btn-ghost" onclick={() => impactDialog.close()}>Cancel</button><button
 				class="btn btn-primary"

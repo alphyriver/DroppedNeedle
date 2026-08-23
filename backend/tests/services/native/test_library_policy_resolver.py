@@ -145,3 +145,23 @@ def test_revision_only_tracks_policy_input(tmp_path: Path) -> None:
 
     assert first.policy_revision == second.policy_revision
     assert first.policy_revision != excluded.policy_revision
+
+
+def test_enabled_toggle_does_not_change_policy_revision(tmp_path: Path) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    enabled = LibraryPolicyResolver(_settings(root))
+    disabled = _settings(root)
+    disabled.enabled = False
+
+    assert LibraryPolicyResolver(disabled).policy_revision == enabled.policy_revision
+
+
+def test_normalise_preserves_the_enabled_flag(tmp_path: Path) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    disabled = _settings(root)
+    disabled.enabled = False
+
+    assert LibraryPolicyResolver(disabled).settings.enabled is False
+    assert LibraryPolicyResolver(_settings(root)).settings.enabled is True

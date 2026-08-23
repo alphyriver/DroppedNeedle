@@ -220,6 +220,16 @@ async def restore_review(
     return await _review_action(review_id, "restore", body, admin, service)
 
 
+@router.post("/reviews/{review_id}/dismiss", response_model=ReviewActionResponse)
+async def dismiss_review(
+    admin: CurrentAdminDep,
+    review_id: str,
+    service: LibraryReviewServiceDep,
+    body: ReviewActionRequest = MsgSpecBody(ReviewActionRequest),
+) -> ReviewActionResponse:
+    return await _review_action(review_id, "dismiss", body, admin, service)
+
+
 @router.post("/reviews/{review_id}/candidate", response_model=ReviewActionResponse)
 async def accept_review_candidate(
     admin: CurrentAdminDep,

@@ -13,8 +13,12 @@ import services.artist_discovery_service as _ads_module
 @pytest.fixture(autouse=True)
 def _reset_precache_flag():
     _ads_module._discovery_precache_running = False
+    _ads_module._precache_consecutive_failures = 0
+    _ads_module._precache_paused_until = 0.0
     yield
     _ads_module._discovery_precache_running = False
+    _ads_module._precache_consecutive_failures = 0
+    _ads_module._precache_paused_until = 0.0
 
 
 def _make_service(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import threading
 import time
 from contextlib import suppress
@@ -35,7 +37,9 @@ from services.native.target_application_runtime import (
     run_library_contribution_verification_worker,
     run_target_identification_worker,
     run_target_operation_worker,
+    run_target_worker_watchdog,
 )
+from infrastructure.resilience.retry import CircuitState
 from services.native.background_workload_gate import BackgroundWorkloadGate
 
 
@@ -122,7 +126,9 @@ async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration() -> N
     coordinator = AsyncMock()
     coordinator.run_once.return_value = None
     scheduler = AsyncMock()
-    resolver = SimpleNamespace(policy_revision="one")
+    resolver = SimpleNamespace(
+        policy_revision="one", settings=SimpleNamespace(enabled=True)
+    )
     calls = {"scheduler": 0, "resolver": 0, "settings": 0}
 
     def scheduler_getter():
@@ -154,8 +160,37 @@ async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration() -> N
         settings_getter,
     )
 
-    assert calls == {"scheduler": 2, "resolver": 2, "settings": 2}
+    # One extra resolver read comes from the startup recovery gate; the two
+    # loop iterations then read it once each.
+    assert calls == {"scheduler": 2, "resolver": 3, "settings": 2}
     assert scheduler.tick.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_supervisor_skips_recover_tick_and_run_when_library_disabled() -> None:
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    scheduler = AsyncMock()
+    resolver = SimpleNamespace(
+        policy_revision="one", settings=SimpleNamespace(enabled=False)
+    )
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {},
+        wakeups,
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: {"frequency": "manual", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+
+    coordinator.recover.assert_not_awaited()
+    scheduler.tick.assert_not_awaited()
+    coordinator.run_once.assert_not_awaited()
+    wakeups.wait.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -179,6 +214,156 @@ async def test_target_identification_worker_recovers_claims_and_survives_iterati
 
     assert queue.recover.await_count == 2
     service.run_claimed_job.assert_awaited_once_with({"id": "job-1"}, "test-worker")
+
+
+@pytest.mark.asyncio
+async def test_identification_worker_defers_crashed_job_with_unexpected_error() -> None:
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.side_effect = [{"id": "job-1", "row_revision": 1}, None]
+    service = AsyncMock()
+    service.run_claimed_job.side_effect = RuntimeError("boom")
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+    )
+
+    # The crashed job is deferred as UNEXPECTED_ERROR (feeding the deferral
+    # cap) instead of being re-claimed into an infinite crash loop.
+    queue.defer.assert_awaited_once_with(
+        {"id": "job-1", "row_revision": 1}, "test-worker", "UNEXPECTED_ERROR"
+    )
+
+
+def _idle_identification_harness():
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.return_value = None
+    service = AsyncMock()
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(
+            side_effect=[None, asyncio.CancelledError(), asyncio.CancelledError()]
+        ),
+    )
+    return queue, service, wakeups
+
+
+@pytest.mark.asyncio
+async def test_identification_worker_sweeps_provider_deferrals_when_breaker_closed() -> (
+    None
+):
+    queue, service, wakeups = _idle_identification_harness()
+    probe = AsyncMock()
+
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+        provider_state_getter=lambda: CircuitState.CLOSED,
+        probe_provider=probe,
+    )
+
+    queue.reset_provider_deferrals.assert_awaited_once()
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_identification_worker_probes_once_per_rate_limit_when_half_open() -> (
+    None
+):
+    queue, service, wakeups = _idle_identification_harness()
+    probe = AsyncMock()
+
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+        provider_state_getter=lambda: CircuitState.HALF_OPEN,
+        probe_provider=probe,
+    )
+
+    # Two idle iterations inside the 60s sweep window: exactly one probe.
+    probe.assert_awaited_once_with()
+    queue.reset_provider_deferrals.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_identification_worker_skips_provider_sweep_when_breaker_open() -> None:
+    queue, service, wakeups = _idle_identification_harness()
+    probe = AsyncMock()
+
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+        provider_state_getter=lambda: CircuitState.OPEN,
+        probe_provider=probe,
+    )
+
+    probe.assert_not_awaited()
+    queue.reset_provider_deferrals.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_watchdog_restarts_dead_worker_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    async def run_forever() -> None:
+        await asyncio.Event().wait()
+
+    alive_task = asyncio.get_running_loop().create_task(run_forever())
+    registry.register("alive-worker", alive_task)
+    dead_task = asyncio.get_running_loop().create_task(run_forever())
+    registry.register("dead-worker", dead_task)
+    dead_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await dead_task
+
+    restarted: list[asyncio.Task[None]] = []
+
+    def dead_starter() -> asyncio.Task[None]:
+        task = asyncio.get_running_loop().create_task(run_forever())
+        registry.register("dead-worker", task)
+        restarted.append(task)
+        return task
+
+    alive_starter_calls = 0
+
+    def alive_starter() -> asyncio.Task[None]:
+        nonlocal alive_starter_calls
+        alive_starter_calls += 1
+        return alive_task
+
+    async def stop_after_first_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_iteration)
+    try:
+        await run_target_worker_watchdog(
+            {"dead-worker": dead_starter, "alive-worker": alive_starter}
+        )
+        assert len(restarted) == 1
+        assert alive_starter_calls == 0
+        assert registry.is_running("dead-worker")
+    finally:
+        alive_task.cancel()
+        for task in restarted:
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.gather(alive_task, *restarted)
 
 
 @pytest.mark.asyncio
@@ -242,6 +427,30 @@ async def test_identification_worker_rechecks_gate_immediately_before_claim() ->
 
 
 @pytest.mark.asyncio
+async def test_identification_worker_skips_claims_when_library_disabled() -> None:
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.return_value = None
+    service = AsyncMock()
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+        enabled_getter=lambda: False,
+    )
+
+    queue.recover.assert_not_awaited()
+    queue.claim.assert_not_awaited()
+    service.run_claimed_job.assert_not_awaited()
+    wakeups.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_target_operation_worker_recovers_and_dispatches_each_iteration() -> None:
     supervisor = AsyncMock()
     recovery = AsyncMock()
@@ -261,6 +470,28 @@ async def test_target_operation_worker_recovers_and_dispatches_each_iteration() 
     assert recovery.recover_once.await_count == 2
     assert supervisor.run_once.await_count == 2
     supervisor.run_once.assert_awaited_with("test-worker")
+
+
+@pytest.mark.asyncio
+async def test_operation_worker_skips_claims_when_library_disabled() -> None:
+    supervisor = AsyncMock()
+    recovery = AsyncMock()
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    await run_target_operation_worker(
+        lambda: supervisor,
+        lambda: recovery,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+        enabled_getter=lambda: False,
+    )
+
+    supervisor.recover.assert_not_awaited()
+    recovery.recover_once.assert_not_awaited()
+    supervisor.run_once.assert_not_awaited()
+    wakeups.wait.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -487,6 +718,180 @@ def test_target_compat_module_has_no_legacy_scanner_dependency() -> None:
     assert "LibraryScanner" not in names
 
 
+def _scan_run(run_id: str = "run-1") -> ScanRun:
+    return ScanRun(
+        id=run_id,
+        kind="incremental",
+        trigger="manual",
+        state="discovering",
+        phase="discovering",
+    )
+
+
+@pytest.mark.asyncio
+async def test_walk_oserror_logs_path_and_records_failure_row(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    denied = root / "secret"
+    store = AsyncMock()
+    store.classify_scan_paths.return_value = {}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+
+    def denied_walk(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "Permission denied", str(denied))
+        yield
+
+    scanner = LibraryInventoryScanner(store, directory_walker=denied_walk)
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+
+    with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
+        _updated, completed, failure_code = await scanner._walk_scope(
+            _scan_run(),
+            scope,
+            root,
+            root,
+            SimpleNamespace(resolve=lambda _path: None),
+            AsyncMock(return_value=True),
+        )
+
+    assert completed is False
+    assert failure_code == "ROOT_PERMISSION_DENIED"
+    records = store.record_scan_failures.await_args.args[1]
+    assert [
+        (record.failure_code, record.relative_path, record.phase)
+        for record in records
+    ] == [("WALK_EACCES", "secret", "discovering")]
+    store.complete_scan_scope_discovery.assert_awaited_once_with(
+        "run-1",
+        "root",
+        ".",
+        state="partially_read",
+        error_code="ROOT_PERMISSION_DENIED",
+    )
+    assert "event=walk_error" in caplog.text
+    assert "secret" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_wedged_walk_times_out_detaches_producer_and_recovers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield (str(root), [], ["track.flac"])
+            wedged.wait()
+            return
+        yield (str(root), [], ["track.flac"])
+
+    store = AsyncMock()
+    store.classify_scan_paths.return_value = {"track.flac": ("new", None)}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    started = time.monotonic()
+    _updated, completed, failure_code = await scanner._walk_scope(
+        _scan_run(), scope, root, root, resolver, checkpoint
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed is False
+    assert failure_code == "WALK_TIMEOUT"
+    assert elapsed < 2.0
+    assert len(scanner._detached_walkers) == 1
+    records = store.record_scan_failures.await_args.args[1]
+    assert [record.failure_code for record in records] == ["WALK_TIMEOUT"]
+    store.complete_scan_scope_discovery.assert_awaited_once_with(
+        "run-1",
+        "root",
+        ".",
+        state="partially_read",
+        error_code="WALK_TIMEOUT",
+    )
+
+    # Releasing the wedged syscall lets the detached producer finish cleanly.
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner._detached_walkers and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+
+    # A subsequent walk on the same scanner is unaffected by the detached one.
+    _updated, completed, failure_code = await scanner._walk_scope(
+        _scan_run("run-2"), scope, root, root, resolver, checkpoint
+    )
+    assert completed is True
+    assert failure_code is None
+
+
+@pytest.mark.asyncio
+async def test_root_probe_timeout_fails_the_run_with_walk_timeout(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    wedged_probe = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        wedged_probe.wait()
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store,
+        walk_deadline_seconds=0.05,
+        directory_probe=probe,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+
+    try:
+        started = time.monotonic()
+        await asyncio.wait_for(
+            scanner.discover(
+                _scan_run(),
+                [scope],
+                {"root": root},
+                SimpleNamespace(),
+                AsyncMock(return_value=True),
+            ),
+            timeout=2.0,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        wedged_probe.set()
+
+    assert elapsed < 2.0
+    records = store.record_scan_failures.await_args.args[1]
+    assert [record.failure_code for record in records] == ["WALK_TIMEOUT"]
+    store.complete_scan_scope_discovery.assert_awaited_once_with(
+        "run-1",
+        "root",
+        ".",
+        state="unavailable",
+        error_code="WALK_TIMEOUT",
+    )
+    assert (
+        store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    )
+
+
 @pytest.mark.asyncio
 async def test_inventory_file_stat_runs_outside_the_event_loop_thread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -523,7 +928,7 @@ async def test_inventory_file_stat_runs_outside_the_event_loop_thread(
     )
     scope = ScanScope(root_id="root", policy_revision="policy-1")
 
-    _updated, completed = await scanner._walk_scope(
+    _updated, completed, failure_code = await scanner._walk_scope(
         run,
         scope,
         root,
@@ -533,6 +938,7 @@ async def test_inventory_file_stat_runs_outside_the_event_loop_thread(
     )
 
     assert completed is True
+    assert failure_code is None
     assert stat_threads
     assert event_loop_thread not in stat_threads
 

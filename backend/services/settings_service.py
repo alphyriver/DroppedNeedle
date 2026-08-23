@@ -647,6 +647,7 @@ class SettingsService:
         self, settings: MusicBrainzConnectionSettings
     ) -> None:
         from repositories.musicbrainz_base import (
+            get_mb_api_base,
             set_mb_api_base,
             mb_rate_limiter,
             mb_circuit_breaker,
@@ -663,6 +664,19 @@ class SettingsService:
             settings.concurrent_searches = min(
                 settings.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
             )
+
+        # Compare against live module state, not stored settings: the route
+        # saves before calling this handler, so stored == incoming always.
+        if (
+            get_mb_api_base() == settings.api_url
+            and mb_rate_limiter.rate == settings.rate_limit
+            and mb_rate_limiter.capacity == settings.concurrent_searches
+        ):
+            logger.info(
+                "MusicBrainz connection settings unchanged; "
+                "skipping circuit breaker reset and cache clear"
+            )
+            return
 
         set_mb_api_base(settings.api_url)
         mb_rate_limiter.update_rate(settings.rate_limit)

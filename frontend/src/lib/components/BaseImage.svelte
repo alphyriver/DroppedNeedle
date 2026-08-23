@@ -153,7 +153,9 @@
 		}
 		return responsiveCoverUrl ? `${coverUrl} 250w, ${responsiveCoverUrl} 500w` : undefined;
 	});
-	let visualSourceKey = $derived(useRemoteUrl && resolvedRemoteUrl ? resolvedRemoteUrl : coverUrl);
+	let visualSourceKey = $derived(
+		useRemoteUrl && resolvedRemoteUrl && !remoteError ? resolvedRemoteUrl : coverUrl
+	);
 	let sizeClasses = $derived(imageType === 'album' ? albumSizeClasses : artistSizeClasses);
 	let sizeClass = $derived(sizeClasses[size]);
 	let roundedClass = $derived(roundedClasses[rounded]);
@@ -179,6 +181,13 @@
 	$effect(() => {
 		if (hasSource && showPlaceholder && !imgLoaded && !visualSettled) {
 			scheduleVisualSettlement();
+		}
+	});
+	$effect(() => {
+		// a stalled CDN image emits neither load nor error: at the settle deadline flip
+		// to the covers proxy (cached image or 202 warm) instead of a dead placeholder
+		if (useRemoteUrl && resolvedRemoteUrl && !remoteError && visualSettled && !imgLoaded) {
+			remoteError = true;
 		}
 	});
 

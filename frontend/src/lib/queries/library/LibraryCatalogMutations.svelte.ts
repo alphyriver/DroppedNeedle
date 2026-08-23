@@ -59,13 +59,13 @@ export function selectReidentificationCandidate() {
 		mutationFn: (input: {
 			jobId: string;
 			expectedRevision: number;
-			candidateKey: string;
+			candidateKey?: string;
 			confirmation: boolean;
 			decisionMode?: 'exact_release' | 'custom_edition' | 'leave_unmanaged';
 		}) =>
 			api.global.post<OperationResponse>(API.library.operationCandidate(input.jobId), {
 				expected_row_revision: input.expectedRevision,
-				candidate_key: input.candidateKey,
+				candidate_key: input.candidateKey ?? '',
 				confirmation: input.confirmation,
 				decision_mode: input.decisionMode ?? 'exact_release'
 			}),

@@ -1,6 +1,7 @@
 import { page } from '@vitest/browser/context';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
+import { ApiError, TransportError } from '$lib/api/client';
 
 const baseSettings = {
 	library_roots: [
@@ -15,6 +16,7 @@ const baseSettings = {
 	staging_path: '/staging',
 	naming_template: '{albumartist}/{album}/{track} {title}',
 	acoustid_api_key: '••••',
+	enabled: true,
 	policy_revision: 'policy-1',
 	reconciliation_required: false,
 	reconciliation_state: 'applied',
@@ -40,6 +42,7 @@ const h = vi.hoisted(() => ({
 		warnings: []
 	} as Record<string, unknown>,
 	impact: vi.fn(),
+	impactError: null as unknown,
 	save: vi.fn(),
 	restore: vi.fn(),
 	applyPreview: vi.fn(),
@@ -81,6 +84,12 @@ vi.mock('$lib/queries/library/LibraryPolicyMutations.svelte', () => ({
 		mutateAsync: h.impact,
 		get data() {
 			return h.impactResult;
+		},
+		get isError() {
+			return h.impactError != null;
+		},
+		get error() {
+			return h.impactError;
 		},
 		isPending: false
 	}),
@@ -136,6 +145,7 @@ beforeEach(() => {
 		warnings: []
 	};
 	h.impact.mockResolvedValue(h.impactResult);
+	h.impactError = null;
 	h.save.mockResolvedValue({
 		...structuredClone(baseSettings),
 		policy_revision: 'policy-2',
@@ -253,6 +263,23 @@ describe('SettingsLibrary target policy UI', () => {
 		});
 	});
 
+	it('sends the master switch state with the saved settings', async () => {
+		render(SettingsLibrary);
+		await page.getByRole('checkbox', { name: 'Local library enabled' }).click();
+		await page.getByRole('button', { name: 'Preview and save settings' }).click();
+		expect(h.impact).toHaveBeenCalledWith(
+			expect.objectContaining({
+				settings: expect.objectContaining({ enabled: false })
+			})
+		);
+		await page.getByRole('button', { name: 'Save policies' }).click();
+		expect(h.save).toHaveBeenCalledWith(
+			expect.objectContaining({
+				settings: expect.objectContaining({ enabled: false })
+			})
+		);
+	});
+
 	it('keeps a stale preview from saving or starting work', async () => {
 		h.impactResult = { ...h.impactResult, stale: true };
 		h.impact.mockResolvedValue(h.impactResult);
@@ -325,5 +352,81 @@ describe('SettingsLibrary target policy UI', () => {
 			expected_policy_revision: 'policy-1',
 			paths: { 'root-old': '/music' }
 		});
+	});
+
+	it('shows the server message when the settings query fails', async () => {
+		h.settings = {
+			data: undefined,
+			isLoading: false,
+			isError: true,
+			error: new ApiError(500, 'Library settings backend is unavailable', 'INTERNAL_ERROR')
+		};
+		render(SettingsLibrary);
+		await expect.element(page.getByText(/Could not load library settings/)).toBeVisible();
+		await expect.element(page.getByText(/Library settings backend is unavailable/)).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Preview and save settings' }))
+			.not.toBeInTheDocument();
+	});
+
+	it('explains why saving is blocked when settings never seed', async () => {
+		h.settings = { data: undefined, isLoading: false, isError: false };
+		render(SettingsLibrary);
+		await expect
+			.element(
+				page.getByText('Library settings could not be loaded yet. Reload the page to retry.')
+			)
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Preview and save settings' }))
+			.toBeDisabled();
+		expect(h.impact).not.toHaveBeenCalled();
+		expect(h.save).not.toHaveBeenCalled();
+	});
+
+	it('points non-administrators at administrator sign-in when settings never seed', async () => {
+		h.isAdmin = false;
+		h.settings = { data: undefined, isLoading: false, isError: false };
+		render(SettingsLibrary);
+		await expect
+			.element(page.getByText('Sign in as an administrator to change library settings.'))
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Preview and save settings' }))
+			.toBeDisabled();
+		expect(h.impact).not.toHaveBeenCalled();
+	});
+
+	it('shows the server message when the impact preview is rejected with a 4xx', async () => {
+		h.impactError = new ApiError(400, 'Root path /music is not readable', 'CONFIGURATION_ERROR');
+		h.impact.mockRejectedValue(h.impactError);
+		render(SettingsLibrary);
+		await page.getByRole('button', { name: 'Preview and save settings' }).click();
+		await expect.element(page.getByText('Root path /music is not readable')).toBeVisible();
+		expect(
+			document.querySelector<HTMLDialogElement>('dialog[aria-labelledby="policy-impact-title"]')
+				?.open
+		).toBe(false);
+		expect(h.save).not.toHaveBeenCalled();
+	});
+
+	it('shows reachability copy instead of a server message when the preview cannot reach the server', async () => {
+		h.impactError = new TransportError(
+			'TRANSPORT_NETWORK',
+			'POST',
+			'/api/v1/settings/library/policy/impact'
+		);
+		h.impact.mockRejectedValue(h.impactError);
+		render(SettingsLibrary);
+		await page.getByRole('button', { name: 'Preview and save settings' }).click();
+		await expect.element(page.getByText(/Check your connection and try again/)).toBeVisible();
+		await expect
+			.element(page.getByText('The server could not be reached', { exact: true }))
+			.not.toBeInTheDocument();
+		expect(
+			document.querySelector<HTMLDialogElement>('dialog[aria-labelledby="policy-impact-title"]')
+				?.open
+		).toBe(false);
+		expect(h.save).not.toHaveBeenCalled();
 	});
 });

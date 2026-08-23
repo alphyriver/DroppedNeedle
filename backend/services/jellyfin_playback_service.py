@@ -151,16 +151,44 @@ class JellyfinPlaybackService:
         except (httpx.HTTPError, ExternalServiceError) as e:
             logger.warning("Stop report failed for %s: %s", item_id, e)
 
-    async def proxy_head(self, item_id: str) -> Response:
-        result: StreamProxyResult = await self._jellyfin.proxy_head_stream(item_id)
+    async def proxy_head(self, item_id: str, user_id: str | None = None) -> Response:
+        repo = await self._repo_for(user_id)
+        try:
+            result: StreamProxyResult = await repo.proxy_head_stream(item_id)
+        except JellyfinAuthError:
+            if repo is self._jellyfin:
+                raise
+            # linked account's token was revoked: the stream still rides the
+            # app-level account (attribution stays fail closed)
+            logger.warning(
+                "Per-user Jellyfin token rejected for user %s, "
+                "streaming %s via app account",
+                user_id,
+                item_id,
+            )
+            result = await self._jellyfin.proxy_head_stream(item_id)
         return Response(status_code=200, headers=result.headers)
 
     async def proxy_stream(
-        self, item_id: str, range_header: str | None = None
+        self, item_id: str, range_header: str | None = None, user_id: str | None = None
     ) -> StreamingResponse:
-        result: StreamProxyResult = await self._jellyfin.proxy_get_stream(
-            item_id, range_header=range_header
-        )
+        repo = await self._repo_for(user_id)
+        try:
+            result: StreamProxyResult = await repo.proxy_get_stream(
+                item_id, range_header=range_header
+            )
+        except JellyfinAuthError:
+            if repo is self._jellyfin:
+                raise
+            logger.warning(
+                "Per-user Jellyfin token rejected for user %s, "
+                "streaming %s via app account",
+                user_id,
+                item_id,
+            )
+            result = await self._jellyfin.proxy_get_stream(
+                item_id, range_header=range_header
+            )
         return StreamingResponse(
             content=result.body_chunks,
             status_code=result.status_code,

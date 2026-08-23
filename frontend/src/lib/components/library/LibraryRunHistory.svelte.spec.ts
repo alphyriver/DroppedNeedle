@@ -37,13 +37,22 @@ const h = vi.hoisted(() => ({
 		isFetchingNextPage: false,
 		fetchNextPage: vi.fn()
 	} as Record<string, unknown>,
+	failures: {
+		data: { pages: [{ items: [], next_cursor: null }] },
+		isLoading: false,
+		isError: false,
+		hasNextPage: false,
+		isFetchingNextPage: false,
+		fetchNextPage: vi.fn()
+	} as Record<string, unknown>,
 	get: vi.fn(),
 	toast: vi.fn(),
 	anchorClick: vi.fn()
 }));
 
 vi.mock('$lib/queries/library/LibraryOperationQueries.svelte', () => ({
-	getLibraryRunHistoryQuery: () => h.history
+	getLibraryRunHistoryQuery: () => h.history,
+	getLibraryRunFailuresQuery: () => h.failures
 }));
 vi.mock('$lib/api/client', () => ({ api: { global: { get: h.get } } }));
 vi.mock('$lib/stores/toast', () => ({ toastStore: { show: h.toast } }));
@@ -54,6 +63,14 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	h.history = {
 		data: { pages: [{ items: [run()] }] },
+		isLoading: false,
+		isError: false,
+		hasNextPage: false,
+		isFetchingNextPage: false,
+		fetchNextPage: vi.fn()
+	};
+	h.failures = {
+		data: { pages: [{ items: [], next_cursor: null }] },
 		isLoading: false,
 		isError: false,
 		hasNextPage: false,
@@ -142,5 +159,86 @@ describe('LibraryRunHistory', () => {
 		await page.getByRole('button', { name: 'Show 2 older runs' }).click();
 		await expect.element(page.getByText('scope-2').first()).toBeVisible();
 		await expect.element(page.getByRole('button', { name: 'Show latest 3' })).toBeVisible();
+	});
+
+	it('lists recorded failed paths for a timed-out run and pages with Load more', async () => {
+		h.history = {
+			data: {
+				pages: [
+					{
+						items: [
+							run({
+								id: 'run-wedged',
+								state: 'failed',
+								terminal_code: 'WALK_TIMEOUT',
+								counters: { discovered_count: 12, errored_count: 1 }
+							})
+						]
+					}
+				]
+			},
+			isLoading: false,
+			isError: false,
+			hasNextPage: false,
+			isFetchingNextPage: false,
+			fetchNextPage: vi.fn()
+		};
+		h.failures = {
+			data: {
+				pages: [
+					{
+						items: [
+							{
+								root_id: 'root-1',
+								relative_path: 'Artist/Stuck Album',
+								failure_code: 'WALK_TIMEOUT',
+								failure_detail: 'The directory walk made no progress for 30.0s.',
+								phase: 'discovering',
+								recorded_at: 140
+							}
+						],
+						next_cursor: 41
+					}
+				]
+			},
+			isLoading: false,
+			isError: false,
+			hasNextPage: true,
+			isFetchingNextPage: false,
+			fetchNextPage: vi.fn()
+		};
+		render(LibraryRunHistory);
+
+		await page.getByText('Details').first().click();
+		await expect
+			.element(page.getByText('Stopped because a library folder stopped responding'))
+			.toBeVisible();
+		await expect.element(page.getByText('Failed paths')).toBeVisible();
+		await expect.element(page.getByText('Artist/Stuck Album')).toBeVisible();
+		await expect.element(page.getByText('WALK_TIMEOUT').first()).toBeVisible();
+		await page.getByRole('button', { name: 'Load more' }).click();
+		expect(h.failures.fetchNextPage).toHaveBeenCalledOnce();
+	});
+
+	it('omits the failed-paths section for clean completed runs', async () => {
+		h.history = {
+			data: {
+				pages: [
+					{
+						items: [run({ counters: { discovered_count: 40, errored_count: 0 } })]
+					}
+				]
+			},
+			isLoading: false,
+			isError: false,
+			hasNextPage: false,
+			isFetchingNextPage: false,
+			fetchNextPage: vi.fn()
+		};
+		render(LibraryRunHistory);
+
+		await page.getByText('Details').first().click();
+		await expect.element(page.getByRole('dialog', { name: 'Run details' })).toBeVisible();
+		await expect.element(page.getByText('Failed paths')).not.toBeInTheDocument();
 	});
 });

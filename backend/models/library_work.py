@@ -207,6 +207,9 @@ class RepairFinding(AppStruct):
     expected_identity_revision: int | None = None
     reason_code: str = ""
     apply_eligible: bool = False
+    suggested_release_mbid: str | None = None
+    suggested_release_group_mbid: str | None = None
+    suggested_edition_json: str = "{}"
 
 
 class ScanInventoryItem(AppStruct):
@@ -223,6 +226,15 @@ class ScanInventoryItem(AppStruct):
     policy_revision: str = ""
     local_track_id: str | None = None
     scope_relative_path: str = "."
+
+
+class ScanFailureRecord(AppStruct):
+    root_id: str
+    relative_path: str
+    failure_code: str
+    recorded_at: float
+    failure_detail: str = ""
+    phase: Literal["discovering", "indexing", "reconciling"] = "discovering"
 
 
 class ScannedTrackWrite(msgspec.Struct):

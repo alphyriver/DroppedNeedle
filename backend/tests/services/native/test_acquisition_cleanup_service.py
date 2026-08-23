@@ -873,7 +873,11 @@ async def test_legacy_reconciliation_cleans_only_unambiguous_terminal_tasks(
     ]
     library.bundles["attention-bundle"] = "needs_attention"
     service = AcquisitionCleanupService(
-        store, library, lambda source: client, lambda: root
+        store,
+        library,
+        lambda source: client,
+        lambda: root,
+        sab_category_getter=lambda: "audio",
     )
 
     await service.recover_startup()
@@ -1079,3 +1083,135 @@ async def test_failed_torrent_is_removed_with_its_partial_data(tmp_path: Path):
     final = await store.get_download_attempt(attempt.id)
     assert final is not None
     assert final.state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_survives_directory_removed_between_passes(
+    tmp_path: Path,
+):
+    root = tmp_path / "sab"
+    vanished = root / "droppedneedle-staging"
+    vanished.mkdir(parents=True)
+    store = _store(tmp_path)
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: root
+    )
+
+    assert await service.reconcile_legacy_mount(limit=1) == 1
+    vanished.rmdir()
+
+    await service.reconcile_legacy_mount()
+
+    mount_key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+    progress = await store.ensure_cleanup_reconciliation(mount_key, str(root))
+    assert progress.completed is True
+
+
+def test_directory_entries_skips_entry_removed_mid_scan(tmp_path: Path, monkeypatch):
+    class _VanishingEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.path = str(tmp_path / name)
+
+        def is_dir(self, follow_symlinks: bool = False) -> bool:
+            raise FileNotFoundError(self.name)
+
+        def is_symlink(self) -> bool:
+            return False
+
+    class _FakeEntries:
+        def __enter__(self):
+            return iter([_VanishingEntry("gone")])
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+    monkeypatch.setattr(cleanup_module.os, "scandir", lambda path: _FakeEntries())
+    assert cleanup_module._directory_entries(tmp_path) == []
+
+
+def test_directory_entries_returns_empty_for_vanished_directory(tmp_path: Path):
+    assert cleanup_module._directory_entries(tmp_path / "missing") == []
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_default_category_scopes_to_droppedneedle_prefix(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "sab"
+    (root / "droppedneedle-staging").mkdir(parents=True)
+    foreign = root / "sonarr"
+    foreign_job = foreign / f"droppedneedle-{'f' * 32}-0"
+    foreign_job.mkdir(parents=True)
+    store = _store(tmp_path)
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: root
+    )
+    visited: list[str] = []
+    original_entries = cleanup_module._directory_entries
+
+    def recording_entries(path: Path):
+        visited.append(str(path))
+        return original_entries(path)
+
+    monkeypatch.setattr(cleanup_module, "_directory_entries", recording_entries)
+
+    await service.reconcile_legacy_mount()
+
+    assert str(root) in visited
+    assert str(root / "droppedneedle-staging") in visited
+    assert not any(str(foreign) in path for path in visited)
+    assert (
+        await store.get_download_attempt_for_job(
+            "usenet", f"droppedneedle-{'f' * 32}-0"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_configured_category_descends_only_there(
+    tmp_path: Path,
+):
+    root = tmp_path / "sab"
+    category_job = root / "audio" / f"droppedneedle-{'f' * 32}-0"
+    category_job.mkdir(parents=True)
+    foreign_job = root / "movies" / f"droppedneedle-{'e' * 32}-0"
+    foreign_job.mkdir(parents=True)
+    store = _store(tmp_path)
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = AcquisitionCleanupService(
+        store,
+        _LibraryStore(),
+        lambda source: client,
+        lambda: root,
+        sab_category_getter=lambda: "Audio",
+    )
+
+    await service.reconcile_legacy_mount()
+
+    assert (
+        await store.get_download_attempt_for_job(
+            "usenet", f"droppedneedle-{'f' * 32}-0"
+        )
+    ).state == "needs_attention"
+    assert (
+        await store.get_download_attempt_for_job(
+            "usenet", f"droppedneedle-{'e' * 32}-0"
+        )
+        is None
+    )

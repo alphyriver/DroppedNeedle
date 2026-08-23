@@ -11,9 +11,12 @@ from api.v1.schemas.library_operations import (
     OperationResponse,
     RepairFindingListResponse,
     RepairEstimateResponse,
+    RepairFindingResponse,
+    ReviewActionResponse,
     ReviewDetailResponse,
     ReviewListItem,
     ReviewListResponse,
+    SuggestedEditionSummary,
 )
 from api.v1.schemas.artist_reconciliation import (
     ArtistDuplicateGroupDetail,
@@ -45,6 +48,14 @@ def services() -> dict[str, AsyncMock]:
             id="review-1", state="needs_review", reason_code="NO_SAFE_MATCH"
         ),
         tracks=[],
+    )
+    review.act.return_value = ReviewActionResponse(
+        review_id="review-1",
+        state="resolved",
+        row_revision=2,
+        catalog_revision=1,
+        action_id="action-dismiss",
+        remaining_exclusion_source=None,
     )
     operation = AsyncMock()
     operation.get.return_value = OperationResponse(
@@ -150,6 +161,41 @@ def test_review_and_diagnostic_contracts(
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["cache-control"] == "no-store"
     assert response.content == b"{}"
+
+
+def test_review_dismiss_forwards_action_and_returns_resolved(
+    app: FastAPI, services: dict[str, AsyncMock]
+) -> None:
+    override_admin_auth(app)
+    client = build_test_client(app)
+    response = client.post(
+        "/library/reviews/review-1/dismiss",
+        json={
+            "expected_review_revision": 1,
+            "expected_catalog_revision": 1,
+            "idempotency_key": "dismiss-1",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "review_id": "review-1",
+        "state": "resolved",
+        "row_revision": 2,
+        "catalog_revision": 1,
+        "action_id": "action-dismiss",
+        "operation_job_id": None,
+        "remaining_exclusion_source": None,
+    }
+    call = services["review"].act.await_args
+    assert call is not None
+    assert call.args[0] == "review-1"
+    assert call.args[1] == "dismiss"
+    assert call.args[2].expected_review_revision == 1
+    assert call.args[2].expected_catalog_revision == 1
+    assert call.args[2].expected_identity_revision is None
+    assert call.args[2].idempotency_key == "dismiss-1"
+    assert call.args[2].confirmation is False
+    assert call.args[3] == "test-admin-id"
 
 
 def test_target_operation_routes_are_admin_only(app: FastAPI) -> None:
@@ -296,6 +342,72 @@ def test_management_identity_preparation_contracts(
     )
 
 
+def test_management_identity_preparation_findings_serialize_suggested_edition(
+    app: FastAPI, services: dict[str, AsyncMock]
+) -> None:
+    override_admin_auth(app)
+    suggested = RepairFindingResponse(
+        id="finding-suggested",
+        local_album_id="album-1",
+        album_title="Album 1",
+        album_artist_name="Artist 1",
+        album_year=2020,
+        cover_available=False,
+        evidence_id="evidence-1",
+        review_id=None,
+        finding_code="exact_release_suggested",
+        reason_code="EXACT_EDITION_SUGGESTED",
+        confidence="complete",
+        apply_eligible=True,
+        state="open",
+        suggested_edition=SuggestedEditionSummary(
+            release_mbid="release-1",
+            release_group_mbid="rg-1",
+            title="Album 1",
+            track_count=11,
+            competing_count=3,
+            date="2019-03-01",
+            country="DE",
+            status="Official",
+        ),
+    )
+    bare = RepairFindingResponse(
+        id="finding-bare",
+        local_album_id="album-2",
+        album_title="Album 2",
+        album_artist_name="Artist 2",
+        album_year=None,
+        cover_available=False,
+        evidence_id=None,
+        review_id=None,
+        finding_code="exact_release_required",
+        reason_code="EXACT_EDITION_NOT_ACCEPTED",
+        confidence="bounded",
+        apply_eligible=False,
+        state="open",
+    )
+    services["repair"].findings.return_value = RepairFindingListResponse(
+        items=[suggested, bare]
+    )
+    response = build_test_client(app).get(
+        "/library/management/identity-preparations/job-1/findings",
+        params={"finding_category": "exact_release_required"},
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["suggested_edition"] == {
+        "release_mbid": "release-1",
+        "release_group_mbid": "rg-1",
+        "title": "Album 1",
+        "track_count": 11,
+        "competing_count": 3,
+        "date": "2019-03-01",
+        "country": "DE",
+        "status": "Official",
+    }
+    assert items[1]["suggested_edition"] is None
+
+
 def test_route_errors_use_typed_envelopes(
     app: FastAPI, services: dict[str, AsyncMock]
 ) -> None:
@@ -388,6 +500,7 @@ def test_target_operation_route_inventory_is_complete() -> None:
         ("POST", "/library/reviews/{review_id}/detach-and-keep-tagged"),
         ("POST", "/library/reviews/{review_id}/exclude"),
         ("POST", "/library/reviews/{review_id}/restore"),
+        ("POST", "/library/reviews/{review_id}/dismiss"),
         ("POST", "/library/reviews/{review_id}/candidate"),
         ("POST", "/library/reviews/bulk-preview"),
         ("POST", "/library/reviews/bulk-apply"),

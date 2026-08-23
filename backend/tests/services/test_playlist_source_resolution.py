@@ -480,3 +480,70 @@ class TestResolveTrackSourcesConcurrency:
 
         assert sorted(result["t-a"]) == ["navidrome"]
         assert sorted(result["t-b"]) == ["navidrome"]
+
+
+class TestGuidAlbumIdFallback:
+    """Pre-fix Jellyfin imports stored the Jellyfin album GUID as album_id, which
+    the MBID-keyed matchers can never hit. Resolution re-keys the GUID to the
+    album's MusicBrainz id via Jellyfin provider ids (no migration, #150)."""
+
+    @pytest.mark.asyncio
+    async def test_guid_album_id_resolves_local_source(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track(
+            album_id="jf-guid-1",
+            source_type="jellyfin",
+            available_sources=["jellyfin"],
+        )
+        repo.get_tracks = MagicMock(return_value=[track])
+
+        jf = _make_jf_service(found=False)
+        jf.resolve_album_mbid = AsyncMock(return_value="mbid-abc")
+        local = _make_local_service()
+
+        result = await service.resolve_track_sources(
+            "p-1", jf_service=jf, local_service=local,
+        )
+
+        local.match_album_by_mbid.assert_called_once_with("mbid-abc")
+        assert sorted(result["t-1"]) == ["jellyfin", "local"]
+        repo.batch_link_library_files.assert_called_once_with("p-1", {"t-1": "789"})
+        updates = repo.batch_update_available_sources.call_args[0][1]
+        assert sorted(updates["t-1"]) == ["jellyfin", "local"]
+
+    @pytest.mark.asyncio
+    async def test_guid_fallback_does_not_poison_mbid_cache_key(self, tmp_path):
+        cache = AsyncMock()
+        cache.get = AsyncMock(return_value=None)
+        repo = MagicMock()
+        service = PlaylistService(repo=repo, cache_dir=tmp_path, cache=cache)
+        jf = _make_jf_service(found=False)
+        jf.resolve_album_mbid = AsyncMock(return_value="mbid-abc")
+
+        await service._resolve_album_sources("jf-guid-1", jf, None)
+
+        set_key = cache.set.call_args[0][0]
+        assert "jf-guid-1" in set_key
+        assert "mbid-abc" not in set_key
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_mbid_match_found(self, tmp_path):
+        service, _ = _make_service(tmp_path)
+        jf = _make_jf_service(found=False)
+        jf.match_album_by_mbid = AsyncMock(
+            return_value=SimpleNamespace(
+                found=True,
+                tracks=[
+                    SimpleNamespace(
+                        track_number=1, title="Wall Street Shuffle", jellyfin_id="jf-9"
+                    )
+                ],
+            )
+        )
+        jf.resolve_album_mbid = AsyncMock(return_value="mbid-other")
+        local = _make_local_service()
+
+        await service._resolve_album_sources("mbid-abc", jf, local)
+
+        jf.resolve_album_mbid.assert_not_called()
+        local.match_album_by_mbid.assert_called_once_with("mbid-abc")

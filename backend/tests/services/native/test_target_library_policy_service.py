@@ -471,6 +471,47 @@ async def test_empty_roots_save_allowed_when_catalog_is_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disabled_save_with_roots_succeeds() -> None:
+    previous = TypedLibrarySettings(
+        library_roots=[_root("root", "/music", "Music")]
+    )
+    disabled = TypedLibrarySettings(
+        library_roots=[_root("root", "/music", "Music")], enabled=False
+    )
+    proposed = LibraryPolicyResolver(disabled)
+    revision = LibraryPolicyResolver(previous).policy_revision
+    base = Mock()
+    base.current_settings.return_value = previous
+    base.current_settings_raw.return_value = previous
+    base.prepare_change.return_value = (proposed, [])
+    base.rebase_scopes.return_value = []
+    base.collapse_scopes.return_value = []
+    base.get_settings.return_value = LibrarySettingsResponse(
+        library_roots=disabled.library_roots,
+        policy_revision=proposed.policy_revision,
+        enabled=False,
+    )
+    store = AsyncMock()
+    store.get_pending_policy.return_value = None
+    reconciliation = AsyncMock()
+    reconciliation.commit_boundary.return_value = {"changed": 0, "cancelled": 0}
+    service = TargetLibraryPolicyService(base, reconciliation, store)
+
+    response = await service.save_settings(
+        disabled, expected_policy_revision=revision
+    )
+    assert response.enabled is False
+    assert response.library_roots[0]["id"] == "root"
+    assert proposed.settings.enabled is False
+    base.persist_settings.assert_called_once_with(
+        proposed.settings, expected_policy_revision=revision
+    )
+    reconciliation.commit_boundary.assert_awaited_once_with(
+        proposed_policy_revision=proposed.policy_revision
+    )
+
+
+@pytest.mark.asyncio
 async def test_restorable_roots_excludes_configured_and_reports_derived_paths() -> None:
     current = TypedLibrarySettings(
         library_roots=[_root("kept", "/library", "library")]

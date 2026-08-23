@@ -93,6 +93,7 @@ def _jellyfin_service(playlists=None, items=None) -> JellyfinLibraryService:
     repo.get_most_played_albums = AsyncMock(return_value=[])
     repo.get_library_stats = AsyncMock(return_value={"album_count": 0, "artist_count": 0, "track_count": 0})
     repo.get_albums = AsyncMock(return_value=([], 0))
+    repo.get_album_detail = AsyncMock(return_value=None)
     type(repo).stats_ttl = PropertyMock(return_value=600)
     prefs = MagicMock()
     conn = MagicMock()

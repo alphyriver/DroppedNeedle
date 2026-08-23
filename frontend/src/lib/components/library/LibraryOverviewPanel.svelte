@@ -93,6 +93,7 @@
 	);
 
 	const policyRevision = $derived(settingsQuery.data?.policy_revision ?? '');
+	const libraryEnabled = $derived(settingsQuery.data?.enabled ?? true);
 	const totalTracks = $derived(statsQuery.data?.total_tracks ?? 0);
 	const localOnlyCount = $derived(statsQuery.data?.local_only_count ?? 0);
 	const latestTerminalRun = $derived(historyQuery.data?.pages[0]?.items[0] ?? null);
@@ -191,6 +192,19 @@
 </script>
 
 <div class="space-y-6">
+	{#if !libraryEnabled}
+		<div class="alert alert-warning">
+			<AlertTriangle class="h-5 w-5" />
+			<div class="min-w-0 flex-1">
+				<strong>The local library is disabled</strong>
+				<p class="text-sm">
+					Scanning and file organization are paused. Existing catalog data and playback keep
+					working. Enable the library in
+					<a class="link link-primary" href="/settings?tab=library">Settings</a> to start new work.
+				</p>
+			</div>
+		</div>
+	{/if}
 	<section
 		class="relative overflow-hidden rounded-3xl border shadow-lg {heroTint}"
 		data-effect={effect}
@@ -408,7 +422,7 @@
 			<div class="mt-auto flex flex-col gap-2">
 				<button
 					class="btn btn-primary rounded-full shadow-lg shadow-primary/25"
-					disabled={requestRun.isPending || !policyRevision}
+					disabled={requestRun.isPending || !policyRevision || !libraryEnabled}
 					onclick={startScan}
 				>
 					<RefreshCw class="h-4 w-4" /> Scan for changes

@@ -89,6 +89,26 @@
 	const findingsMeta = $derived(findingsQuery.data?.pages[0] ?? null);
 	const refreshRequired = $derived(findingsMeta?.refresh_required ?? false);
 	const currentCounts = $derived(findingsMeta?.current_counts_by_finding ?? null);
+	const suggestedCount = $derived(currentCounts?.exact_release_suggested ?? 0);
+	const applySealSummary = $derived.by(() => {
+		const mappings = currentCounts?.mapping_ready ?? 0;
+		const editions = currentCounts?.exact_release_suggested ?? 0;
+		const kinds = [
+			mappings === 1 ? '1 exact track map' : mappings > 1 ? `${mappings} exact track maps` : null,
+			editions === 1
+				? '1 suggested edition'
+				: editions > 1
+					? `${editions} suggested editions`
+					: null
+		].filter((label): label is string => label !== null);
+		const subject =
+			kinds.length === 2
+				? `${kinds[0]} and ${kinds[1]}`
+				: kinds.length === 1
+					? kinds[0]
+					: 'No identities';
+		return `${subject} will be sealed as durable catalog identity. Editions are chosen by stored evidence; ties break to the earliest Official edition, worldwide first. Override any edition afterwards from the album page.`;
+	});
 	const tabs = [
 		{ id: 'mapping_ready', label: 'Mappings ready' },
 		{ id: 'ready', label: 'Already ready' },
@@ -138,7 +158,9 @@
 		const counts = currentCounts ?? item.repair_summary?.counts_by_finding ?? {};
 		return tab === 'unverifiable'
 			? (counts.unverifiable ?? 0) + (counts.stale ?? 0)
-			: (counts[tab] ?? 0);
+			: tab === 'exact_release_required'
+				? (counts.exact_release_required ?? 0) + (counts.exact_release_suggested ?? 0)
+				: (counts[tab] ?? 0);
 	}
 
 	function openConfirmation(action: 'apply' | 'discard', opener: HTMLButtonElement): void {
@@ -179,6 +201,7 @@
 				EXACT_RELEASE_MAPPING_SUPPORTED: 'Exact track map verified',
 				EXACT_RELEASE_MAPPINGS_PRESENT: 'Exact track map already present',
 				EXACT_EDITION_NOT_ACCEPTED: 'Choose the exact MusicBrainz edition',
+				EXACT_EDITION_SUGGESTED: 'Exact edition suggested',
 				SELECTED_RELEASE_UNAVAILABLE: 'Selected edition is unavailable',
 				SELECTED_RELEASE_CONFLICT: 'Selected edition conflicts with the release',
 				CONFLICTING_TRACK_EVIDENCE: 'Track evidence conflicts',
@@ -314,6 +337,13 @@
 							><Database class="h-4 w-4" /> Accept mappings...</button
 						>
 					{/if}
+					{#if report.state === 'ready' && !refreshRequired && suggestedCount > 0}
+						<button
+							class="btn btn-primary btn-sm"
+							onclick={(event) => openConfirmation('apply', event.currentTarget)}
+							>Accept editions ({suggestedCount})...</button
+						>
+					{/if}
 					{#if report.state === 'ready'}
 						<button
 							class="btn btn-ghost btn-sm"
@@ -385,6 +415,23 @@
 								<p class="truncate text-xs text-base-content/60">
 									{finding.album_artist_name || 'Unknown release artist'}
 								</p>
+								{#if finding.suggested_edition}
+									<div class="mt-1 flex min-w-0 items-center gap-2">
+										<p class="truncate text-xs text-base-content/55">
+											Suggested: {finding.suggested_edition.title} · {finding.suggested_edition
+												.date ?? 'date unknown'}{finding.suggested_edition.country
+												? ` · ${finding.suggested_edition.country}`
+												: ''}{finding.suggested_edition.status
+												? ` · ${finding.suggested_edition.status}`
+												: ''} · {finding.suggested_edition.track_count} tracks
+										</p>
+										{#if finding.suggested_edition.competing_count > 1}
+											<span class="badge badge-sm badge-outline shrink-0"
+												>1 of {finding.suggested_edition.competing_count} matching editions</span
+											>
+										{/if}
+									</div>
+								{/if}
 								<p class="mt-1 truncate text-xs text-base-content/45">
 									{findingTitle(finding.reason_code)}
 									<span aria-hidden="true"> · </span>
@@ -540,6 +587,7 @@
 				change tags, paths, or audio. Releases may become eligible for a future organization
 				preview.
 			</p>
+			<p class="mt-2 text-sm text-base-content/65">{applySealSummary}</p>
 		{:else}
 			<p class="mt-3 text-sm text-base-content/65">
 				This removes the report from the active workspace. Its audit record remains, and no music
@@ -558,7 +606,7 @@
 				{#if applyPreparation.isPending || discardPreparation.isPending}<span
 						class="loading loading-spinner loading-sm"
 					></span>{/if}
-				{confirmAction === 'apply' ? 'Accept catalog mappings' : 'Dismiss report'}
+				{confirmAction === 'apply' ? 'Accept identities' : 'Dismiss report'}
 			</button>
 		</div>
 	</div>

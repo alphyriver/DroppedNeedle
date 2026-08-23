@@ -188,6 +188,8 @@ def test_failed_working_migration_records_sanitized_reference_counts(
         )
     )
     assert state["failure_evidence"] == evidence
+    assert state["error_type"] == "_WorkingMigrationError"
+    assert state["error_message"] == "checked failure"
     assert "source_key" not in json.dumps(state["failure_evidence"])
 
 
@@ -1312,9 +1314,7 @@ def test_target_startup_hard_timeout_stops_advancing_heartbeat(
         lambda *_args, **_kwargs: StalledProcess(),
     )
     monkeypatch.setattr(automatic_upgrade, "_target_progress", progress)
-    monkeypatch.setattr(
-        automatic_upgrade, "_TARGET_STARTUP_HARD_TIMEOUT_SECONDS", 0.03
-    )
+    monkeypatch.setattr(automatic_upgrade, "_TARGET_STARTUP_HARD_TIMEOUT_SECONDS", 0.03)
 
     assert (
         run_target_supervisor(
@@ -1664,3 +1664,135 @@ def test_main_removes_default_config_when_fresh_upgrade_fails(
 
     assert automatic_upgrade.main() == 1
     assert not settings.config_file_path.exists()
+
+
+def _failed_replace(_source: object, _destination: object) -> None:
+    raise OSError("rename unsupported")
+
+
+def test_replace_file_falls_back_to_copy_when_rename_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "nested" / "destination.txt"
+    source.write_bytes(b"published-content")
+    monkeypatch.setattr(automatic_upgrade.os, "replace", _failed_replace)
+
+    automatic_upgrade._replace_file(source, destination)
+
+    assert destination.read_bytes() == b"published-content"
+
+
+def test_replace_database_falls_back_to_sqlite_copy_when_rename_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    destination = tmp_path / "destination.db"
+    _write_unmigrated_database(source)
+    _mark_migrated(source)
+    _write_unmigrated_database(destination, value="outdated")
+    monkeypatch.setattr(automatic_upgrade.os, "replace", _failed_replace)
+
+    automatic_upgrade._replace_database(source, destination)
+
+    assert automatic_upgrade._database_has_marker(destination)
+    assert _source_value(destination) == "original"
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
+
+
+def test_replace_file_retries_transient_stale_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"published-content")
+    real_sha256 = automatic_upgrade._sha256
+    destination_reads = 0
+
+    def flaky_sha256(path: Path) -> str | None:
+        nonlocal destination_reads
+        if Path(path) == destination:
+            destination_reads += 1
+            if destination_reads == 1:
+                return "stale"
+        return real_sha256(path)
+
+    monkeypatch.setattr(automatic_upgrade, "_sha256", flaky_sha256)
+    monkeypatch.setattr(automatic_upgrade, "_PUBLISH_VERIFY_INTERVAL_SECONDS", 0)
+
+    automatic_upgrade._replace_file(source, destination)
+
+    assert destination.read_bytes() == b"published-content"
+    assert destination_reads > 1
+
+
+def test_replace_database_raises_when_content_never_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.db"
+    destination = tmp_path / "destination.db"
+    _write_unmigrated_database(source)
+    _mark_migrated(source)
+    _write_unmigrated_database(destination, value="outdated")
+    real_sha256 = automatic_upgrade._sha256
+
+    def wrong_destination_hash(path: Path) -> str | None:
+        if Path(path) == destination:
+            return "wrong"
+        return real_sha256(path)
+
+    monkeypatch.setattr(automatic_upgrade, "_sha256", wrong_destination_hash)
+    monkeypatch.setattr(automatic_upgrade, "_PUBLISH_VERIFY_INTERVAL_SECONDS", 0)
+
+    with pytest.raises(OSError, match="could not be verified"):
+        automatic_upgrade._replace_database(source, destination)
+
+    assert automatic_upgrade._database_has_marker(destination)
+    assert _source_value(destination) == "original"
+
+
+def test_upgrade_completes_when_atomic_rename_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    _write_unmigrated_database(settings.library_db_path)
+    settings.config_file_path.parent.mkdir(parents=True)
+    settings.config_file_path.write_text('{"name":"before"}', encoding="utf-8")
+    monkeypatch.setenv("COMMIT_TAG", "test-version")
+
+    def migrate(working: Path) -> dict[str, object]:
+        working_database = working / "cache" / "library.db"
+        with sqlite3.connect(working_database) as connection:
+            connection.execute("UPDATE source_value SET value = 'migrated'")
+        (working / "config" / "config.json").write_text(
+            '{"name":"after"}', encoding="utf-8"
+        )
+        _mark_migrated(working_database)
+        return {"passed": True}
+
+    monkeypatch.setattr(automatic_upgrade.os, "replace", _failed_replace)
+    result = run_automatic_copy_upgrade(settings, runner=migrate)
+
+    assert result == "upgraded"
+    assert automatic_upgrade._database_has_marker(settings.library_db_path)
+    assert _source_value(settings.library_db_path) == "migrated"
+    state = json.loads(
+        (settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["stage"] == "completed"
+    assert settings.config_file_path.read_text(encoding="utf-8") == '{"name":"after"}'
+
+
+def test_write_state_falls_back_when_rename_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    payload = {"stage": "completed", "attempt": 1}
+    monkeypatch.setattr(automatic_upgrade.os, "replace", _failed_replace)
+
+    automatic_upgrade._write_state(path, payload)
+
+    assert automatic_upgrade._read_state(path) == payload

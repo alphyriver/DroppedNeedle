@@ -15,7 +15,12 @@ from core.dependencies import (
     get_navidrome_playback_service,
     get_plex_playback_service,
 )
-from core.exceptions import ExternalServiceError, PlaybackNotAllowedError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    JellyfinAuthError,
+    PlaybackNotAllowedError,
+    ResourceNotFoundError,
+)
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentUserDep
 from services.jellyfin_playback_service import JellyfinPlaybackService
@@ -32,16 +37,22 @@ router = APIRouter(route_class=MsgSpecRoute, prefix="/stream", tags=["streaming"
 async def stream_jellyfin_audio(
     item_id: str,
     request: Request,
+    current_user: CurrentUserDep,
     playback_service: JellyfinPlaybackService = Depends(get_jellyfin_playback_service),
 ) -> StreamingResponse:
     try:
         range_header = request.headers.get("Range")
-        return await playback_service.proxy_stream(item_id, range_header=range_header)
+        return await playback_service.proxy_stream(
+            item_id, range_header=range_header, user_id=current_user.id
+        )
     except ResourceNotFoundError:
         raise HTTPException(status_code=404, detail="Audio item not found")
     except PlaybackNotAllowedError as e:
         logger.warning("Playback not allowed for %s: %s", item_id, e)
         raise HTTPException(status_code=403, detail="Playback not allowed")
+    except JellyfinAuthError as e:
+        logger.warning("Jellyfin auth failure streaming %s: %s", item_id, e)
+        raise HTTPException(status_code=502, detail="Failed to stream from Jellyfin")
     except ExternalServiceError as e:
         if "416" in str(e):
             raise HTTPException(status_code=416, detail="Range not satisfiable")
@@ -51,15 +62,19 @@ async def stream_jellyfin_audio(
 @router.head("/jellyfin/{item_id}")
 async def head_jellyfin_audio(
     item_id: str,
+    current_user: CurrentUserDep,
     playback_service: JellyfinPlaybackService = Depends(get_jellyfin_playback_service),
 ) -> Response:
     try:
-        return await playback_service.proxy_head(item_id)
+        return await playback_service.proxy_head(item_id, user_id=current_user.id)
     except ResourceNotFoundError:
         raise HTTPException(status_code=404, detail="Audio item not found")
     except PlaybackNotAllowedError as e:
         logger.warning("Playback not allowed for %s: %s", item_id, e)
         raise HTTPException(status_code=403, detail="Playback not allowed")
+    except JellyfinAuthError as e:
+        logger.warning("Jellyfin auth failure heading %s: %s", item_id, e)
+        raise HTTPException(status_code=502, detail="Failed to resolve Jellyfin stream")
     except ExternalServiceError as e:
         logger.error("Jellyfin head stream error for %s: %s", item_id, e)
         raise HTTPException(status_code=502, detail="Failed to resolve Jellyfin stream")
@@ -194,10 +209,11 @@ async def stream_local_file(
 @router.head("/navidrome/{item_id}")
 async def head_navidrome_audio(
     item_id: str,
+    current_user: CurrentUserDep,
     playback_service: NavidromePlaybackService = Depends(get_navidrome_playback_service),
 ) -> Response:
     try:
-        return await playback_service.proxy_head(item_id)
+        return await playback_service.proxy_head(item_id, user_id=current_user.id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid stream request")
     except ExternalServiceError:
@@ -208,10 +224,13 @@ async def head_navidrome_audio(
 async def stream_navidrome_audio(
     item_id: str,
     request: Request,
+    current_user: CurrentUserDep,
     playback_service: NavidromePlaybackService = Depends(get_navidrome_playback_service),
 ) -> StreamingResponse:
     try:
-        return await playback_service.proxy_stream(item_id, request.headers.get("Range"))
+        return await playback_service.proxy_stream(
+            item_id, request.headers.get("Range"), user_id=current_user.id
+        )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid stream request")
     except ExternalServiceError as e:
@@ -254,10 +273,11 @@ async def navidrome_stopped(
 @router.head("/plex/{part_key:path}")
 async def head_plex_audio(
     part_key: str,
+    current_user: CurrentUserDep,
     playback_service: PlexPlaybackService = Depends(get_plex_playback_service),
 ) -> Response:
     try:
-        return await playback_service.proxy_head(part_key)
+        return await playback_service.proxy_head(part_key, user_id=current_user.id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid stream request")
     except ExternalServiceError:
@@ -268,10 +288,13 @@ async def head_plex_audio(
 async def stream_plex_audio(
     part_key: str,
     request: Request,
+    current_user: CurrentUserDep,
     playback_service: PlexPlaybackService = Depends(get_plex_playback_service),
 ) -> StreamingResponse:
     try:
-        return await playback_service.proxy_stream(part_key, request.headers.get("Range"))
+        return await playback_service.proxy_stream(
+            part_key, request.headers.get("Range"), user_id=current_user.id
+        )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid stream request")
     except ExternalServiceError as e:

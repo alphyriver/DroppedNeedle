@@ -640,8 +640,12 @@ class LibraryReviewService:
         evidence: CandidateEvidence | None,
     ) -> list[str]:
         if review.state == "excluded" or review.effective_policy == "excluded":
-            return ["restore"] if review.exclusion_source == "item_decision" else []
-        actions = ["exclude", "retry"]
+            return (
+                ["restore", "dismiss"]
+                if review.exclusion_source == "item_decision"
+                else ["dismiss"]
+            )
+        actions = ["exclude", "retry", "dismiss"]
         if identity is None:
             actions.append("keep_tagged")
         else:

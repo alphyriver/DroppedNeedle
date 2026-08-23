@@ -117,7 +117,11 @@ upgrade and is unsupported. The `/app/config` and `/app/cache` mounts must be wr
 support SQLite WAL locking, `fsync`, and atomic file replacement. This includes ordinary
 Docker bind mounts and named volumes, plus local Unraid shares and TrueNAS datasets with
 the usual container permissions. NFS, SMB, and other network mounts are safe only when
-they provide those SQLite filesystem guarantees.
+they provide those SQLite filesystem guarantees. On Docker Desktop for Windows, prefer
+named Docker volumes over Windows-path bind mounts for `/app/config` and `/app/cache`;
+the Windows mount translation does not reliably honor atomic file replacement. The
+startup upgrade detects this and falls back to a verified direct copy, but named
+volumes remain the recommended setup on Windows.
 
 ### 3. First-run setup
 

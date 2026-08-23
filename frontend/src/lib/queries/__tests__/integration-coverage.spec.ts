@@ -402,6 +402,7 @@ const COVERAGE: Array<[string, string, string]> = [
 	['current scan runs', API.library.currentScanRuns(), '/api/v1/library/scan-runs/current'],
 	['scan run estimate', API.library.scanRunEstimate(), '/api/v1/library/scan-runs/estimate'],
 	['scan run detail', API.library.scanRun('R1'), '/api/v1/library/scan-runs/R1'],
+	['scan run failures', API.library.scanRunFailures('R1'), '/api/v1/library/scan-runs/R1/failures'],
 	['pause scan run', API.library.pauseScanRun('R1'), '/api/v1/library/scan-runs/R1/pause'],
 	['resume scan run', API.library.resumeScanRun('R1'), '/api/v1/library/scan-runs/R1/resume'],
 	['stop scan run', API.library.stopScanRun('R1'), '/api/v1/library/scan-runs/R1/stop'],

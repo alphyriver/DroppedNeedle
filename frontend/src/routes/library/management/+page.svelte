@@ -25,6 +25,7 @@
 	const settingsQuery = getTargetLibrarySettingsQuery(() => authStore.isAdmin);
 	const activityQuery = getLibraryActivityQuery(() => authStore.user?.id);
 	const roots = $derived(settingsQuery.data?.library_roots ?? []);
+	const libraryEnabled = $derived(settingsQuery.data?.enabled ?? true);
 	const policyRevision = $derived(settingsQuery.data?.policy_revision ?? '');
 	const workItems = $derived(activityQuery.data?.work_items ?? []);
 	const scanWork = $derived(
@@ -205,7 +206,22 @@
 			</div>
 		{:else if activeTab === 'organize'}
 			<div role="tabpanel" id="management-panel-organize" aria-labelledby="management-tab-organize">
-				<LibraryManagementControlRoom />
+				{#if !libraryEnabled}
+					<div class="alert alert-warning">
+						<FolderCog class="h-5 w-5" />
+						<div class="min-w-0 flex-1">
+							<strong>The local library is disabled</strong>
+							<p class="text-sm">
+								File organization is paused. Existing catalog data and playback keep working. Enable
+								the library in
+								<a class="link link-primary" href="/settings?tab=library">Settings</a> to run organization
+								again.
+							</p>
+						</div>
+					</div>
+				{:else}
+					<LibraryManagementControlRoom />
+				{/if}
 			</div>
 		{:else}
 			<div
@@ -220,6 +236,18 @@
 					</div>
 				{:else if settingsQuery.isError}
 					<div class="alert alert-error">Could not load organization settings.</div>
+				{:else if !libraryEnabled}
+					<div class="alert alert-warning">
+						<Settings2 class="h-5 w-5" />
+						<div class="min-w-0 flex-1">
+							<strong>The local library is disabled</strong>
+							<p class="text-sm">
+								Automatic organization is paused. Enable the library in
+								<a class="link link-primary" href="/settings?tab=library">Settings</a> to manage profiles
+								and automation again.
+							</p>
+						</div>
+					</div>
 				{:else}
 					<SettingsLibraryManagement {roots} {policyRevision} />
 				{/if}

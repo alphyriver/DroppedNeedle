@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import threading
 import time
@@ -14,7 +15,12 @@ from pathlib import Path, PurePosixPath
 import msgspec
 
 from infrastructure.persistence.native_library_store import NativeLibraryStore
-from models.library_work import ScanInventoryItem, ScanRun, ScanScope
+from models.library_work import (
+    ScanFailureRecord,
+    ScanInventoryItem,
+    ScanRun,
+    ScanScope,
+)
 from services.local_files_service import AUDIO_EXTENSIONS
 from services.native.library_filesystem_coordinator import (
     LibraryFilesystemCoordinator,
@@ -28,12 +34,32 @@ INVENTORY_BATCH_SIZE = 256
 
 Checkpoint = Callable[[str, str], Awaitable[bool]]
 DirectoryWalker = Callable[..., Iterator[tuple[str, list[str], list[str]]]]
+DirectoryProbe = Callable[[Path], bool]
 logger = logging.getLogger(__name__)
 
 
 @contextmanager
 def _uncoordinated_read() -> Iterator[None]:
     yield
+
+
+class _WalkHeartbeat:
+    """Thread-safe liveness signal written by the walk producer thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._touched_at = time.monotonic()
+        self.last_directory = ""
+
+    def touch(self, directory: str = "") -> None:
+        with self._lock:
+            self._touched_at = time.monotonic()
+            if directory:
+                self.last_directory = directory
+
+    def age(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._touched_at
 
 
 class LibraryInventoryScanner:
@@ -43,10 +69,73 @@ class LibraryInventoryScanner:
         *,
         directory_walker: DirectoryWalker = os.walk,
         filesystem_coordinator: LibraryFilesystemCoordinator | None = None,
+        walk_deadline_seconds: float = 30.0,
+        directory_probe: DirectoryProbe = Path.is_dir,
+        max_detached_walkers: int = 4,
     ) -> None:
         self._store = store
         self._directory_walker = directory_walker
         self._filesystem = filesystem_coordinator
+        self._walk_deadline_seconds = walk_deadline_seconds
+        self._directory_probe = directory_probe
+        self._max_detached_walkers = max_detached_walkers
+        self._detached_walkers: set[asyncio.Task[None]] = set()
+
+    def _finish_detached_walker(self, task: asyncio.Task[None]) -> None:
+        self._detached_walkers.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    def _detach_walker(self, task: asyncio.Task[None]) -> None:
+        if task.done():
+            return
+        if len(self._detached_walkers) < self._max_detached_walkers:
+            self._detached_walkers.add(task)
+        task.add_done_callback(self._finish_detached_walker)
+
+    async def _record_failure(
+        self,
+        run_id: str,
+        scope: ScanScope,
+        *,
+        relative_path: str,
+        failure_code: str,
+        failure_detail: str,
+    ) -> None:
+        await self._store.record_scan_failures(
+            run_id,
+            [
+                ScanFailureRecord(
+                    root_id=scope.root_id,
+                    relative_path=relative_path,
+                    failure_code=failure_code,
+                    recorded_at=time.time(),
+                    failure_detail=failure_detail,
+                    phase="discovering",
+                )
+            ],
+        )
+
+    @staticmethod
+    def _relativize(path: Path, root: Path) -> str:
+        try:
+            return PurePosixPath(*path.relative_to(root).parts).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    @staticmethod
+    def _failure_relative_path(
+        exc: BaseException, root: Path, heartbeat: _WalkHeartbeat
+    ) -> str:
+        filename = getattr(exc, "filename", None)
+        candidate = (
+            Path(str(filename))
+            if filename
+            else (Path(heartbeat.last_directory) if heartbeat.last_directory else None)
+        )
+        if candidate is None:
+            return "."
+        return LibraryInventoryScanner._relativize(candidate, root)
 
     async def discover(
         self,
@@ -71,6 +160,13 @@ class LibraryInventoryScanner:
             if root is None and scope.root_path is not None:
                 root = Path(scope.root_path)
             if root is None:
+                await self._record_failure(
+                    run.id,
+                    scope,
+                    relative_path=scope.relative_path,
+                    failure_code="ROOT_UNAVAILABLE",
+                    failure_detail="The library root has no configured path.",
+                )
                 await self._store.complete_scan_scope_discovery(
                     run.id,
                     scope.root_id,
@@ -89,8 +185,51 @@ class LibraryInventoryScanner:
             selected = (
                 root if scope.relative_path == "." else root / scope.relative_path
             )
-            exists = await asyncio.to_thread(selected.is_dir)
+            try:
+                exists = await asyncio.wait_for(
+                    asyncio.to_thread(self._directory_probe, selected),
+                    timeout=self._walk_deadline_seconds,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "library_scan event=walk_timeout run_id=%s root_id=%s path=%s",
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                )
+                await self._record_failure(
+                    run.id,
+                    scope,
+                    relative_path=scope.relative_path,
+                    failure_code="WALK_TIMEOUT",
+                    failure_detail=(
+                        "The library root probe exceeded "
+                        f"{self._walk_deadline_seconds:.1f}s."
+                    ),
+                )
+                await self._store.complete_scan_scope_discovery(
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                    state="unavailable",
+                    error_code="WALK_TIMEOUT",
+                )
+                return await self._store.transition_scan_run(
+                    run.id,
+                    expected_state=current.state,
+                    expected_revision=current.row_revision,
+                    new_state="failed",
+                    now=current.updated_at,
+                    terminal_code="WALK_TIMEOUT",
+                )
             if not exists:
+                await self._record_failure(
+                    run.id,
+                    scope,
+                    relative_path=scope.relative_path,
+                    failure_code="ROOT_UNAVAILABLE",
+                    failure_detail=f"The library root path is missing: {selected}",
+                )
                 await self._store.complete_scan_scope_discovery(
                     run.id,
                     scope.root_id,
@@ -117,7 +256,7 @@ class LibraryInventoryScanner:
                     if self._filesystem is not None
                     else None
                 )
-                current, completed = await self._walk_scope(
+                current, completed, walk_failure_code = await self._walk_scope(
                     current,
                     scope,
                     root,
@@ -146,7 +285,7 @@ class LibraryInventoryScanner:
                         expected_revision=current.row_revision,
                         new_state="failed",
                         now=current.updated_at,
-                        terminal_code="ROOT_PERMISSION_DENIED",
+                        terminal_code=walk_failure_code or "ROOT_PERMISSION_DENIED",
                     )
                 return current
             await self._store.complete_scan_scope_discovery(
@@ -167,12 +306,13 @@ class LibraryInventoryScanner:
         resolver: LibraryPolicyResolver,
         checkpoint: Checkpoint,
         discovery_generation: int = 1,
-    ) -> tuple[ScanRun, bool]:
+    ) -> tuple[ScanRun, bool, str | None]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[Path, os.stat_result] | BaseException | None] = (
             asyncio.Queue(maxsize=INVENTORY_QUEUE_SIZE)
         )
         stopped = threading.Event()
+        heartbeat = _WalkHeartbeat()
 
         def producer() -> None:
             try:
@@ -196,6 +336,7 @@ class LibraryInventoryScanner:
                             directory, subdirectories, filenames = next(walker)
                         except StopIteration:
                             break
+                        heartbeat.touch(directory)
                         subdirectories[:] = [
                             name
                             for name in subdirectories
@@ -205,6 +346,7 @@ class LibraryInventoryScanner:
                             tuple[Path, os.stat_result] | BaseException
                         ] = []
                         for filename in filenames:
+                            heartbeat.touch(directory)
                             path = Path(directory) / filename
                             if (
                                 path.suffix.casefold() not in AUDIO_EXTENSIONS
@@ -232,6 +374,8 @@ class LibraryInventoryScanner:
         current = run
         completed = True
         discard_remaining = False
+        detached = False
+        walk_failure_code: str | None = None
         discovered = 0
         stale_cleanup_pending = True
         last_checkpoint = time.monotonic()
@@ -241,6 +385,36 @@ class LibraryInventoryScanner:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=0.25)
                 except TimeoutError:
+                    if heartbeat.age() > self._walk_deadline_seconds:
+                        completed = False
+                        stopped.set()
+                        walk_failure_code = "WALK_TIMEOUT"
+                        logger.warning(
+                            "library_scan event=walk_timeout run_id=%s root_id=%s "
+                            "path=%s",
+                            run.id,
+                            scope.root_id,
+                            heartbeat.last_directory or scope.relative_path,
+                        )
+                        await self._record_failure(
+                            run.id,
+                            scope,
+                            relative_path=(
+                                self._relativize(Path(heartbeat.last_directory), root)
+                                if heartbeat.last_directory
+                                else scope.relative_path
+                            ),
+                            failure_code="WALK_TIMEOUT",
+                            failure_detail=(
+                                "The directory walk made no progress for "
+                                f"{self._walk_deadline_seconds:.1f}s."
+                            ),
+                        )
+                        # The producer thread is wedged in a syscall; awaiting it
+                        # would wedge the scan worker, so it is detached instead.
+                        self._detach_walker(producer_task)
+                        detached = True
+                        break
                     if not await checkpoint(run.id, scope.policy_revision):
                         completed = False
                         stopped.set()
@@ -255,6 +429,28 @@ class LibraryInventoryScanner:
                     completed = False
                     stopped.set()
                     discard_remaining = True
+                    walk_failure_code = "ROOT_PERMISSION_DENIED"
+                    relative_path = self._failure_relative_path(item, root, heartbeat)
+                    failure_code = (
+                        "WALK_" + errno.errorcode.get(item.errno, "EUNKNOWN")
+                        if isinstance(item, OSError) and item.errno is not None
+                        else "WALK_ERROR"
+                    )
+                    logger.warning(
+                        "library_scan event=walk_error run_id=%s root_id=%s path=%s "
+                        "error=%s",
+                        run.id,
+                        scope.root_id,
+                        relative_path,
+                        item,
+                    )
+                    await self._record_failure(
+                        run.id,
+                        scope,
+                        relative_path=relative_path,
+                        failure_code=failure_code,
+                        failure_detail=str(item),
+                    )
                     continue
                 batch.append(item)
                 if len(batch) >= INVENTORY_BATCH_SIZE:
@@ -307,12 +503,17 @@ class LibraryInventoryScanner:
                 try:
                     await asyncio.wait_for(queue.get(), timeout=0.1)
                 except TimeoutError:
+                    if heartbeat.age() > self._walk_deadline_seconds:
+                        self._detach_walker(producer_task)
+                        detached = True
+                        break
                     continue
-            await asyncio.shield(producer_task)
+            if not detached:
+                await asyncio.shield(producer_task)
             raise
         finally:
             stopped.set()
-            if not producer_task.done():
+            if not detached and not producer_task.done():
                 await producer_task
         if not completed:
             await self._store.complete_scan_scope_discovery(
@@ -320,9 +521,9 @@ class LibraryInventoryScanner:
                 scope.root_id,
                 scope.relative_path,
                 state="partially_read",
-                error_code="ROOT_PERMISSION_DENIED",
+                error_code=walk_failure_code or "ROOT_PERMISSION_DENIED",
             )
-        return current, completed
+        return current, completed, walk_failure_code
 
     async def _persist_batch(
         self,

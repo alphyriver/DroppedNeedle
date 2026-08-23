@@ -1,3 +1,4 @@
+import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -225,3 +226,131 @@ class TestPerUserAttribution:
 
         with pytest.raises(JellyfinAuthError):
             await svc.start_playback("item-1")
+
+
+class TestPerUserProxyStreaming:
+    """Streaming proxies through the user's linked repo, app account as fallback."""
+
+    @staticmethod
+    def _stream_result():
+        from repositories.navidrome_models import StreamProxyResult
+
+        async def _chunks():
+            yield b"data"
+
+        return StreamProxyResult(
+            status_code=200,
+            headers={"Content-Type": "audio/flac"},
+            media_type="audio/flac",
+            body_chunks=_chunks(),
+        )
+
+    @staticmethod
+    def _factory(per_user_repo):
+        factory = MagicMock()
+        factory.resolve_jellyfin = AsyncMock(return_value=per_user_repo)
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_uses_per_user_repo_when_linked(self):
+        app_repo = _make_repo()
+        per_user = _make_repo()
+        per_user.proxy_get_stream = AsyncMock(return_value=self._stream_result())
+        svc = JellyfinPlaybackService(
+            jellyfin_repo=app_repo, client_factory=self._factory(per_user)
+        )
+
+        await svc.proxy_stream("item-1", range_header="bytes=0-", user_id="u1")
+
+        per_user.proxy_get_stream.assert_awaited_once_with(
+            "item-1", range_header="bytes=0-"
+        )
+        app_repo.proxy_get_stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_proxy_head_uses_per_user_repo_when_linked(self):
+        app_repo = _make_repo()
+        per_user = _make_repo()
+        per_user.proxy_head_stream = AsyncMock(return_value=self._stream_result())
+        svc = JellyfinPlaybackService(
+            jellyfin_repo=app_repo, client_factory=self._factory(per_user)
+        )
+
+        await svc.proxy_head("item-1", user_id="u1")
+
+        per_user.proxy_head_stream.assert_awaited_once_with("item-1")
+        app_repo.proxy_head_stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_falls_back_to_app_repo_when_unlinked(self):
+        app_repo = _make_repo()
+        app_repo.proxy_get_stream = AsyncMock(return_value=self._stream_result())
+        svc = JellyfinPlaybackService(
+            jellyfin_repo=app_repo, client_factory=self._factory(None)
+        )
+
+        await svc.proxy_stream("item-1", user_id="u1")
+
+        app_repo.proxy_get_stream.assert_awaited_once_with(
+            "item-1", range_header=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_falls_back_to_app_repo_on_linked_auth_failure(
+        self, caplog
+    ):
+        from core.exceptions import JellyfinAuthError
+
+        app_repo = _make_repo()
+        app_repo.proxy_get_stream = AsyncMock(return_value=self._stream_result())
+        per_user = _make_repo()
+        per_user.proxy_get_stream = AsyncMock(
+            side_effect=JellyfinAuthError("revoked")
+        )
+        svc = JellyfinPlaybackService(
+            jellyfin_repo=app_repo, client_factory=self._factory(per_user)
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await svc.proxy_stream("item-1", user_id="u1")
+
+        per_user.proxy_get_stream.assert_awaited_once()
+        app_repo.proxy_get_stream.assert_awaited_once_with(
+            "item-1", range_header=None
+        )
+        assert any(
+            "app account" in record.message and "u1" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_proxy_head_falls_back_to_app_repo_on_linked_auth_failure(self):
+        from core.exceptions import JellyfinAuthError
+
+        app_repo = _make_repo()
+        app_repo.proxy_head_stream = AsyncMock(return_value=self._stream_result())
+        per_user = _make_repo()
+        per_user.proxy_head_stream = AsyncMock(
+            side_effect=JellyfinAuthError("revoked")
+        )
+        svc = JellyfinPlaybackService(
+            jellyfin_repo=app_repo, client_factory=self._factory(per_user)
+        )
+
+        await svc.proxy_head("item-1", user_id="u1")
+
+        per_user.proxy_head_stream.assert_awaited_once()
+        app_repo.proxy_head_stream.assert_awaited_once_with("item-1")
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_app_level_auth_failure_still_raises(self):
+        from core.exceptions import JellyfinAuthError
+
+        app_repo = _make_repo()
+        app_repo.proxy_get_stream = AsyncMock(
+            side_effect=JellyfinAuthError("bad api key")
+        )
+        svc = JellyfinPlaybackService(jellyfin_repo=app_repo)
+
+        with pytest.raises(JellyfinAuthError):
+            await svc.proxy_stream("item-1")

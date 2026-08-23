@@ -96,6 +96,8 @@
 			><option value="">All reasons</option><option value="NO_CANDIDATE">No external result</option
 			><option value="AMBIGUOUS">Several equally likely releases</option><option
 				value="CONTRADICTORY">Conflicting track evidence</option
+			><option value="MAX_DEFERRALS_EXCEEDED">Retry limit reached</option><option
+				value="SUBJECT_NOT_AVAILABLE">Album no longer available</option
 			></select
 		>
 		<select
@@ -167,6 +169,8 @@
 						>No external result</option
 					><option value="AMBIGUOUS">Several equally likely releases</option><option
 						value="CONTRADICTORY">Conflicting track evidence</option
+					><option value="MAX_DEFERRALS_EXCEEDED">Retry limit reached</option><option
+						value="SUBJECT_NOT_AVAILABLE">Album no longer available</option
 					></select
 				></label
 			><label class="form-control"

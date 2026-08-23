@@ -97,6 +97,11 @@ class LibraryScanCoordinator:
         )
 
     async def request_run(self, request: ScanRequest) -> ScanRequestResult:
+        if not self._resolver_getter().settings.enabled:
+            raise ValidationError(
+                "The local library is disabled. Enable it in Settings → Library "
+                "before starting a scan."
+            )
         if not request.scopes:
             raise ValidationError("Select at least one library scope.")
         if any(
@@ -179,6 +184,8 @@ class LibraryScanCoordinator:
         )
 
     async def recover(self) -> list[ScanRun]:
+        if not self._resolver_getter().settings.enabled:
+            return []
         runs = await self._store.recover_scan_runs(now=self._clock())
         self._pending_control_run_ids.clear()
         for run in runs:
@@ -257,6 +264,8 @@ class LibraryScanCoordinator:
         return run.state in {"discovering", "indexing", "reconciling"}
 
     async def run_once(self, root_paths: dict[str, Path]) -> ScanRun | None:
+        if not self._resolver_getter().settings.enabled:
+            return None
         await self._store.cleanup_terminal_scan_inventory(limit=5_000)
         run = await self._store.get_resumable_scan_run()
         newly_claimed = run is None
