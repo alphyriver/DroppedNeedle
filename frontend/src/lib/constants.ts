@@ -302,6 +302,14 @@ export const API = {
 			return `/api/v1/library/scan-runs/estimate${query ? `?${query}` : ''}`;
 		},
 		scanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}`,
+		scanRunFailures: (runId: string, limit?: number, cursor?: number) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor !== undefined) query.set('cursor', String(cursor));
+			let url = `/api/v1/library/scan-runs/${runId}/failures`;
+			if (query.size) url += `?${query.toString()}`;
+			return url;
+		},
 		pauseScanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}/pause`,
 		resumeScanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}/resume`,
 		stopScanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}/stop`,
@@ -334,6 +342,7 @@ export const API = {
 			`/api/v1/library/reviews/${reviewId}/detach-and-keep-tagged`,
 		reviewExclude: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/exclude`,
 		reviewRestore: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/restore`,
+		reviewDismiss: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/dismiss`,
 		reviewCandidate: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/candidate`,
 		reviewRetry: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/retry`,
 		bulkReviewPreview: () => '/api/v1/library/reviews/bulk-preview',

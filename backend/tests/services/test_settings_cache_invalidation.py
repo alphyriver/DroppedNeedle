@@ -295,3 +295,125 @@ async def test_youtube_settings_change_clears_home_cache():
     mock_repo_fn.cache_clear.assert_called_once()
     for key in home_keys:
         assert await cache.get(key) is None
+
+
+@pytest.fixture
+def mb_live_state():
+    """Snapshot and restore the live MusicBrainz module state around a test."""
+    from repositories.musicbrainz_base import (
+        get_mb_api_base,
+        set_mb_api_base,
+        mb_rate_limiter,
+    )
+
+    base = get_mb_api_base()
+    rate = mb_rate_limiter.rate
+    capacity = mb_rate_limiter.capacity
+    yield
+    set_mb_api_base(base)
+    mb_rate_limiter.update_rate(rate)
+    mb_rate_limiter.update_capacity(capacity)
+
+
+def _mb_settings(api_url: str, rate_limit: float, concurrent_searches: int):
+    from api.v1.schemas.settings import MusicBrainzConnectionSettings
+
+    return MusicBrainzConnectionSettings(
+        api_url=api_url,
+        rate_limit=rate_limit,
+        concurrent_searches=concurrent_searches,
+    )
+
+
+def _seed_mb_live_state(settings) -> None:
+    from repositories.musicbrainz_base import set_mb_api_base, mb_rate_limiter
+
+    set_mb_api_base(settings.api_url)
+    mb_rate_limiter.update_rate(settings.rate_limit)
+    mb_rate_limiter.update_capacity(settings.concurrent_searches)
+
+
+def _spy_mb_side_effects(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from repositories.musicbrainz_base import mb_circuit_breaker, mb_deduplicator
+
+    reset = MagicMock()
+    clear = MagicMock()
+    monkeypatch.setattr(mb_circuit_breaker, "reset", reset)
+    monkeypatch.setattr(mb_deduplicator, "clear", clear)
+    return reset, clear
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_musicbrainz_settings_unchanged_skips_reset_and_cache_clear(
+    mb_live_state, monkeypatch
+):
+    """Saving identical MusicBrainz settings is a no-op: no breaker reset, no
+    deduplicator clear, caches survive - endpoint behavior did not change."""
+    service, cache = await _build_service()
+    settings = _mb_settings("https://mb.mirror.example/ws/2", 2.0, 4)
+    _seed_mb_live_state(settings)
+    reset, clear = _spy_mb_side_effects(monkeypatch)
+
+    mb_keys = [f"{p}noop" for p in musicbrainz_prefixes()]
+    await _populate(cache, mb_keys)
+
+    await service.on_musicbrainz_settings_changed(settings)
+
+    reset.assert_not_called()
+    clear.assert_not_called()
+    for key in mb_keys:
+        assert await cache.get(key) == "v"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_musicbrainz_settings_endpoint_change_resets_and_clears(
+    mb_live_state, monkeypatch
+):
+    """An endpoint change resets the breaker, clears the deduplicator, and
+    clears the MusicBrainz cache prefixes."""
+    service, cache = await _build_service()
+    _seed_mb_live_state(_mb_settings("https://mb-a.example/ws/2", 2.0, 4))
+    reset, clear = _spy_mb_side_effects(monkeypatch)
+
+    mb_keys = [f"{p}endpoint" for p in musicbrainz_prefixes()]
+    await _populate(cache, mb_keys)
+
+    await service.on_musicbrainz_settings_changed(
+        _mb_settings("https://mb-b.example/ws/2", 2.0, 4)
+    )
+
+    from repositories.musicbrainz_base import get_mb_api_base
+
+    reset.assert_called_once()
+    clear.assert_called_once()
+    assert get_mb_api_base() == "https://mb-b.example/ws/2"
+    for key in mb_keys:
+        assert await cache.get(key) is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_musicbrainz_settings_rate_only_change_resets_and_clears(
+    mb_live_state, monkeypatch
+):
+    """A rate-only change re-arms the limiter, so it is behavior-changing and
+    must reset the breaker and clear caches too."""
+    service, cache = await _build_service()
+    _seed_mb_live_state(_mb_settings("https://mb-a.example/ws/2", 2.0, 4))
+    reset, clear = _spy_mb_side_effects(monkeypatch)
+
+    mb_keys = [f"{p}rate" for p in musicbrainz_prefixes()]
+    await _populate(cache, mb_keys)
+
+    await service.on_musicbrainz_settings_changed(
+        _mb_settings("https://mb-a.example/ws/2", 3.0, 4)
+    )
+
+    from repositories.musicbrainz_base import mb_rate_limiter
+
+    reset.assert_called_once()
+    clear.assert_called_once()
+    assert mb_rate_limiter.rate == 3.0
+    for key in mb_keys:
+        assert await cache.get(key) is None

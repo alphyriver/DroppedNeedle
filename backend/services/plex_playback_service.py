@@ -36,14 +36,16 @@ class PlexPlaybackService:
                 return per_user
         return self._plex
 
-    async def proxy_head(self, part_key: str) -> Response:
-        result: StreamProxyResult = await self._plex.proxy_head_stream(part_key)
+    async def proxy_head(self, part_key: str, user_id: str | None = None) -> Response:
+        repo = await self._repo_for(user_id)
+        result: StreamProxyResult = await repo.proxy_head_stream(part_key)
         return Response(status_code=result.status_code, headers=result.headers)
 
     async def proxy_stream(
-        self, part_key: str, range_header: str | None = None
+        self, part_key: str, range_header: str | None = None, user_id: str | None = None
     ) -> StreamingResponse:
-        result: StreamProxyResult = await self._plex.proxy_get_stream(
+        repo = await self._repo_for(user_id)
+        result: StreamProxyResult = await repo.proxy_get_stream(
             part_key, range_header=range_header
         )
         return StreamingResponse(

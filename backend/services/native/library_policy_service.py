@@ -274,6 +274,7 @@ class LibraryPolicyService:
             staging_path=settings.staging_path,
             naming_template=settings.naming_template,
             acoustid_api_key=settings.acoustid_api_key,
+            enabled=settings.enabled,
             policy_revision=resolver.policy_revision,
             reconciliation_required=reconciliation_required,
             reconciliation_state=(

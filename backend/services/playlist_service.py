@@ -801,9 +801,19 @@ class PlaylistService:
         nd_by_num: dict[tuple[int, int], tuple[str, str]] = {}
         plex_by_num: dict[tuple[int, int], tuple[str, str, str]] = {}
 
+        # Pre-fix Jellyfin imports stored the Jellyfin album GUID as album_id,
+        # which the MBID-keyed Jellyfin/local lookups can never match. Re-key it
+        # via the album's provider ids so legacy rows resolve without a
+        # migration. The cache key above stays the original album_id.
+        match_album_id = album_id
         if jf_service is not None:
             try:
                 match = await jf_service.match_album_by_mbid(album_id)
+                if not match.found:
+                    mbid = await jf_service.resolve_album_mbid(album_id)
+                    if isinstance(mbid, str) and mbid and mbid != album_id:
+                        match_album_id = mbid
+                        match = await jf_service.match_album_by_mbid(mbid)
                 if match.found:
                     for t in match.tracks:
                         key = _safe_track_number(t.track_number)
@@ -821,7 +831,7 @@ class PlaylistService:
 
         if local_service is not None:
             try:
-                match = await local_service.match_album_by_mbid(album_id)
+                match = await local_service.match_album_by_mbid(match_album_id)
                 if match.found:
                     for t in match.tracks:
                         key = _safe_track_number(t.track_number)

@@ -3,7 +3,10 @@
 	import { api } from '$lib/api/client';
 	import { API } from '$lib/constants';
 	import { toastStore } from '$lib/stores/toast';
-	import { getLibraryRunHistoryQuery } from '$lib/queries/library/LibraryOperationQueries.svelte';
+	import {
+		getLibraryRunFailuresQuery,
+		getLibraryRunHistoryQuery
+	} from '$lib/queries/library/LibraryOperationQueries.svelte';
 	import type { ScanRun } from '$lib/queries/library/LibraryOperationsTypes';
 	import { tick } from 'svelte';
 
@@ -14,6 +17,8 @@
 	const visibleRuns = $derived(showOlder ? runs : runs.slice(0, DEFAULT_VISIBLE_RUNS));
 	const olderRunCount = $derived(Math.max(0, runs.length - DEFAULT_VISIBLE_RUNS));
 	let detailRun = $state<ScanRun | null>(null);
+	const failuresQuery = getLibraryRunFailuresQuery(() => detailRun?.id ?? null);
+	const failureItems = $derived(failuresQuery.data?.pages.flatMap((page) => page.items) ?? []);
 	let exportRun = $state<ScanRun | null>(null);
 	let exporting = $state(false);
 	let detailDialog: HTMLDialogElement;
@@ -44,6 +49,7 @@
 			CANCELLED: 'Stopped by an administrator',
 			POLICY_CHANGED: 'Stopped because library policy changed',
 			SUPERSEDED_POLICY_CHANGED: 'Stopped because library policy changed',
+			WALK_TIMEOUT: 'Stopped because a library folder stopped responding',
 			FAILED: 'The scan could not finish'
 		};
 		return run.terminal_code
@@ -250,6 +256,39 @@
 						<li>{phase.replaceAll('_', ' ')} · {phaseDuration(seconds)}</li>
 					{/each}
 				</ul>
+			{/if}
+			{#if detailRun.state === 'failed' || (detailRun.counters['errored_count'] ?? 0) > 0}
+				<h3 class="mt-4 text-sm font-semibold">Failed paths</h3>
+				{#if failuresQuery.isLoading}
+					<p class="mt-2 text-sm text-base-content/55">Loading failed paths…</p>
+				{:else if failuresQuery.isError}
+					<p class="mt-2 text-sm text-error">Could not load failed paths.</p>
+				{:else if failureItems.length === 0}
+					<p class="mt-2 text-sm text-base-content/55">No failed paths were recorded.</p>
+				{:else}
+					<ul class="mt-2 space-y-1 text-sm text-base-content/65">
+						{#each failureItems as failure, index (index)}
+							<li class="flex items-center justify-between gap-2">
+								<span class="truncate">{failure.relative_path}</span>
+								<span class="badge badge-error badge-sm shrink-0">{failure.failure_code}</span>
+							</li>
+						{/each}
+					</ul>
+					{#if failuresQuery.hasNextPage}
+						<div class="mt-2 text-center">
+							<button
+								class="btn btn-ghost btn-sm"
+								disabled={failuresQuery.isFetchingNextPage}
+								onclick={() => failuresQuery.fetchNextPage()}
+							>
+								{#if failuresQuery.isFetchingNextPage}
+									<span class="loading loading-spinner loading-xs"></span>
+								{/if}
+								Load more
+							</button>
+						</div>
+					{/if}
+				{/if}
 			{/if}
 			<div class="modal-action">
 				<button

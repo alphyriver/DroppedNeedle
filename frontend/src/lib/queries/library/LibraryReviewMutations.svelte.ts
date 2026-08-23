@@ -34,7 +34,7 @@ async function invalidateReviewState(reviewId?: string): Promise<void> {
 	]);
 }
 
-export type ReviewAction = 'keep_tagged' | 'detach_keep_tagged' | 'exclude' | 'restore';
+export type ReviewAction = 'keep_tagged' | 'detach_keep_tagged' | 'exclude' | 'restore' | 'dismiss';
 
 export function actOnLibraryReview(action: ReviewAction) {
 	return createMutation(() => ({
@@ -46,7 +46,9 @@ export function actOnLibraryReview(action: ReviewAction) {
 						? API.library.reviewDetachKeepTagged(input.reviewId)
 						: action === 'exclude'
 							? API.library.reviewExclude(input.reviewId)
-							: API.library.reviewRestore(input.reviewId);
+							: action === 'dismiss'
+								? API.library.reviewDismiss(input.reviewId)
+								: API.library.reviewRestore(input.reviewId);
 			return api.global.post<ReviewActionResponse>(url, input.body);
 		},
 		onSuccess: async (_result, input) => {

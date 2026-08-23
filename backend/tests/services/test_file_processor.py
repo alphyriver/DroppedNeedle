@@ -1198,6 +1198,45 @@ async def test_place_held_file_imports_bypassing_verify(tmp_path: Path):
     assert await manager.has_album("rg-9") is True
 
 
+@pytest.mark.asyncio
+async def test_place_held_file_without_library_root_raises_configuration_error(
+    tmp_path: Path,
+):
+    """Every root removed since the file was held: an actionable, recoverable 400
+    (the user restores a root and retries) instead of an IndexError 500 - and the
+    publisher is never touched, so nothing lands in a half-imported state."""
+    from core.exceptions import ConfigurationError
+    from models.held_import import HeldImport
+
+    publisher = AsyncMock()
+    fp, _manager, _client, _library, _downloads = _make_processor(
+        tmp_path, publisher=publisher
+    )
+    fp._library_paths = []  # roots cleared after the hold was recorded
+    held_dir = tmp_path / "held"
+    held_dir.mkdir()
+    held_file = held_dir / "src.flac"
+    shutil.copy(_FLAC, held_file)
+    held = HeldImport(
+        id=1,
+        user_id="user-a",
+        held_path=str(held_file),
+        reason="fingerprint_mismatch",
+        source="usenet",
+        status="held",
+        created_at=0.0,
+        release_group_mbid="rg-9",
+        recording_mbid="rec-3",
+        track_number=3,
+        naming_template=_TEMPLATE,
+    )
+
+    with pytest.raises(ConfigurationError, match="No library root is configured"):
+        await fp.place_held_file(held)
+
+    publisher.assert_not_called()
+
+
 # -- P2: the file's OWN tags vs the requested identity (2026-07-05 wrong-single) --
 
 

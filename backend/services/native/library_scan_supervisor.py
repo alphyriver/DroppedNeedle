@@ -69,7 +69,10 @@ async def supervise_target_scans(
 ) -> None:
     wakeups = work_wakeups or DurableWorkWakeups()
     try:
-        await coordinator_getter().recover()
+        # None resolver getter means the scheduler is not wired up; the library
+        # is treated as enabled so plain supervisor deployments keep working.
+        if resolver_getter is None or resolver_getter().settings.enabled:
+            await coordinator_getter().recover()
     except asyncio.CancelledError:
         return
     except Exception:  # noqa: BLE001 - startup recovery failure must not kill the supervisor
@@ -80,21 +83,25 @@ async def supervise_target_scans(
         wait_seconds = EMPTY_RECOVERY_INTERVAL_SECONDS
         try:
             coordinator = coordinator_getter()
+            resolver = resolver_getter() if resolver_getter is not None else None
+            enabled = resolver is None or resolver.settings.enabled
             if (
-                scheduler_getter is not None
-                and resolver_getter is not None
+                enabled
+                and scheduler_getter is not None
+                and resolver is not None
                 and schedule_settings_getter is not None
             ):
                 schedule = schedule_settings_getter()
                 await scheduler_getter().tick(
                     coordinator,
-                    resolver_getter(),
+                    resolver,
                     frequency=schedule["frequency"],
                     daily_time=schedule["daily_time"],
                     timezone_name=schedule["timezone_name"],
                     now=now_getter(),
                 )
-            processed = await coordinator.run_once(root_paths_getter()) is not None
+            if enabled:
+                processed = await coordinator.run_once(root_paths_getter()) is not None
         except asyncio.CancelledError:
             break
         except Exception:  # noqa: BLE001 - the lifetime supervisor records and survives run failures

@@ -100,6 +100,7 @@ from models.library_work import (
     OperationWorkItem,
     RepairFinding,
     ReviewDecision,
+    ScanFailureRecord,
     ScanInventoryItem,
     ScanRequest,
     ScanRequestResult,
@@ -131,6 +132,7 @@ UNKNOWN_ARTIST_ID = "00000000-0000-4000-8000-000000000002"
 AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
     {"SUPPORTED", "ACCEPTED", "SUPPORTED_EMBEDDED_IDS"}
 )
+ATTENTION_FAILURE_CODES = frozenset({"MAX_DEFERRALS_EXCEEDED", "SUBJECT_NOT_AVAILABLE"})
 BULK_PREVIEW_BATCH_SIZE = 500
 BULK_PREVIEW_CLEANUP_BATCH_SIZE = 5_000
 MANAGEMENT_PERSISTENCE_BATCH_SIZE = 500
@@ -1185,6 +1187,9 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE library_identity_repair_findings ADD COLUMN reason_code TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE library_identity_repair_findings ADD COLUMN apply_eligible INTEGER NOT NULL DEFAULT 0 CHECK(apply_eligible IN (0,1))",
                 "ALTER TABLE library_identity_repair_findings ADD COLUMN apply_result TEXT",
+                "ALTER TABLE library_identity_repair_findings ADD COLUMN suggested_release_mbid TEXT",
+                "ALTER TABLE library_identity_repair_findings ADD COLUMN suggested_release_group_mbid TEXT",
+                "ALTER TABLE library_identity_repair_findings ADD COLUMN suggested_edition_json TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE library_catalog_actions ADD COLUMN local_artist_id TEXT REFERENCES local_artists(id) ON DELETE RESTRICT",
                 "ALTER TABLE library_scan_run_scopes ADD COLUMN scope_id TEXT",
                 "ALTER TABLE library_scan_run_scopes ADD COLUMN root_path TEXT",
@@ -1249,6 +1254,7 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE library_management_import_journal ADD COLUMN baseline_file_mtime_ns INTEGER",
                 "ALTER TABLE library_management_import_journal ADD COLUMN baseline_file_mode INTEGER",
                 "ALTER TABLE library_operation_jobs ADD COLUMN next_attempt_at REAL",
+                "ALTER TABLE library_identification_jobs ADD COLUMN attention_cause TEXT",
             ):
                 try:
                     connection.execute(statement)
@@ -6527,10 +6533,16 @@ class NativeLibraryStore(PersistenceBase):
             )
 
     async def enqueue_identification_job(
-        self, job: IdentificationJob, *, expected_policy_revision: str | None = None
+        self,
+        job: IdentificationJob,
+        *,
+        expected_policy_revision: str | None = None,
+        resurrect_attention: bool = True,
     ) -> str:
         job_id, _ = await self.enqueue_identification_job_result(
-            job, expected_policy_revision=expected_policy_revision
+            job,
+            expected_policy_revision=expected_policy_revision,
+            resurrect_attention=resurrect_attention,
         )
         return job_id
 
@@ -6539,6 +6551,7 @@ class NativeLibraryStore(PersistenceBase):
         job: IdentificationJob,
         *,
         expected_policy_revision: str | None = None,
+        resurrect_attention: bool = True,
     ) -> tuple[str, bool]:
         def operation(connection: sqlite3.Connection) -> tuple[str, bool]:
             if expected_policy_revision is not None:
@@ -6555,7 +6568,9 @@ class NativeLibraryStore(PersistenceBase):
                         raise StaleRevisionError(
                             "The library policy changed while identification was queued."
                         )
-            return self._enqueue_identification_job_result(connection, job)
+            return self._enqueue_identification_job_result(
+                connection, job, resurrect_attention=resurrect_attention
+            )
 
         result = await self._write(operation)
         if result[0]:
@@ -6574,12 +6589,16 @@ class NativeLibraryStore(PersistenceBase):
         grouping_context: tuple[str, str] | None = None,
         queue_cursor: str | None = None,
         background: bool = False,
+        resurrect_attention: bool = True,
     ) -> list[tuple[str, bool]]:
         """Enqueue one bounded job batch in a single store-owned transaction."""
 
         def operation(connection: sqlite3.Connection) -> list[tuple[str, bool]]:
             results = [
-                self._enqueue_identification_job_result(connection, job) for job in jobs
+                self._enqueue_identification_job_result(
+                    connection, job, resurrect_attention=resurrect_attention
+                )
+                for job in jobs
             ]
             created = sum(created for _, created in results)
             if scan_run_id is not None and created:
@@ -6629,7 +6648,11 @@ class NativeLibraryStore(PersistenceBase):
         return result
 
     def _enqueue_identification_job_result(
-        self, connection: sqlite3.Connection, job: IdentificationJob
+        self,
+        connection: sqlite3.Connection,
+        job: IdentificationJob,
+        *,
+        resurrect_attention: bool = True,
     ) -> tuple[str, bool]:
         subject_column = (
             "local_album_id" if job.local_album_id is not None else "local_track_id"
@@ -6660,7 +6683,8 @@ class NativeLibraryStore(PersistenceBase):
                 (job.created_at, decision["id"]),
             )
         existing = connection.execute(
-            "SELECT id FROM library_identification_jobs WHERE dedupe_key = ? "
+            "SELECT id, state, last_failure_code, attention_cause "
+            "FROM library_identification_jobs WHERE dedupe_key = ? "
             + (
                 "AND state IN ('queued','running','paused') "
                 if job.kind == "review_retry"
@@ -6670,6 +6694,27 @@ class NativeLibraryStore(PersistenceBase):
             (job.dedupe_key,),
         ).fetchone()
         if existing is not None:
+            if (
+                resurrect_attention
+                and str(existing["state"]) == "failed"
+                and str(existing["last_failure_code"] or "") in ATTENTION_FAILURE_CODES
+                and str(existing["attention_cause"] or "")
+                == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+            ):
+                # Terminal-failed attention jobs must not block later enqueues of
+                # the same dedupe key. Only provider-caused caps resurrect;
+                # deterministic failures stay terminal until the album's input
+                # changes (a new dedupe key).
+                connection.execute(
+                    "UPDATE library_identification_jobs SET state = 'queued', "
+                    "attempt_count = 0, not_before = ?, last_failure_code = NULL, "
+                    "attention_cause = NULL, terminal_at = NULL, updated_at = ?, "
+                    "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                    "WHERE id = ?",
+                    (job.not_before, job.created_at, existing["id"]),
+                )
+                self._bump_stream(connection, "identification")
+                return str(existing["id"]), True
             return str(existing["id"]), False
         queued_subject = connection.execute(
             f"SELECT id FROM library_identification_jobs WHERE {subject_column} = ? "
@@ -6988,6 +7033,27 @@ class NativeLibraryStore(PersistenceBase):
                 "artist_identity": _row(artist_identity),
                 "review": _row(review),
             }
+
+        return await self._read(operation)
+
+    async def get_indexed_track_paths_for_release_group(
+        self, release_group_mbid: str
+    ) -> list[str]:
+        """Absolute file paths of indexed tracks sealed to this release group."""
+
+        def operation(connection: sqlite3.Connection) -> list[str]:
+            rows = connection.execute(
+                "SELECT t.file_path FROM local_tracks t "
+                "JOIN local_album_external_identities i "
+                "ON i.local_album_id = t.local_album_id "
+                "JOIN local_albums a ON a.id = t.local_album_id "
+                "WHERE i.provider = 'musicbrainz' "
+                "AND lower(i.release_group_mbid) = lower(?) "
+                "AND a.retired_into_album_id IS NULL "
+                "AND t.availability = 'indexed' ORDER BY t.file_path",
+                (release_group_mbid,),
+            ).fetchall()
+            return [str(row["file_path"]) for row in rows if row["file_path"]]
 
         return await self._read(operation)
 
@@ -7442,6 +7508,132 @@ class NativeLibraryStore(PersistenceBase):
         self.work_wakeups.notify_after("identification", not_before - now)
         return result
 
+    async def terminal_fail_identification_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        expected_job_revision: int,
+        failure_code: str,
+        now: float,
+        attention_cause: str | None = None,
+    ) -> int:
+        """Fail a running job terminally, keeping the row for auditability.
+
+        Album-scoped terminal failures surface a review row so the album stays
+        findable in the review queue and can be dismissed or retried there.
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            row = connection.execute(
+                "UPDATE library_identification_jobs SET state = 'failed', "
+                "last_failure_code = ?, attention_cause = ?, terminal_at = ?, "
+                "lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, "
+                "updated_at = ?, row_revision = row_revision + 1, "
+                "event_revision = event_revision + 1 WHERE id = ? AND state = 'running' "
+                "AND lease_owner = ? AND row_revision = ? RETURNING row_revision",
+                (
+                    failure_code,
+                    attention_cause,
+                    now,
+                    now,
+                    job_id,
+                    worker_id,
+                    expected_job_revision,
+                ),
+            ).fetchone()
+            if row is None:
+                raise StaleRevisionError(
+                    "The identification job changed before it could be failed."
+                )
+            job = connection.execute(
+                "SELECT local_album_id, local_track_id, input_revision "
+                "FROM library_identification_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if (
+                job is not None
+                and job["local_album_id"] is not None
+                and job["local_track_id"] is None
+            ):
+                active_review = connection.execute(
+                    "SELECT id FROM library_identification_reviews "
+                    "WHERE local_album_id = ? AND input_revision = ? "
+                    "AND state != 'resolved'",
+                    (job["local_album_id"], job["input_revision"]),
+                ).fetchone()
+                if active_review is None:
+                    connection.execute(
+                        "INSERT INTO library_identification_reviews "
+                        "(id, local_album_id, state, reason_code, attempt_id, "
+                        "input_revision, created_at, updated_at) "
+                        "VALUES (?, ?, 'needs_review', ?, NULL, ?, ?, ?)",
+                        (
+                            str(uuid.uuid4()),
+                            job["local_album_id"],
+                            failure_code,
+                            job["input_revision"],
+                            now,
+                            now,
+                        ),
+                    )
+            self._bump_stream(connection, "identification")
+            return int(row["row_revision"])
+
+        return await self._write(operation)
+
+    async def reset_provider_identification_deferrals(self, *, now: float) -> int:
+        """Clear backoff on provider-deferred queued jobs after recovery.
+
+        Only rows deferred for PROVIDER_TEMPORARILY_UNAVAILABLE are reset; other
+        deferral reasons keep their backoff untouched.
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            cursor = connection.execute(
+                "UPDATE library_identification_jobs SET attempt_count = 0, "
+                "not_before = 0, last_failure_code = NULL, updated_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE state = 'queued' "
+                "AND last_failure_code = 'PROVIDER_TEMPORARILY_UNAVAILABLE' "
+                "AND row_revision < ? AND event_revision < ?",
+                (now, MAX_REVISION, MAX_REVISION),
+            )
+            if cursor.rowcount:
+                self._bump_stream(connection, "identification")
+            return cursor.rowcount
+
+        result = await self._write(operation)
+        if result:
+            self.work_wakeups.notify("identification")
+        return result
+
+    async def gc_stale_identification_jobs(
+        self, *, now: float, grace_seconds: float
+    ) -> int:
+        """Terminally fail queued SUBJECT_NOT_AVAILABLE jobs past the grace period.
+
+        Tracks can legitimately reappear, so the worker keeps deferring until the
+        grace expires; this sweep is the backstop for rows that are never claimed
+        again (the deferral cap bounds actively-claimed rows first).
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            cursor = connection.execute(
+                "UPDATE library_identification_jobs SET state = 'failed', "
+                "attention_cause = 'SUBJECT_NOT_AVAILABLE', terminal_at = ?, "
+                "updated_at = ?, row_revision = row_revision + 1, "
+                "event_revision = event_revision + 1 WHERE state = 'queued' "
+                "AND last_failure_code = 'SUBJECT_NOT_AVAILABLE' "
+                "AND updated_at < ? AND row_revision < ? AND event_revision < ?",
+                (now, now, now - grace_seconds, MAX_REVISION, MAX_REVISION),
+            )
+            if cursor.rowcount:
+                self._bump_stream(connection, "identification")
+            return cursor.rowcount
+
+        return await self._write(operation)
+
     async def pause_identification_queue(
         self,
         *,
@@ -7566,7 +7758,9 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
-    async def get_identification_activity_snapshot(self) -> dict[str, Any]:
+    async def get_identification_activity_snapshot(
+        self, *, now: float
+    ) -> dict[str, Any]:
         """Return redacted aggregate queue state for activity and admin progress UI."""
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -7585,8 +7779,11 @@ class NativeLibraryStore(PersistenceBase):
             }
             active = connection.execute(
                 "SELECT MIN(created_at) AS started_at, MAX(updated_at) AS updated_at, "
-                "SUM(CASE WHEN last_failure_code IS NOT NULL THEN 1 ELSE 0 END) AS deferred_count "
-                "FROM library_identification_jobs WHERE state IN ('queued','running','paused')"
+                "SUM(CASE WHEN last_failure_code IS NOT NULL THEN 1 ELSE 0 END) AS deferred_count, "
+                "SUM(CASE WHEN state IN ('queued','paused') "
+                "AND (not_before IS NULL OR not_before <= ?) THEN 1 ELSE 0 END) AS claimable_count "
+                "FROM library_identification_jobs WHERE state IN ('queued','running','paused')",
+                (now,),
             ).fetchone()
             active_priority = connection.execute(
                 "SELECT priority FROM library_identification_jobs "
@@ -7614,6 +7811,22 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE state IN ('queued','running','paused')"
                 ).fetchone()[0]
             )
+            attention_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_identification_jobs "
+                    "WHERE state = 'failed' AND last_failure_code IN "
+                    "('MAX_DEFERRALS_EXCEEDED','SUBJECT_NOT_AVAILABLE')"
+                ).fetchone()[0]
+            )
+            deferred_reason_counts = {
+                str(row["last_failure_code"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT last_failure_code, COUNT(*) AS count "
+                    "FROM library_identification_jobs "
+                    "WHERE state IN ('queued','running','paused') "
+                    "AND last_failure_code IS NOT NULL GROUP BY last_failure_code"
+                ).fetchall()
+            }
             return {
                 "control_state": str(control["state"]),
                 "control_revision": int(control["row_revision"]),
@@ -7621,6 +7834,9 @@ class NativeLibraryStore(PersistenceBase):
                 "started_at": active["started_at"],
                 "updated_at": active["updated_at"],
                 "deferred_count": int(active["deferred_count"] or 0),
+                "claimable_count": int(active["claimable_count"] or 0),
+                "deferred_reason_counts": deferred_reason_counts,
+                "attention_count": attention_count,
                 "kept_local_count": kept_local_count,
                 "active_priority": (
                     int(active_priority["priority"])
@@ -9053,6 +9269,13 @@ class NativeLibraryStore(PersistenceBase):
                 )
                 return None, 0, True
             run_id = str(row["id"])
+            deleted_failures = connection.execute(
+                "DELETE FROM library_scan_failures WHERE rowid IN ("
+                "SELECT rowid FROM library_scan_failures WHERE run_id=? LIMIT ?)",
+                (run_id, max(1, limit)),
+            ).rowcount
+            if deleted_failures:
+                return run_id, deleted_failures, False
             for table in (
                 "library_scan_grouping_evidence",
                 "library_scan_grouping_edges",
@@ -9725,6 +9948,15 @@ class NativeLibraryStore(PersistenceBase):
                     for root_id, path, failure_code in failures
                 ],
             )
+            connection.executemany(
+                "INSERT OR IGNORE INTO library_scan_failures "
+                "(run_id, root_id, relative_path, failure_code, failure_detail, "
+                "phase, recorded_at) VALUES (?, ?, ?, ?, '', 'indexing', ?)",
+                [
+                    (run_id, root_id, path, failure_code, updated_at)
+                    for root_id, path, failure_code in failures
+                ],
+            )
             if catalog_changed:
                 self._bump_catalog(connection)
             allowed = {
@@ -9764,6 +9996,69 @@ class NativeLibraryStore(PersistenceBase):
             return self._scan_state_from_row(updated)
 
         return await self._write_scan(operation)
+
+    async def record_scan_failures(
+        self, run_id: str, failures: list[ScanFailureRecord]
+    ) -> None:
+        """Persist per-path scan failures; the PK dedupes repeated reports."""
+
+        if not failures:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.executemany(
+                "INSERT OR IGNORE INTO library_scan_failures "
+                "(run_id, root_id, relative_path, failure_code, failure_detail, "
+                "phase, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        run_id,
+                        failure.root_id,
+                        failure.relative_path,
+                        failure.failure_code,
+                        failure.failure_detail,
+                        failure.phase,
+                        failure.recorded_at,
+                    )
+                    for failure in failures
+                ],
+            )
+
+        return await super()._background_write(operation)
+
+    async def list_scan_run_failures(
+        self,
+        run_id: str,
+        *,
+        limit: int = 50,
+        cursor_rowid: int | None = None,
+    ) -> tuple[list[ScanFailureRecord], int | None]:
+        """Read one rowid-keyset page of recorded scan failures for a run."""
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[list[ScanFailureRecord], int | None]:
+            rows = connection.execute(
+                "SELECT rowid, root_id, relative_path, failure_code, failure_detail, "
+                "phase, recorded_at FROM library_scan_failures WHERE run_id = ? "
+                "AND (? IS NULL OR rowid > ?) ORDER BY rowid LIMIT ?",
+                (run_id, cursor_rowid, cursor_rowid, max(1, limit) + 1),
+            ).fetchall()
+            page = rows[: max(1, limit)]
+            next_cursor = int(page[-1]["rowid"]) if len(rows) > len(page) else None
+            return [
+                ScanFailureRecord(
+                    root_id=str(row["root_id"]),
+                    relative_path=str(row["relative_path"]),
+                    failure_code=str(row["failure_code"]),
+                    recorded_at=float(row["recorded_at"]),
+                    failure_detail=str(row["failure_detail"]),
+                    phase=row["phase"],
+                )
+                for row in page
+            ], next_cursor
+
+        return await self._read(operation)
 
     async def upsert_scanned_track(
         self,
@@ -16061,6 +16356,7 @@ class NativeLibraryStore(PersistenceBase):
                 "detach_keep_tagged": "keep_tagged",
                 "exclude": "excluded",
                 "restore": "resolved",
+                "dismiss": "resolved",
             }.get(action, action)
             if action == "exclude":
                 if album_id is not None:
@@ -16096,6 +16392,18 @@ class NativeLibraryStore(PersistenceBase):
                 "((local_album_id = ? AND ? IS NOT NULL) OR (local_track_id = ? AND ? IS NOT NULL))",
                 (now, now, album_id, album_id, track_id, track_id),
             )
+            if action == "dismiss":
+                # Dismissed attention must not keep the failed job counting in
+                # attention_count: the review is resolved and nothing else would
+                # clear the markers for a never-resurrecting cap.
+                connection.execute(
+                    "UPDATE library_identification_jobs SET last_failure_code = NULL, "
+                    "attention_cause = NULL, updated_at = ?, "
+                    "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                    "WHERE state = 'failed' AND input_revision = ? AND "
+                    "((local_album_id = ? AND ? IS NOT NULL) OR (local_track_id = ? AND ? IS NOT NULL))",
+                    (now, review["input_revision"], album_id, album_id, track_id, track_id),
+                )
             updated = connection.execute(
                 "UPDATE library_identification_reviews SET state = ?, reason_code = ?, "
                 "decided_by_user_id = ?, decided_at = ?, updated_at = ?, "
@@ -25410,8 +25718,11 @@ class NativeLibraryStore(PersistenceBase):
                 raise ResourceNotFoundError("Re-identification job not found.")
             if (
                 job["state"] != "ready"
-                or int(job["row_revision"]) != expected_job_revision
-            ):
+                and not (
+                    job["state"] == "succeeded"
+                    and decision_mode == "leave_unmanaged"
+                )
+            ) or int(job["row_revision"]) != expected_job_revision:
                 raise StaleRevisionError(
                     "The re-identification candidates changed before selection."
                 )
@@ -25463,18 +25774,20 @@ class NativeLibraryStore(PersistenceBase):
                 )
             result = json.loads(str(snapshot["result_json"]))
             attempt_id = str(result["attempt_id"])
-            evidence_row = connection.execute(
-                "SELECT * FROM library_identification_evidence WHERE attempt_id = ? "
-                "AND candidate_key = ?",
-                (attempt_id, candidate_key),
-            ).fetchone()
-            if evidence_row is None:
-                raise StaleRevisionError(
-                    "The selected candidate is no longer available."
+            evidence = None
+            if candidate_key != "":
+                evidence_row = connection.execute(
+                    "SELECT * FROM library_identification_evidence WHERE attempt_id = ? "
+                    "AND candidate_key = ?",
+                    (attempt_id, candidate_key),
+                ).fetchone()
+                if evidence_row is None:
+                    raise StaleRevisionError(
+                        "The selected candidate is no longer available."
+                    )
+                evidence = msgspec.json.decode(
+                    bytes(evidence_row["evidence_json"]), type=CandidateEvidence
                 )
-            evidence = msgspec.json.decode(
-                bytes(evidence_row["evidence_json"]), type=CandidateEvidence
-            )
             if decision_mode == "leave_unmanaged":
                 before_identity = (
                     dict(current_album_identity)
@@ -25490,7 +25803,8 @@ class NativeLibraryStore(PersistenceBase):
                         (actor_user_id, now, snapshot["local_album_id"]),
                     )
                 elif (
-                    is_valid_mbid(evidence.release_group_mbid)
+                    evidence is not None
+                    and is_valid_mbid(evidence.release_group_mbid)
                     and evidence.album_title_classification != "contradictory"
                     and evidence.album_artist_classification != "contradictory"
                 ):
@@ -25561,6 +25875,10 @@ class NativeLibraryStore(PersistenceBase):
                     reason_code="MANAGEMENT_EXCLUDED",
                     before=before_identity,
                     now=now,
+                )
+            if evidence is None:
+                raise StaleRevisionError(
+                    "The selected candidate is no longer available."
                 )
             if decision_mode == "custom_edition":
                 if not confirmation:
@@ -26051,7 +26369,7 @@ class NativeLibraryStore(PersistenceBase):
         updated = connection.execute(
             "UPDATE library_operation_jobs SET state='succeeded',terminal_code=?,"
             "terminal_at=?,updated_at=?,row_revision=row_revision+1,"
-            "event_revision=event_revision+1 WHERE id=? AND state='ready' "
+            "event_revision=event_revision+1 WHERE id=? AND state IN ('ready','succeeded') "
             "AND row_revision=? RETURNING *",
             (terminal_code, now, now, job_id, expected_job_revision),
         ).fetchone()
@@ -27166,7 +27484,9 @@ class NativeLibraryStore(PersistenceBase):
                 "INSERT INTO library_identity_repair_findings "
                 "(id, job_id, local_album_id, evidence_id, expected_album_revision, "
                 "expected_identity_revision, finding_code, confidence, reason_code, "
-                "apply_eligible, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "apply_eligible, suggested_release_mbid, suggested_release_group_mbid, "
+                "suggested_edition_json, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         finding.id,
@@ -27179,6 +27499,9 @@ class NativeLibraryStore(PersistenceBase):
                         finding.confidence,
                         finding.reason_code,
                         int(finding.apply_eligible),
+                        finding.suggested_release_mbid,
+                        finding.suggested_release_group_mbid,
+                        finding.suggested_edition_json,
                         updated_at,
                         updated_at,
                     )
@@ -27187,6 +27510,33 @@ class NativeLibraryStore(PersistenceBase):
             )
 
         await self._write(operation)
+
+    async def get_latest_album_identification_evidence(
+        self, local_album_id: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+        """Latest attempt (any trigger) that still has uncompacted evidence."""
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+            attempt = connection.execute(
+                "SELECT a.* FROM library_identification_attempts a "
+                "WHERE a.local_album_id = ? AND EXISTS ("
+                "SELECT 1 FROM library_identification_evidence e "
+                "WHERE e.attempt_id = a.id AND e.compacted = 0) "
+                "ORDER BY a.completed_at DESC, a.id DESC LIMIT 1",
+                (local_album_id,),
+            ).fetchone()
+            if attempt is None:
+                return None
+            rows = connection.execute(
+                "SELECT * FROM library_identification_evidence "
+                "WHERE attempt_id = ? AND compacted = 0 ORDER BY candidate_key",
+                (attempt["id"],),
+            ).fetchall()
+            return dict(attempt), [dict(row) for row in rows]
+
+        return await self._read(operation)
 
     async def create_repair_operation(
         self,
@@ -27469,6 +27819,57 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def defer_repair_audit_work(
+        self,
+        *,
+        job_id: str,
+        ordinal: int | None,
+        worker_id: str,
+        reason_code: str,
+        now: float,
+        retry_not_before: float | None = None,
+    ) -> dict[str, Any]:
+        """Release a running repair audit back to queued for a later retry.
+
+        The running work item (when one is claimed) is returned to 'pending'
+        with the failure code; the whole job is queued with next_attempt_at so
+        the audit resumes exactly at the deferred item. Nothing is marked
+        succeeded and no finding row is written.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            if ordinal is not None:
+                work_update = connection.execute(
+                    "UPDATE library_operation_work SET state = 'pending', failure_code = ?, "
+                    "updated_at = ?, row_revision = row_revision + 1 "
+                    "WHERE job_id = ? AND ordinal = ? AND state = 'running'",
+                    (reason_code, now, job_id, ordinal),
+                )
+                if work_update.rowcount != 1:
+                    raise StaleRevisionError(
+                        "The repair audit work lease changed while it was deferred."
+                    )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = 'queued', lease_owner = NULL, "
+                "lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?, "
+                "next_attempt_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND kind = 'repair' AND state = 'running' "
+                "AND lease_owner = ? RETURNING *",
+                (now, retry_not_before, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The repair audit lease changed while it was deferred."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        result = await self._write(operation)
+        if retry_not_before is not None:
+            self.work_wakeups.notify_after("operation", retry_not_before - now)
+        return result
+
     async def save_repair_finding_for_work(
         self,
         job_id: str,
@@ -27525,7 +27926,8 @@ class NativeLibraryStore(PersistenceBase):
                 "INSERT INTO library_identity_repair_findings "
                 "(id, job_id, local_album_id, evidence_id, expected_album_revision, "
                 "expected_identity_revision, finding_code, confidence, reason_code, apply_eligible, "
-                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "suggested_release_mbid, suggested_release_group_mbid, suggested_edition_json, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     finding.id,
                     job_id,
@@ -27537,6 +27939,9 @@ class NativeLibraryStore(PersistenceBase):
                     finding.confidence,
                     finding.reason_code,
                     int(finding.apply_eligible),
+                    finding.suggested_release_mbid,
+                    finding.suggested_release_group_mbid,
+                    finding.suggested_edition_json,
                     now,
                     now,
                 ),
@@ -27817,7 +28222,7 @@ class NativeLibraryStore(PersistenceBase):
             if management_readiness:
                 evidence_row = (
                     connection.execute(
-                        "SELECT e.evidence_json, e.attempt_id, "
+                        "SELECT e.evidence_json, e.attempt_id, e.compacted, "
                         "a.input_tag_revision, a.input_file_revision, "
                         "a.input_policy_revision FROM library_identification_evidence e "
                         "JOIN library_identification_attempts a ON a.id = e.attempt_id "
@@ -27845,164 +28250,181 @@ class NativeLibraryStore(PersistenceBase):
                     if evidence_row is not None
                     else None
                 )
-                current_revisions = tuple(_album_input_revision(track_rows).split(":"))
-                proposed = {
-                    item.local_track_id: item
-                    for item in (evidence.track_evidence if evidence else [])
-                    if item.classification == "supported"
-                }
-                stale = bool(
-                    finding is None
-                    or album is None
-                    or identity is None
-                    or evidence_row is None
-                    or evidence is None
-                    or int(album["row_revision"])
-                    != int(work["expected_subject_revision"])
-                    or int(identity["row_revision"])
-                    != int(finding["expected_identity_revision"])
-                    or str(identity["release_group_mbid"])
-                    != evidence.release_group_mbid
-                    or str(identity["release_mbid"] or "")
-                    != str(evidence.release_mbid or "")
-                    or current_revisions
-                    != (
-                        str(evidence_row["input_tag_revision"]),
-                        str(evidence_row["input_file_revision"]),
-                        str(evidence_row["input_policy_revision"]),
+                if finding is not None and finding["finding_code"] == (
+                    "exact_release_suggested"
+                ):
+                    state, failure_code = self._apply_suggested_edition_tx(
+                        connection,
+                        work=work,
+                        finding=finding,
+                        album=album,
+                        identity=identity,
+                        evidence_row=evidence_row,
+                        track_rows=track_rows,
+                        evidence=evidence,
+                        job_id=job_id,
+                        actor_user_id=actor_user_id,
+                        now=now,
                     )
-                    or set(proposed) != {str(row["id"]) for row in track_rows}
-                )
-                release_track_ids: set[str] = set()
-                if not stale:
-                    for row in track_rows:
-                        item = proposed[str(row["id"])]
-                        if (
-                            not item.recording_mbid
-                            or not item.release_track_mbid
-                            or item.candidate_disc_number is None
-                            or item.candidate_track_position is None
-                            or item.release_track_mbid in release_track_ids
-                            or not _recording_evidence_matches(
-                                row["recording_mbid"], item
-                            )
-                            or (
-                                row["identity_release_mbid"]
-                                and row["identity_release_mbid"]
-                                != evidence.release_mbid
-                            )
-                            or (
-                                row["release_track_mbid"]
-                                and row["release_track_mbid"] != item.release_track_mbid
-                            )
-                            or (
-                                row["embedded_release_group_mbid"]
-                                and row["embedded_release_group_mbid"]
-                                != evidence.release_group_mbid
-                            )
-                            or (
-                                row["embedded_release_mbid"]
-                                and row["embedded_release_mbid"]
-                                != evidence.release_mbid
-                            )
-                            or not _recording_evidence_matches(
-                                row["embedded_recording_mbid"], item
-                            )
-                            or (
-                                row["embedded_release_track_mbid"]
-                                and row["embedded_release_track_mbid"]
-                                != item.release_track_mbid
-                            )
-                        ):
-                            stale = True
-                            break
-                        release_track_ids.add(item.release_track_mbid)
-                if stale:
-                    state = "skipped"
-                    failure_code = "STALE_SUBJECT"
-                    if finding is not None:
-                        connection.execute(
-                            "UPDATE library_identity_repair_findings SET finding_code = 'stale', "
-                            "state = 'stale', "
-                            "apply_result = 'STALE_SUBJECT', updated_at = ?, "
-                            "row_revision = row_revision + 1 WHERE id = ?",
-                            (now, finding["id"]),
-                        )
                 else:
-                    assert finding is not None
-                    assert evidence is not None
-                    assert evidence_row is not None
-                    before = [
-                        {
-                            "local_track_id": str(row["id"]),
-                            "recording_mbid": row["recording_mbid"],
-                            "release_mbid": row["identity_release_mbid"],
-                            "release_track_mbid": row["release_track_mbid"],
-                        }
-                        for row in track_rows
-                    ]
-                    for local_track_id, item in proposed.items():
+                    current_revisions = tuple(_album_input_revision(track_rows).split(":"))
+                    proposed = {
+                        item.local_track_id: item
+                        for item in (evidence.track_evidence if evidence else [])
+                        if item.classification == "supported"
+                    }
+                    stale = bool(
+                        finding is None
+                        or album is None
+                        or identity is None
+                        or evidence_row is None
+                        or evidence is None
+                        or int(album["row_revision"])
+                        != int(work["expected_subject_revision"])
+                        or int(identity["row_revision"])
+                        != int(finding["expected_identity_revision"])
+                        or str(identity["release_group_mbid"])
+                        != evidence.release_group_mbid
+                        or str(identity["release_mbid"] or "")
+                        != str(evidence.release_mbid or "")
+                        or current_revisions
+                        != (
+                            str(evidence_row["input_tag_revision"]),
+                            str(evidence_row["input_file_revision"]),
+                            str(evidence_row["input_policy_revision"]),
+                        )
+                        or set(proposed) != {str(row["id"]) for row in track_rows}
+                    )
+                    release_track_ids: set[str] = set()
+                    if not stale:
+                        for row in track_rows:
+                            item = proposed[str(row["id"])]
+                            if (
+                                not item.recording_mbid
+                                or not item.release_track_mbid
+                                or item.candidate_disc_number is None
+                                or item.candidate_track_position is None
+                                or item.release_track_mbid in release_track_ids
+                                or not _recording_evidence_matches(
+                                    row["recording_mbid"], item
+                                )
+                                or (
+                                    row["identity_release_mbid"]
+                                    and row["identity_release_mbid"]
+                                    != evidence.release_mbid
+                                )
+                                or (
+                                    row["release_track_mbid"]
+                                    and row["release_track_mbid"] != item.release_track_mbid
+                                )
+                                or (
+                                    row["embedded_release_group_mbid"]
+                                    and row["embedded_release_group_mbid"]
+                                    != evidence.release_group_mbid
+                                )
+                                or (
+                                    row["embedded_release_mbid"]
+                                    and row["embedded_release_mbid"]
+                                    != evidence.release_mbid
+                                )
+                                or not _recording_evidence_matches(
+                                    row["embedded_recording_mbid"], item
+                                )
+                                or (
+                                    row["embedded_release_track_mbid"]
+                                    and row["embedded_release_track_mbid"]
+                                    != item.release_track_mbid
+                                )
+                            ):
+                                stale = True
+                                break
+                            release_track_ids.add(item.release_track_mbid)
+                    if stale:
+                        state = "skipped"
+                        failure_code = "STALE_SUBJECT"
+                        if finding is not None:
+                            connection.execute(
+                                "UPDATE library_identity_repair_findings SET finding_code = 'stale', "
+                                "state = 'stale', "
+                                "apply_result = 'STALE_SUBJECT', updated_at = ?, "
+                                "row_revision = row_revision + 1 WHERE id = ?",
+                                (now, finding["id"]),
+                            )
+                    else:
+                        assert finding is not None
+                        assert evidence is not None
+                        assert evidence_row is not None
+                        before = [
+                            {
+                                "local_track_id": str(row["id"]),
+                                "recording_mbid": row["recording_mbid"],
+                                "release_mbid": row["identity_release_mbid"],
+                                "release_track_mbid": row["release_track_mbid"],
+                            }
+                            for row in track_rows
+                        ]
+                        for local_track_id, item in proposed.items():
+                            connection.execute(
+                                "INSERT INTO local_track_external_identities "
+                                "(local_track_id, provider, recording_mbid, release_mbid, "
+                                "release_track_mbid, medium_position, release_track_position, "
+                                "decision_source, attempt_id, selected_at) "
+                                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, 'manual', ?, ?) "
+                                "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
+                                "recording_mbid = excluded.recording_mbid, "
+                                "release_mbid = excluded.release_mbid, "
+                                "release_track_mbid = excluded.release_track_mbid, "
+                                "medium_position = excluded.medium_position, "
+                                "release_track_position = excluded.release_track_position, "
+                                "decision_source = 'manual', attempt_id = excluded.attempt_id, "
+                                "selected_at = excluded.selected_at, "
+                                "row_revision = row_revision + 1",
+                                (
+                                    local_track_id,
+                                    item.recording_mbid,
+                                    evidence.release_mbid,
+                                    item.release_track_mbid,
+                                    item.candidate_disc_number,
+                                    item.candidate_track_position,
+                                    evidence_row["attempt_id"],
+                                    now,
+                                ),
+                            )
+                        after = [
+                            {
+                                "local_track_id": local_track_id,
+                                "recording_mbid": item.recording_mbid,
+                                "release_mbid": evidence.release_mbid,
+                                "release_track_mbid": item.release_track_mbid,
+                                "medium_position": item.candidate_disc_number,
+                                "release_track_position": item.candidate_track_position,
+                            }
+                            for local_track_id, item in sorted(proposed.items())
+                        ]
                         connection.execute(
-                            "INSERT INTO local_track_external_identities "
-                            "(local_track_id, provider, recording_mbid, release_mbid, "
-                            "release_track_mbid, medium_position, release_track_position, "
-                            "decision_source, attempt_id, selected_at) "
-                            "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, 'manual', ?, ?) "
-                            "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
-                            "recording_mbid = excluded.recording_mbid, "
-                            "release_mbid = excluded.release_mbid, "
-                            "release_track_mbid = excluded.release_track_mbid, "
-                            "medium_position = excluded.medium_position, "
-                            "release_track_position = excluded.release_track_position, "
-                            "decision_source = 'manual', attempt_id = excluded.attempt_id, "
-                            "selected_at = excluded.selected_at, "
-                            "row_revision = row_revision + 1",
+                            "INSERT INTO library_catalog_actions "
+                            "(id, actor_user_id, action_kind, local_album_id, "
+                            "operation_job_id, before_json, after_json, reason_code, "
+                            "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                             (
-                                local_track_id,
-                                item.recording_mbid,
-                                evidence.release_mbid,
-                                item.release_track_mbid,
-                                item.candidate_disc_number,
-                                item.candidate_track_position,
-                                evidence_row["attempt_id"],
+                                str(uuid.uuid4()),
+                                actor_user_id,
+                                "accept_management_track_mappings",
+                                work["local_album_id"],
+                                job_id,
+                                json.dumps(before, sort_keys=True),
+                                json.dumps(after, sort_keys=True),
+                                "EXACT_RELEASE_MAPPINGS_ACCEPTED",
                                 now,
                             ),
                         )
-                    after = [
-                        {
-                            "local_track_id": local_track_id,
-                            "recording_mbid": item.recording_mbid,
-                            "release_mbid": evidence.release_mbid,
-                            "release_track_mbid": item.release_track_mbid,
-                            "medium_position": item.candidate_disc_number,
-                            "release_track_position": item.candidate_track_position,
-                        }
-                        for local_track_id, item in sorted(proposed.items())
-                    ]
-                    connection.execute(
-                        "INSERT INTO library_catalog_actions "
-                        "(id, actor_user_id, action_kind, local_album_id, "
-                        "operation_job_id, before_json, after_json, reason_code, "
-                        "created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (
-                            str(uuid.uuid4()),
-                            actor_user_id,
-                            "accept_management_track_mappings",
-                            work["local_album_id"],
-                            job_id,
-                            json.dumps(before, sort_keys=True),
-                            json.dumps(after, sort_keys=True),
-                            "EXACT_RELEASE_MAPPINGS_ACCEPTED",
-                            now,
-                        ),
-                    )
-                    connection.execute(
-                        "UPDATE library_identity_repair_findings SET state = 'applied', "
-                        "apply_result = 'MAPPINGS_ACCEPTED', updated_at = ?, "
-                        "row_revision = row_revision + 1 WHERE id = ?",
-                        (now, finding["id"]),
-                    )
-                    self._bump_catalog(connection)
+                        connection.execute(
+                            "UPDATE library_identity_repair_findings SET state = 'applied', "
+                            "apply_result = 'MAPPINGS_ACCEPTED', updated_at = ?, "
+                            "row_revision = row_revision + 1 WHERE id = ?",
+                            (now, finding["id"]),
+                        )
+                        self._bump_catalog(connection)
             elif (
                 finding is None
                 or album is None
@@ -28138,6 +28560,207 @@ class NativeLibraryStore(PersistenceBase):
             return {"state": state, "failure_code": failure_code}
 
         return await self._write(operation)
+
+    def _apply_suggested_edition_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        work: sqlite3.Row,
+        finding: sqlite3.Row,
+        album: sqlite3.Row | None,
+        identity: sqlite3.Row | None,
+        evidence_row: sqlite3.Row | None,
+        track_rows: list[sqlite3.Row],
+        evidence: CandidateEvidence | None,
+        job_id: str,
+        actor_user_id: str,
+        now: float,
+    ) -> tuple[str, str | None]:
+        """Seal one accepted suggested edition; mirrors manual candidate accept."""
+        mapped = (
+            _complete_track_identity_mapping(track_rows, evidence)
+            if evidence is not None
+            else None
+        )
+        stale = bool(
+            album is None
+            or evidence_row is None
+            or evidence is None
+            or mapped is None
+            or int(evidence_row["compacted"])
+            or int(album["row_revision"]) != int(work["expected_subject_revision"])
+            or tuple(_album_input_revision(track_rows).split(":"))
+            != (
+                str(evidence_row["input_tag_revision"]),
+                str(evidence_row["input_file_revision"]),
+                str(evidence_row["input_policy_revision"]),
+            )
+            or (identity is None) != (finding["expected_identity_revision"] is None)
+            or (
+                identity is not None
+                and (
+                    int(identity["row_revision"])
+                    != int(finding["expected_identity_revision"])
+                    or identity["release_mbid"] is not None
+                )
+            )
+            or evidence.reason_code not in AUTOMATIC_SAFE_EVIDENCE_REASONS
+        )
+        if not stale:
+            assert evidence is not None
+            assert mapped is not None
+            for row, item in zip(track_rows, mapped, strict=True):
+                if (
+                    not _recording_evidence_matches(row["recording_mbid"], item)
+                    or (
+                        row["identity_release_mbid"]
+                        and row["identity_release_mbid"] != evidence.release_mbid
+                    )
+                    or (
+                        row["release_track_mbid"]
+                        and row["release_track_mbid"] != item.release_track_mbid
+                    )
+                    or (
+                        row["embedded_release_group_mbid"]
+                        and row["embedded_release_group_mbid"]
+                        != evidence.release_group_mbid
+                    )
+                    or (
+                        row["embedded_release_mbid"]
+                        and row["embedded_release_mbid"] != evidence.release_mbid
+                    )
+                    or not _recording_evidence_matches(
+                        row["embedded_recording_mbid"], item
+                    )
+                    or (
+                        row["embedded_release_track_mbid"]
+                        and row["embedded_release_track_mbid"]
+                        != item.release_track_mbid
+                    )
+                ):
+                    stale = True
+                    break
+        if stale:
+            connection.execute(
+                "UPDATE library_identity_repair_findings SET finding_code = 'stale', "
+                "state = 'stale', apply_result = 'STALE_SUBJECT', updated_at = ?, "
+                "row_revision = row_revision + 1 WHERE id = ?",
+                (now, finding["id"]),
+            )
+            return "skipped", "STALE_SUBJECT"
+        assert evidence is not None
+        assert evidence_row is not None
+        assert mapped is not None
+        before = (
+            {
+                "release_group_mbid": identity["release_group_mbid"],
+                "release_mbid": identity["release_mbid"],
+            }
+            if identity is not None
+            else {}
+        )
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, release_mbid, "
+            "decision_source, matcher_version, attempt_id, selected_by_user_id, "
+            "selected_at) "
+            "VALUES (?, 'musicbrainz', ?, ?, 'manual', ?, ?, ?, ?) "
+            "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
+            "release_group_mbid = excluded.release_group_mbid, "
+            "release_mbid = excluded.release_mbid, "
+            "decision_source = 'manual', matcher_version = excluded.matcher_version, "
+            "attempt_id = excluded.attempt_id, "
+            "selected_by_user_id = excluded.selected_by_user_id, "
+            "selected_at = excluded.selected_at, row_revision = row_revision + 1",
+            (
+                work["local_album_id"],
+                evidence.release_group_mbid,
+                evidence.release_mbid,
+                evidence.matcher_version,
+                evidence_row["attempt_id"],
+                actor_user_id,
+                now,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM local_track_external_identities WHERE local_track_id IN "
+            "(SELECT id FROM local_tracks WHERE local_album_id = ? "
+            "AND availability = 'indexed')",
+            (work["local_album_id"],),
+        )
+        for item in mapped:
+            connection.execute(
+                "INSERT INTO local_track_external_identities "
+                "(local_track_id, provider, recording_mbid, release_mbid, "
+                "release_track_mbid, medium_position, release_track_position, "
+                "decision_source, attempt_id, selected_at) "
+                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, 'manual', ?, ?)",
+                (
+                    item.local_track_id,
+                    item.recording_mbid,
+                    evidence.release_mbid,
+                    item.release_track_mbid,
+                    item.candidate_disc_number,
+                    item.candidate_track_position,
+                    evidence_row["attempt_id"],
+                    now,
+                ),
+            )
+        connection.execute(
+            "DELETE FROM library_custom_edition_active WHERE local_album_id = ?",
+            (work["local_album_id"],),
+        )
+        connection.execute(
+            "DELETE FROM library_management_exclusions WHERE local_album_id = ?",
+            (work["local_album_id"],),
+        )
+        connection.execute(
+            "UPDATE library_identification_reviews SET state = 'resolved', "
+            "reason_code = 'SUGGESTED_EDITION_ACCEPTED', decided_by_user_id = ?, "
+            "decided_at = ?, updated_at = ?, decision_revision = decision_revision + 1, "
+            "row_revision = row_revision + 1 WHERE local_album_id = ? "
+            "AND state != 'resolved'",
+            (actor_user_id, now, now, work["local_album_id"]),
+        )
+        after = {
+            "release_group_mbid": evidence.release_group_mbid,
+            "release_mbid": evidence.release_mbid,
+            "tracks": [
+                {
+                    "local_track_id": item.local_track_id,
+                    "recording_mbid": item.recording_mbid,
+                    "release_track_mbid": item.release_track_mbid,
+                    "medium_position": item.candidate_disc_number,
+                    "release_track_position": item.candidate_track_position,
+                }
+                for item in mapped
+            ],
+        }
+        connection.execute(
+            "INSERT INTO library_catalog_actions "
+            "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
+            "before_json, after_json, reason_code, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()),
+                actor_user_id,
+                "accept_suggested_edition",
+                work["local_album_id"],
+                job_id,
+                json.dumps(before, sort_keys=True),
+                json.dumps(after, sort_keys=True),
+                "SUGGESTED_EDITION_ACCEPTED",
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE library_identity_repair_findings SET state = 'applied', "
+            "apply_result = 'EDITION_ACCEPTED', updated_at = ?, "
+            "row_revision = row_revision + 1 WHERE id = ?",
+            (now, finding["id"]),
+        )
+        self._bump_catalog(connection)
+        return "succeeded", None
 
     async def list_repair_findings(
         self,

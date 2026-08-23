@@ -95,6 +95,7 @@ function createPlayerStore() {
 	let shuffleEnabled = $state(false);
 	let shuffleOrder = $state<number[]>([]);
 	let consecutiveErrors = 0;
+	let failedTrackNames: string[] = [];
 	let errorSkipTimeout: ReturnType<typeof setTimeout> | null = null;
 	let lastPersistTime = 0;
 	let beforeUnloadRegistered = false;
@@ -201,6 +202,7 @@ function createPlayerStore() {
 		shuffleOrder = [];
 		shuffleEnabled = false;
 		consecutiveErrors = 0;
+		failedTrackNames = [];
 		progressReporter.stop();
 		unregisterBeforeUnload();
 		storeSessionData(null);
@@ -321,8 +323,15 @@ function createPlayerStore() {
 		consecutiveErrors++;
 		playbackState = 'error';
 		const trackName = nowPlaying?.trackName ?? 'Unknown track';
+		failedTrackNames.push(trackName);
 		if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-			playbackToast.show('Several tracks failed, so playback stopped.', 'error');
+			const named = failedTrackNames
+				.slice(0, MAX_CONSECUTIVE_ERRORS)
+				.map((n) => `"${n}"`)
+				.join(', ');
+			const extra = failedTrackNames.length - MAX_CONSECUTIVE_ERRORS;
+			const suffix = extra > 0 ? ` +${extra} more` : '';
+			playbackToast.show(`Several tracks failed: ${named}${suffix} - playback stopped.`, 'error');
 			applyResetState();
 			return;
 		}
@@ -353,6 +362,7 @@ function createPlayerStore() {
 			playbackState = state;
 			if (state === 'playing') {
 				consecutiveErrors = 0;
+				failedTrackNames = [];
 				if (getJellyfinItem())
 					progressReporter.start(() => ({
 						jellyfinItem: getJellyfinItem(),

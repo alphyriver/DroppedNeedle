@@ -17,6 +17,8 @@ export const LibraryQueryKeyFactory = {
 	runHistory: (cursor: string | undefined) =>
 		[...LibraryQueryKeyFactory.operationsPrefix(), 'run-history', cursor ?? 'first'] as const,
 	run: (runId: string) => [...LibraryQueryKeyFactory.operationsPrefix(), 'run', runId] as const,
+	runFailures: (runId: string) =>
+		[...LibraryQueryKeyFactory.operationsPrefix(), 'run-failures', runId] as const,
 	runEstimate: (scopeIds: string[]) =>
 		[...LibraryQueryKeyFactory.operationsPrefix(), 'estimate', [...scopeIds].sort()] as const,
 	reviewsPrefix: () => [...LibraryQueryKeyFactory.all, 'reviews'] as const,

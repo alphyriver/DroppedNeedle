@@ -53,6 +53,7 @@
 	const counters = $derived(runDetailQuery.data?.snapshot.counters ?? {});
 	const scopes = $derived(runDetailQuery.data?.snapshot.scopes ?? []);
 	const policyRevision = $derived(settingsQuery.data?.policy_revision ?? '');
+	const libraryEnabled = $derived(settingsQuery.data?.enabled ?? true);
 	const reviewCount = $derived(reviewsQuery.data?.pages[0]?.filtered_total ?? 0);
 	const roots = $derived(settingsQuery.data?.library_roots ?? []);
 	const scopeLabel = $derived(
@@ -83,6 +84,21 @@
 		'rescan_files'
 	);
 	const catalogRevision = $derived(reviewsQuery.data?.pages[0]?.catalog_revision ?? 0);
+	const attentionCount = $derived(identification?.attention_count ?? 0);
+	const deferredReasonBreakdown = $derived(
+		Object.entries(identification?.deferred_reason_counts ?? {})
+			.map(([code, count]) => `${deferredReasonLabel(code)}: ${count.toLocaleString()}`)
+			.join(', ')
+	);
+
+	function deferredReasonLabel(code: string): string {
+		const labels: Record<string, string> = {
+			PROVIDER_TEMPORARILY_UNAVAILABLE: 'provider temporarily unavailable',
+			SUBJECT_NOT_AVAILABLE: 'album no longer available',
+			MAX_DEFERRALS_EXCEEDED: 'retry limit reached'
+		};
+		return labels[code] ?? code.toLowerCase().replaceAll('_', ' ');
+	}
 
 	function stateLabel(state: string): string {
 		const labels: Record<string, string> = {
@@ -151,44 +167,58 @@
 				</a>
 			</div>
 		</div>
-		<div class="mt-4 flex flex-wrap items-center justify-between gap-4">
-			<div class="max-w-xl">
-				<h2 class="font-display text-2xl font-bold">Scan &amp; identify</h2>
-				<p class="mt-1 text-sm text-base-content/60">
-					Reads your library folders and updates the catalog. Identification then matches albums to
-					MusicBrainz. Nothing here writes to your files.
-				</p>
+		{#if !libraryEnabled}
+			<div class="alert alert-warning">
+				<ShieldAlert class="h-5 w-5" />
+				<div class="min-w-0 flex-1">
+					<strong>The local library is disabled</strong>
+					<p class="text-sm">
+						Scanning and identification are paused. Existing catalog data and playback keep working.
+						Enable the library in
+						<a class="link link-primary" href="/settings?tab=library">Settings</a> to start new work.
+					</p>
+				</div>
 			</div>
-			<button
-				class="btn btn-primary btn-lg rounded-full shadow-lg shadow-primary/25 glow-primary-soft"
-				disabled={requestRun.isPending || !policyRevision}
-				onclick={() => void startRun('incremental')}
-			>
-				<RefreshCw class="h-5 w-5" /> Scan for changes
-			</button>
-		</div>
-		<div class="mt-4 space-y-3">
-			<div
-				class="flex flex-wrap items-center justify-between gap-3 border-t border-base-content/10 pt-3 text-sm"
-			>
-				<button class="btn btn-outline btn-sm" onclick={() => openWork('rescan_files')}>
-					<ScanLine class="h-4 w-4" /> Rescan files...
+		{:else}
+			<div class="mt-4 flex flex-wrap items-center justify-between gap-4">
+				<div class="max-w-xl">
+					<h2 class="font-display text-2xl font-bold">Scan &amp; identify</h2>
+					<p class="mt-1 text-sm text-base-content/60">
+						Reads your library folders and updates the catalog. Identification then matches albums
+						to MusicBrainz. Nothing here writes to your files.
+					</p>
+				</div>
+				<button
+					class="btn btn-primary btn-lg rounded-full shadow-lg shadow-primary/25 glow-primary-soft"
+					disabled={requestRun.isPending || !policyRevision}
+					onclick={() => void startRun('incremental')}
+				>
+					<RefreshCw class="h-5 w-5" /> Scan for changes
 				</button>
-				<p class="text-base-content/55">
-					Deep re-read of selected folders. Use after fixing files outside DroppedNeedle.
-				</p>
 			</div>
-			<div
-				class="flex flex-wrap items-center justify-between gap-3 border-t border-base-content/10 pt-3 text-sm"
-			>
-				<button class="btn btn-outline btn-sm" onclick={() => openWork('retry_identification')}>
-					<ListChecks class="h-4 w-4" /> Retry identification...
-				</button>
-				<p class="text-base-content/55">
-					Re-runs matching for albums still waiting on review or a provider.
-				</p>
+			<div class="mt-4 space-y-3">
+				<div
+					class="flex flex-wrap items-center justify-between gap-3 border-t border-base-content/10 pt-3 text-sm"
+				>
+					<button class="btn btn-outline btn-sm" onclick={() => openWork('rescan_files')}>
+						<ScanLine class="h-4 w-4" /> Rescan files...
+					</button>
+					<p class="text-base-content/55">
+						Deep re-read of selected folders. Use after fixing files outside DroppedNeedle.
+					</p>
+				</div>
+				<div
+					class="flex flex-wrap items-center justify-between gap-3 border-t border-base-content/10 pt-3 text-sm"
+				>
+					<button class="btn btn-outline btn-sm" onclick={() => openWork('retry_identification')}>
+						<ListChecks class="h-4 w-4" /> Retry identification...
+					</button>
+					<p class="text-base-content/55">
+						Re-runs matching for albums still waiting on review or a provider.
+					</p>
+				</div>
 			</div>
-		</div>
+		{/if}
 	</div>
 
 	{#if activityQuery.isLoading || runsQuery.isLoading}
@@ -420,10 +450,24 @@
 						<span>Current work: {identification?.priority_band ?? 'No queued priority'}</span>
 						<span>Oldest waiting: {formatAge(identification?.oldest_backlog_at)}</span>
 					</div>
-					{#if identification?.provider_unavailable}
+					{#if attentionCount > 0}
+						<div class="alert alert-error py-2 text-sm">
+							{attentionCount.toLocaleString()}
+							{attentionCount === 1 ? 'album needs' : 'albums need'} attention after repeated identification
+							failures or because the album is no longer available. Use Review identification below to
+							resolve them.
+						</div>
+					{:else if identification?.provider_unavailable}
 						<div class="alert alert-warning py-2 text-sm">
-							Some metadata checks are waiting for a provider to become available. Local playback is
-							unaffected.
+							MusicBrainz is currently unavailable. Metadata checks will resume automatically when
+							it recovers. Local playback is unaffected.
+						</div>
+					{:else if (identification?.deferred_count ?? 0) > 0}
+						<div class="alert alert-info py-2 text-sm">
+							{(identification?.deferred_count ?? 0).toLocaleString()} metadata
+							{(identification?.deferred_count ?? 0) === 1 ? 'check is' : 'checks are'} deferred{deferredReasonBreakdown
+								? ` (${deferredReasonBreakdown})`
+								: ''}. They retry automatically.
 						</div>
 					{/if}
 					<div class="flex flex-wrap items-center justify-between gap-2 text-sm">

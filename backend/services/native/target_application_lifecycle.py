@@ -127,7 +127,11 @@ async def _migrate_global_connections(
 
 
 async def run_target_one_time_migrations(
-    *, auth_store: Any, preferences: Any, cache_dir: Path
+    *,
+    auth_store: Any,
+    preferences: Any,
+    cache_dir: Path,
+    library_enabled: bool = True,
 ) -> None:
     """Run target data ratchets without touching the retained legacy catalog."""
 
@@ -161,23 +165,29 @@ async def run_target_one_time_migrations(
     )
     if release_year_count:
         logger.info("Backfilled %d accepted release catalog years", release_year_count)
-    from core.dependencies.service_providers import (
-        get_artist_identity_reconciliation_service,
-        get_catalog_identity_hygiene_service,
-    )
+    if not library_enabled:
+        logger.info(
+            "Skipped catalog hygiene and artist reconciliation backfills: "
+            "the local library is disabled"
+        )
+    else:
+        from core.dependencies.service_providers import (
+            get_artist_identity_reconciliation_service,
+            get_catalog_identity_hygiene_service,
+        )
 
-    hygiene_job = await get_catalog_identity_hygiene_service().enqueue_backfill()
-    logger.info(
-        "Queued bounded catalog identity hygiene backfill %s",
-        hygiene_job["id"],
-    )
-    reconciliation_job = (
-        await get_artist_identity_reconciliation_service().enqueue_backfill()
-    )
-    logger.info(
-        "Queued bounded artist identity reconciliation backfill %s",
-        reconciliation_job["id"],
-    )
+        hygiene_job = await get_catalog_identity_hygiene_service().enqueue_backfill()
+        logger.info(
+            "Queued bounded catalog identity hygiene backfill %s",
+            hygiene_job["id"],
+        )
+        reconciliation_job = (
+            await get_artist_identity_reconciliation_service().enqueue_backfill()
+        )
+        logger.info(
+            "Queued bounded artist identity reconciliation backfill %s",
+            reconciliation_job["id"],
+        )
     await auth_store.backfill_usernames()
     await auth_store.migrate_local_provider_to_username()
     await _migrate_shared_avatar(auth_store, cache_dir)

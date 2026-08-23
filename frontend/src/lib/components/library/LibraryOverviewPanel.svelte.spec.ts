@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
 	settings: {
 		data: {
 			policy_revision: 'policy-1',
+			enabled: true,
 			library_roots: [],
 			affected_scope_ids: []
 		},
@@ -220,5 +221,16 @@ describe('LibraryOverviewPanel', () => {
 			scope_ids: [],
 			expected_policy_revision: 'policy-1'
 		});
+	});
+
+	it('shows a disabled notice and blocks the scan action when the library is off', async () => {
+		h.settings = {
+			data: { ...(h.settings.data as Record<string, unknown>), enabled: false },
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryOverviewPanel);
+		await expect.element(page.getByText('The local library is disabled')).toBeVisible();
+		await expect.element(page.getByRole('button', { name: 'Scan for changes' })).toBeDisabled();
 	});
 });

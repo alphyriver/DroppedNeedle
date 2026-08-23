@@ -37,9 +37,35 @@ DEFAULT_SIMILAR_COUNT = 15
 DEFAULT_TOP_SONGS_COUNT = 10
 DEFAULT_TOP_ALBUMS_COUNT = 10
 _DISCOVERY_WORKER_TIMEOUT = 120
+_PRECACHE_MAX_CONSECUTIVE_FAILURES = 5
+_PRECACHE_PAUSE_SECONDS = 1800.0  # matches ListenBrainz _POPULARITY_DEGRADED_TTL
 
 # Module-level flag survives singleton cache invalidation / instance recreation
 _discovery_precache_running = False
+
+# Module-level pause state survives singleton cache invalidation / instance
+# recreation, same rationale as _discovery_precache_running above.
+_precache_consecutive_failures = 0
+_precache_paused_until = 0.0  # time.monotonic deadline; 0 = not paused
+
+
+def _record_precache_unit_failure() -> None:
+    global _precache_consecutive_failures, _precache_paused_until
+    _precache_consecutive_failures += 1
+    if _precache_consecutive_failures >= _PRECACHE_MAX_CONSECUTIVE_FAILURES:
+        _precache_paused_until = monotonic() + _PRECACHE_PAUSE_SECONDS
+        _precache_consecutive_failures = 0
+        logger.info(
+            "Discovery precache paused for %ds after %d consecutive unit "
+            "failures (upstream outage backoff); will probe again after the pause",
+            int(_PRECACHE_PAUSE_SECONDS),
+            _PRECACHE_MAX_CONSECUTIVE_FAILURES,
+        )
+
+
+def _record_precache_unit_success() -> None:
+    global _precache_consecutive_failures
+    _precache_consecutive_failures = 0
 
 
 def _dedupe_similar_artists(artists: list[SimilarArtist]) -> list[SimilarArtist]:
@@ -624,6 +650,9 @@ class ArtistDiscoveryService:
         global _discovery_precache_running
         if _discovery_precache_running:
             return 0
+        if monotonic() < _precache_paused_until:
+            logger.debug("Discovery precache skipped: paused after repeated upstream failures")
+            return 0
 
         _discovery_precache_running = True
         try:
@@ -678,8 +707,14 @@ class ArtistDiscoveryService:
 
         async def process_artist(idx: int, mbid: str) -> bool:
             nonlocal cached_count, source_fetches, progress_counter
+            if monotonic() < _precache_paused_until:
+                return False
             try:
                 async with sem:
+                    if monotonic() < _precache_paused_until:
+                        # Pause tripped while this unit queued on the semaphore:
+                        # fast-complete without invoking sources.
+                        return False
                     for source in sources:
                         if self._workload_gate is not None:
                             await self._workload_gate.wait_until_available()
@@ -745,8 +780,10 @@ class ArtistDiscoveryService:
                         local_progress, current_item=artist_name, generation=generation
                     )
 
+                _record_precache_unit_success()
                 return True
             except Exception as e:  # noqa: BLE001
+                _record_precache_unit_failure()
                 logger.warning("Failed to precache discovery for %s: %s", mbid[:8], e)
                 async with counter_lock:
                     progress_counter += 1
@@ -766,6 +803,7 @@ class ArtistDiscoveryService:
                     process_artist(idx, mbid), timeout=_DISCOVERY_WORKER_TIMEOUT
                 )
             except asyncio.TimeoutError:
+                _record_precache_unit_failure()
                 logger.warning(
                     "Discovery timed out for %s after %ds",
                     mbid[:8],
@@ -787,6 +825,8 @@ class ArtistDiscoveryService:
 
         chunk = max(discovery_concurrency * 4, 20)
         for i in range(0, len(artist_mbids), chunk):
+            if monotonic() < _precache_paused_until:
+                break
             if status_service and status_service.is_cancelled():
                 break
             batch = artist_mbids[i : i + chunk]

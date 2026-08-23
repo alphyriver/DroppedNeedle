@@ -389,7 +389,8 @@ describe('playlistTrackToQueueItem', () => {
 		disc_number: 2,
 		duration: 240,
 		created_at: '2026-01-01T00:00:00Z',
-		plex_rating_key: null
+		plex_rating_key: null,
+		library_file_id: null
 	};
 
 	it('maps local track to QueueItem with correct streamUrl', () => {
@@ -484,5 +485,50 @@ describe('playlistTrackToQueueItem', () => {
 		expect.assertions(1);
 		const item = playlistTrackToQueueItem(basePlaylistTrack)!;
 		expect(item.playlistTrackId).toBe('pt-1');
+	});
+
+	it('prefers local when library_file_id set and available_sources includes local', () => {
+		expect.assertions(4);
+		const track: PlaylistTrack = {
+			...basePlaylistTrack,
+			source_type: 'jellyfin',
+			track_source_id: 'jf-123',
+			available_sources: ['jellyfin', 'local'],
+			library_file_id: '77'
+		};
+		const item = playlistTrackToQueueItem(track)!;
+		expect(item.sourceType).toBe('local');
+		expect(item.trackSourceId).toBe('77');
+		expect(item.streamUrl).toBe('/api/v1/stream/local/77');
+		expect(item.sourceIds).toEqual({ jellyfin: 'jf-123', local: '77' });
+	});
+
+	it('keeps jellyfin when library_file_id is null', () => {
+		expect.assertions(3);
+		const track: PlaylistTrack = {
+			...basePlaylistTrack,
+			source_type: 'jellyfin',
+			track_source_id: 'jf-123',
+			available_sources: ['jellyfin', 'local'],
+			library_file_id: null
+		};
+		const item = playlistTrackToQueueItem(track)!;
+		expect(item.sourceType).toBe('jellyfin');
+		expect(item.trackSourceId).toBe('jf-123');
+		expect(item.sourceIds).toEqual({ jellyfin: 'jf-123' });
+	});
+
+	it('keeps jellyfin when local is not in available_sources', () => {
+		expect.assertions(2);
+		const track: PlaylistTrack = {
+			...basePlaylistTrack,
+			source_type: 'jellyfin',
+			track_source_id: 'jf-123',
+			available_sources: ['jellyfin'],
+			library_file_id: '77'
+		};
+		const item = playlistTrackToQueueItem(track)!;
+		expect(item.sourceType).toBe('jellyfin');
+		expect(item.streamUrl).toBe('/api/v1/stream/jellyfin/jf-123');
 	});
 });

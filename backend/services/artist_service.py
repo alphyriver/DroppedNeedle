@@ -25,7 +25,10 @@ from services.artist_utils import (
     extract_wiki_info,
     build_base_artist_info,
 )
-from infrastructure.cache.cache_keys import ARTIST_INFO_PREFIX
+from infrastructure.cache.cache_keys import (
+    ARTIST_INFO_PREFIX,
+    mb_artist_release_groups_key,
+)
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.validators import validate_mbid
@@ -34,13 +37,17 @@ from infrastructure.http.disconnect import DisconnectCallable, check_disconnecte
 from core.exceptions import ClientDisconnectedError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBArtistImages
-from repositories.musicbrainz_base import extract_artist_name
+from repositories.musicbrainz_base import extract_artist_name, mb_deduplicator
 
 if TYPE_CHECKING:
     from infrastructure.persistence import LibraryDB
     from services.native.library_ownership_service import LibraryOwnershipService
 
 logger = logging.getLogger(__name__)
+
+# MB is rate-limited to 1 req/s in-process; bound the cold browse to 10 pages
+# (1000 release groups) so pathological artists don't hog the limiter.
+_MAX_RG_PAGES = 10
 
 
 class ArtistService:
@@ -569,92 +576,108 @@ class ArtistService:
                 source_total_count=None,
             )
 
-        _SCAN_BATCH = 100
-        _MAX_SCAN_BATCHES = 2
-        seen_mbids: set[str] = set()
-        all_albums: list[ReleaseItem] = []
-        all_singles: list[ReleaseItem] = []
-        all_eps: list[ReleaseItem] = []
+        full_list = await self._fetch_all_release_groups(artist_id, is_disconnected)
 
-        raw_offset = offset
-        source_total: int | None = None
-        batches_scanned = 0
+        if self._ownership is not None:
+            album_mbids, requested_mbids = await self._target_release_group_flags(
+                full_list, artist_name=""
+            )
 
-        while batches_scanned < _MAX_SCAN_BATCHES:
+        albums, singles, eps = categorize_release_groups(
+            {"release-group-list": full_list},
+            album_mbids,
+            included_primary_types,
+            included_secondary_types,
+            requested_mbids,
+        )
+        # Stream order = UI section order; categorize_release_groups already
+        # sorts each bucket by year desc, so don't re-sort here.
+
+        tagged: list[tuple[str, ReleaseItem]] = (
+            [("albums", item) for item in albums]
+            + [("eps", item) for item in eps]
+            + [("singles", item) for item in singles]
+        )
+
+        page = tagged[offset : offset + limit]
+        page_albums = [item for kind, item in page if kind == "albums"]
+        page_singles = [item for kind, item in page if kind == "singles"]
+        page_eps = [item for kind, item in page if kind == "eps"]
+
+        next_offset = offset + limit if offset + limit < len(tagged) else None
+        return ArtistReleases(
+            albums=page_albums,
+            singles=page_singles,
+            eps=page_eps,
+            offset=offset,
+            limit=limit,
+            returned_count=len(page),
+            next_offset=next_offset,
+            has_more=next_offset is not None,
+            source_total_count=len(tagged),
+        )
+
+    async def _fetch_all_release_groups(
+        self, artist_id: str, is_disconnected: DisconnectCallable | None
+    ) -> list[dict[str, Any]]:
+        """Cached, request-coalesced full release-group browse.
+
+        Stores raw MB dicts only; in_library/requested flags are recomputed
+        per request from library state, so library changes never invalidate it.
+        """
+        cache_key = mb_artist_release_groups_key(artist_id)
+        cached = await self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        return await mb_deduplicator.dedupe(
+            cache_key,
+            lambda: self._fetch_all_release_groups_uncached(artist_id, is_disconnected),
+        )
+
+    async def _fetch_all_release_groups_uncached(
+        self, artist_id: str, is_disconnected: DisconnectCallable | None
+    ) -> list[dict[str, Any]]:
+        """Fetch all release-group pages (max _MAX_RG_PAGES), first-wins dedupe.
+
+        MB re-sorts each browse page by GID against a different materialized
+        order, so pages can overlap or drift mid-fetch; dedupe by id survives
+        that. Only complete fetches are cached so an outage never poisons it.
+        """
+        cache_key = mb_artist_release_groups_key(artist_id)
+        collected: dict[str, dict[str, Any]] = {}
+        raw_offset = 0
+        total = 0
+        pages = 0
+
+        while pages < _MAX_RG_PAGES:
             await check_disconnected(is_disconnected)
             release_groups, mb_total = await self._mb_repo.get_artist_release_groups(
                 artist_id,
                 raw_offset,
-                _SCAN_BATCH,
+                100,
                 priority=RequestPriority.USER_INITIATED,
             )
-            await check_disconnected(is_disconnected)
-            if source_total is None:
-                source_total = mb_total
-
+            total = mb_total or total
             if not release_groups:
                 break
-
-            batch_album_mbids = album_mbids
-            batch_requested_mbids = requested_mbids
-            if self._ownership is not None:
-                (
-                    batch_album_mbids,
-                    batch_requested_mbids,
-                ) = await self._target_release_group_flags(
-                    release_groups, artist_name=""
-                )
-
-            consumed = 0
-            for release_group in release_groups:
-                consumed += 1
-                page_albums, page_singles, page_eps = categorize_release_groups(
-                    {"release-group-list": [release_group]},
-                    batch_album_mbids,
-                    included_primary_types,
-                    included_secondary_types,
-                    batch_requested_mbids,
-                )
-                for target, items in (
-                    (all_albums, page_albums),
-                    (all_singles, page_singles),
-                    (all_eps, page_eps),
-                ):
-                    for item in items:
-                        if item.id and item.id not in seen_mbids:
-                            seen_mbids.add(item.id)
-                            target.append(item)
-                if len(seen_mbids) >= limit:
-                    break
-
-            raw_offset += consumed
-            batches_scanned += 1
-
-            if len(seen_mbids) >= limit:
-                break
-            if raw_offset >= mb_total:
+            for group in release_groups:
+                group_id = group.get("id")
+                if not group_id:
+                    continue
+                collected.setdefault(str(group_id).casefold(), group)
+            raw_offset += len(release_groups)
+            pages += 1
+            if raw_offset >= total:
                 break
 
-        for lst in (all_albums, all_singles, all_eps):
-            lst.sort(key=lambda x: (x.year is None, -(x.year or 0)))
-
-        returned_count = len(all_albums) + len(all_singles) + len(all_eps)
-
-        has_more = raw_offset < (source_total or 0)
-
-        next_offset = raw_offset if has_more else None
-
-        return ArtistReleases(
-            albums=all_albums,
-            singles=all_singles,
-            eps=all_eps,
-            offset=offset,
-            limit=limit,
-            returned_count=returned_count,
-            next_offset=next_offset,
-            has_more=has_more,
-            source_total_count=source_total,
-        )
+        full_list = list(collected.values())
+        if total > 0 and raw_offset >= total:
+            await self._cache.set(
+                cache_key,
+                full_list,
+                ttl_seconds=self._get_artist_ttl(in_library=False),
+            )
+        return full_list
 
     async def _fetch_artist_data(
         self,

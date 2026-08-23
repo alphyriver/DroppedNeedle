@@ -449,6 +449,19 @@ describe('AlbumIdentificationPanel', () => {
 		await expect
 			.element(page.getByRole('heading', { name: 'Identity attached' }))
 			.not.toBeInTheDocument();
+
+		// Zero-candidate albums still have an exit: leave the album unmanaged
+		// without any candidate evidence.
+		const leaveButton = page.getByRole('button', { name: 'Leave unmanaged' });
+		await expect.element(leaveButton).toBeVisible();
+		await leaveButton.click();
+		expect(h.select).toHaveBeenCalledWith({
+			jobId: 'job-1',
+			expectedRevision: 8,
+			candidateKey: '',
+			confirmation: true,
+			decisionMode: 'leave_unmanaged'
+		});
 	});
 
 	it('uses the candidate rail to inspect one release dossier at a time', async () => {

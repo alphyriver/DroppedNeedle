@@ -19,6 +19,8 @@ from api.v1.schemas.library_scan_target import (
     ScanEstimateResponse,
     ScanRunCurrentResponse,
     ScanRunDetailResponse,
+    ScanRunFailureItem,
+    ScanRunFailuresResponse,
     ScanRunHistoryResponse,
     ScanRunRequestBody,
     ScanRunRequestedResponse,
@@ -27,6 +29,8 @@ from api.v1.schemas.library import LibraryScanStatusResponse
 from core.dependencies import (
     LibraryAdministrativeWorkServiceDep,
     LibraryPolicyResolverDep,
+    MbProviderAvailabilityDep,
+    NativeLibraryStoreDep,
     TargetIdentificationQueueDep,
     TargetLibraryScanCoordinatorDep,
 )
@@ -116,6 +120,7 @@ async def library_activity(
     coordinator: TargetLibraryScanCoordinatorDep,
     identification: TargetIdentificationQueueDep,
     administrative_work: LibraryAdministrativeWorkServiceDep,
+    mb_provider_available: MbProviderAvailabilityDep,
 ) -> LibraryActivityResponse:
     revisions = await identification.stream_revisions()
     runs = await coordinator.current()
@@ -270,7 +275,7 @@ async def library_activity(
             state = "pausing"
         elif control_state == "paused":
             state = "paused"
-        elif waiting:
+        elif counts.get("running", 0) or identification_snapshot["claimable_count"]:
             state = "running"
         elif identification_snapshot["failure_event_id"] is not None:
             state = "failed"
@@ -298,13 +303,17 @@ async def library_activity(
                 needs_review_count=counts.get("needs_review", 0),
                 failed_count=counts.get("failed", 0),
                 deferred_count=identification_snapshot["deferred_count"],
+                deferred_reason_counts=identification_snapshot[
+                    "deferred_reason_counts"
+                ],
+                attention_count=identification_snapshot["attention_count"],
                 priority_band=(
                     _IDENTIFICATION_PRIORITY_LABELS.get(active_priority, "Queued work")
                     if active_priority is not None
                     else None
                 ),
                 oldest_backlog_at=identification_snapshot["started_at"],
-                provider_unavailable=bool(identification_snapshot["deferred_count"]),
+                provider_unavailable=not mb_provider_available(),
                 control_revision=identification_snapshot["control_revision"],
                 failure_event_id=identification_snapshot["failure_event_id"],
                 failure_at=identification_snapshot["failure_at"],
@@ -530,6 +539,34 @@ async def scan_run_detail(
     coordinator: TargetLibraryScanCoordinatorDep,
 ) -> ScanRunDetailResponse:
     return ScanRunDetailResponse(snapshot=await coordinator.snapshot(run_id))
+
+
+@router.get("/scan-runs/{run_id}/failures", response_model=ScanRunFailuresResponse)
+async def scan_run_failures(
+    run_id: str,
+    _: CurrentAdminDep,
+    store: NativeLibraryStoreDep,
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: int | None = Query(default=None, ge=1),
+) -> ScanRunFailuresResponse:
+    await store.get_scan_run(run_id)
+    items, next_cursor = await store.list_scan_run_failures(
+        run_id, limit=limit, cursor_rowid=cursor
+    )
+    return ScanRunFailuresResponse(
+        items=[
+            ScanRunFailureItem(
+                root_id=item.root_id,
+                relative_path=item.relative_path,
+                failure_code=item.failure_code,
+                failure_detail=item.failure_detail,
+                phase=item.phase,
+                recorded_at=item.recorded_at,
+            )
+            for item in items
+        ],
+        next_cursor=next_cursor,
+    )
 
 
 async def _control(

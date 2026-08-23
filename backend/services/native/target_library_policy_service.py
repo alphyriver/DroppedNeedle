@@ -301,6 +301,7 @@ class TargetLibraryPolicyService:
                 staging_path=current.staging_path,
                 naming_template=current.naming_template,
                 acoustid_api_key=current.acoustid_api_key,
+                enabled=current.enabled,
             ),
             expected_policy_revision=request.expected_policy_revision,
         )

@@ -8,6 +8,7 @@ import type {
 	ScanEstimateResponse,
 	ScanRunCurrentResponse,
 	ScanRunDetailResponse,
+	ScanRunFailuresResponse,
 	ScanRunHistoryResponse
 } from './LibraryOperationsTypes';
 
@@ -42,6 +43,22 @@ export const getLibraryRunHistoryQuery = (enabled: Getter<boolean> = () => true)
 			api.global.get<ScanRunHistoryResponse>(API.library.scanRuns(50, pageParam), { signal }),
 		getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined
 	}));
+
+export const getLibraryRunFailuresQuery = (getRunId: Getter<string | null>) =>
+	createInfiniteQuery(() => {
+		const runId = getRunId();
+		return {
+			enabled: Boolean(runId),
+			queryKey: LibraryQueryKeyFactory.runFailures(runId ?? ''),
+			initialPageParam: undefined as number | undefined,
+			queryFn: ({ pageParam, signal }) =>
+				api.global.get<ScanRunFailuresResponse>(
+					API.library.scanRunFailures(runId ?? '', 50, pageParam),
+					{ signal }
+				),
+			getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined
+		};
+	});
 
 export const getLibraryRunEstimateQuery = (
 	getScopeIds: Getter<string[]>,

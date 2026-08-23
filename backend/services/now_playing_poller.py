@@ -147,7 +147,7 @@ async def run_now_playing_presence_loop(
                 plex_service_getter(),
             )
         except asyncio.CancelledError:
-            raise
+            break
         except Exception as e:  # noqa: BLE001
             logger.warning("now-playing presence loop cycle failed: %s", e)
         await asyncio.sleep(interval)

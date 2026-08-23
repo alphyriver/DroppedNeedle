@@ -999,3 +999,77 @@ describe('non-seekable state propagation', () => {
 		expect(playerStore.isSeekable).toBe(true);
 	});
 });
+
+describe('track failure reporting', () => {
+	beforeEach(() => {
+		localStorage.clear();
+		playerStore.stop();
+		vi.clearAllMocks();
+		vi.useFakeTimers();
+		mockApiHead.mockResolvedValue(new Response(null, { status: 200 }));
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.unstubAllGlobals();
+		vi.stubGlobal('localStorage', {
+			getItem: vi.fn((key: string) => (storage.has(key) ? storage.get(key)! : null)),
+			setItem: vi.fn((key: string, value: string) => {
+				storage.set(key, value);
+			}),
+			removeItem: vi.fn((key: string) => {
+				storage.delete(key);
+			}),
+			clear: vi.fn(() => {
+				storage.clear();
+			})
+		});
+	});
+
+	function fireCurrentTrackError(): void {
+		capturedErrorCallbacks.forEach((cb) => cb({ code: '4', message: 'stream failed' }));
+	}
+
+	it('final failure toast names the failed tracks', async () => {
+		playerStore.playQueue(makeItems(3));
+		await vi.advanceTimersByTimeAsync(0);
+
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(playbackToast.show).toHaveBeenLastCalledWith(
+			'Several tracks failed: "Track 1", "Track 2", "Track 3" - playback stopped.',
+			'error'
+		);
+		expect(playerStore.queue).toHaveLength(0);
+	});
+
+	it('failed track names reset after a successful play', async () => {
+		playerStore.playQueue(makeItems(4));
+		await vi.advanceTimersByTimeAsync(0);
+
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+
+		// track 2 plays successfully - the failure list resets
+		capturedStateCallbacks.forEach((cb) => cb('playing'));
+		await vi.advanceTimersByTimeAsync(0);
+
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(2100);
+		fireCurrentTrackError();
+		await vi.advanceTimersByTimeAsync(0);
+
+		const lastCall = vi.mocked(playbackToast.show).mock.calls.at(-1);
+		expect(lastCall?.[0]).toBe(
+			'Several tracks failed: "Track 2", "Track 3", "Track 4" - playback stopped.'
+		);
+		expect(lastCall?.[0]).not.toContain('Track 1');
+	});
+});

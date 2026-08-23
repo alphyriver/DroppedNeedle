@@ -411,6 +411,7 @@ def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
         "start_target_scan_supervisor",
         "start_target_identification_worker",
         "start_target_operation_worker",
+        "start_target_worker_watchdog",
     } <= target
 
 
@@ -433,13 +434,18 @@ def test_target_lifecycle_events_sweep_uses_target_catalog_authority() -> None:
 
 
 @pytest.mark.parametrize(
-    ("admission_token", "expected_phase"),
-    [(None, "steady_state"), ("a" * 32, "admission")],
+    ("admission_token", "expected_phase", "library_enabled"),
+    [
+        (None, "steady_state", True),
+        ("a" * 32, "admission", True),
+        (None, "steady_state", False),
+    ],
 )
 def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     monkeypatch: pytest.MonkeyPatch,
     admission_token: str | None,
     expected_phase: str,
+    library_enabled: bool,
 ) -> None:
     import target_application as target_module
     from core.dependencies import auth_providers
@@ -463,7 +469,9 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
             memory_cache_cleanup_interval=60,
             disk_cache_cleanup_interval=60,
         ),
-        get_typed_library_settings=lambda: SimpleNamespace(library_roots=[]),
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[], enabled=library_enabled
+        ),
         get_library_scan_schedule=lambda: SimpleNamespace(
             scan_frequency="manual", daily_scan_time="03:00"
         ),
@@ -539,21 +547,49 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         "start_target_scan_supervisor",
         lambda *args, **kwargs: scan_supervisor_arguments.update(kwargs),
     )
+    identification_worker_arguments: dict[str, object] = {}
     monkeypatch.setattr(
-        target_module, "start_target_identification_worker", lambda *a, **k: None
+        target_module,
+        "start_target_identification_worker",
+        lambda *a, **k: identification_worker_arguments.update(k),
     )
+    operation_worker_arguments: dict[str, object] = {}
     monkeypatch.setattr(
-        target_module, "start_target_operation_worker", lambda *a, **k: None
+        target_module,
+        "start_target_operation_worker",
+        lambda *a, **k: operation_worker_arguments.update(k),
     )
     monkeypatch.setattr(
         target_module,
         "start_library_contribution_verification_worker",
         lambda *a, **k: None,
     )
+    watchdog_starters: dict[str, object] = {}
+    monkeypatch.setattr(
+        target_module,
+        "start_target_worker_watchdog",
+        lambda starters: watchdog_starters.update(starters),
+    )
+    pending_migration = AsyncMock()
+    pending_migration.schedule.return_value = False
+    monkeypatch.setattr(
+        target_module,
+        "get_legacy_pending_migration_service",
+        lambda: pending_migration,
+    )
     monkeypatch.setattr(auth_providers, "get_auth_service", lambda: auth)
     monkeypatch.setattr(auth_providers, "get_auth_store", lambda: auth_store)
+    registry = target_module.TaskRegistry.get_instance()
+    shutdown_order: list[str] = []
     monkeypatch.setattr(
-        target_module.TaskRegistry.get_instance(), "cancel_all", AsyncMock()
+        registry,
+        "cancel",
+        AsyncMock(side_effect=lambda *a, **k: shutdown_order.append("cancel")),
+    )
+    monkeypatch.setattr(
+        registry,
+        "cancel_all",
+        AsyncMock(side_effect=lambda *a, **k: shutdown_order.append("cancel_all")),
     )
     monkeypatch.setenv("TZ", "Europe/London")
     if admission_token is None:
@@ -567,7 +603,12 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
 
     validate.assert_awaited_once_with(expected_phase)
     admission.assert_awaited_once()
-    migrate.assert_awaited_once()
+    migrate.assert_awaited_once_with(
+        auth_store=auth_store,
+        preferences=preferences,
+        cache_dir=target_module.get_settings().cache_dir,
+        library_enabled=library_enabled,
+    )
     operation_supervisor.recover.assert_awaited_once()
     recovery_service.recover_startup.assert_awaited_once()
     operational.assert_awaited_once_with(
@@ -575,11 +616,29 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         preferences=preferences,
         auth_store=auth_store,
     )
+    identification_enabled_getter = identification_worker_arguments["enabled_getter"]
+    operation_enabled_getter = operation_worker_arguments["enabled_getter"]
+    assert callable(identification_enabled_getter)
+    assert callable(operation_enabled_getter)
+    assert identification_enabled_getter() is library_enabled
+    assert operation_enabled_getter() is library_enabled
+    if library_enabled:
+        pending_migration.schedule.assert_awaited_once()
+    else:
+        pending_migration.schedule.assert_not_awaited()
     schedule_settings_getter = scan_supervisor_arguments["schedule_settings_getter"]
     assert callable(schedule_settings_getter)
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     timezone_name.assert_called_once_with()
+    assert set(watchdog_starters) == {
+        "target-library-identification-worker",
+        "target-library-operation-worker",
+        "library-contribution-verification-worker",
+    }
+    assert all(callable(starter) for starter in watchdog_starters.values())
+    registry.cancel.assert_awaited_once_with("target-worker-watchdog")
+    assert shutdown_order == ["cancel", "cancel_all"]
     cleanup.assert_awaited_once()
     assert lifecycle_order == [
         "validate",

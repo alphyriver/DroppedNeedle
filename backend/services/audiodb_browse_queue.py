@@ -94,6 +94,7 @@ class AudioDBBrowseQueue:
                 try:
                     settings = preferences_service.get_advanced_settings()
                     if not settings.audiodb_enabled:
+                        await asyncio.sleep(_BROWSE_QUEUE_INTER_ITEM_DELAY)
                         continue
 
                     if item.entity_type == "artist":

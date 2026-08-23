@@ -99,6 +99,7 @@ def _track_to_response(t) -> PlaylistTrackResponse:
         duration=t.duration,
         created_at=t.created_at,
         plex_rating_key=getattr(t, "plex_rating_key", None),
+        library_file_id=getattr(t, "library_file_id", None),
     )
 
 

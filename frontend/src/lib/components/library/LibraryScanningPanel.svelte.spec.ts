@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
 	settings: {
 		data: {
 			policy_revision: 'policy-1',
+			enabled: true,
 			library_roots: [
 				{ id: 'root-1', label: 'Main library', path: '/music', policy: 'automatic', rules: [] }
 			],
@@ -37,6 +38,14 @@ const h = vi.hoisted(() => ({
 		isError: false
 	} as Record<string, unknown>,
 	history: {
+		data: { pages: [{ items: [], next_cursor: null }] },
+		isLoading: false,
+		isError: false,
+		hasNextPage: false,
+		isFetchingNextPage: false,
+		fetchNextPage: vi.fn()
+	} as Record<string, unknown>,
+	failures: {
 		data: { pages: [{ items: [], next_cursor: null }] },
 		isLoading: false,
 		isError: false,
@@ -70,6 +79,7 @@ vi.mock('$lib/queries/library/LibraryOperationQueries.svelte', () => ({
 		}
 	}),
 	getLibraryRunHistoryQuery: () => h.history,
+	getLibraryRunFailuresQuery: () => h.failures,
 	getLibraryRunEstimateQuery: () => ({ data: { estimated_file_count: 100 }, isFetching: false })
 }));
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
@@ -167,6 +177,8 @@ function activity(
 		needs_review_count: kind === 'identification' ? 5 : 0,
 		failed_count: 0,
 		deferred_count: 2,
+		deferred_reason_counts: {},
+		attention_count: 0,
 		priority_band: kind === 'identification' ? 'New and changed albums' : null,
 		oldest_backlog_at: kind === 'identification' ? 1 : null,
 		provider_unavailable: false,
@@ -207,6 +219,19 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	sessionStorage.clear();
 	h.activity = { data: { items: [] }, isLoading: false, isError: false };
+	h.settings = {
+		data: {
+			policy_revision: 'policy-1',
+			enabled: true,
+			library_roots: [
+				{ id: 'root-1', label: 'Main library', path: '/music', policy: 'automatic', rules: [] }
+			],
+			affected_scope_ids: [],
+			reconciliation_required: false
+		},
+		isSuccess: true,
+		isLoading: false
+	};
 	h.runs = { data: { active: null, queued: null }, isLoading: false, isError: false };
 	h.detail = { data: undefined };
 	h.operation = { data: undefined };
@@ -238,6 +263,23 @@ describe('LibraryScanningPanel', () => {
 			.toHaveAttribute('href', '/settings?tab=library');
 		expect(page.getByRole('button', { name: 'Pause all' }).query()).toBeNull();
 		expect(page.getByRole('button', { name: 'Resume all' }).query()).toBeNull();
+	});
+
+	it('shows a disabled notice instead of scan controls when the library is off', async () => {
+		h.settings = {
+			data: {
+				...structuredClone(h.settings.data as Record<string, unknown>),
+				enabled: false
+			},
+			isSuccess: true,
+			isLoading: false
+		};
+		render(LibraryScanningPanel);
+		await expect.element(page.getByText('The local library is disabled')).toBeVisible();
+		expect(page.getByRole('heading', { name: 'Scan & identify' }).query()).toBeNull();
+		expect(page.getByRole('button', { name: 'Scan for changes' }).query()).toBeNull();
+		expect(page.getByRole('button', { name: 'Rescan files...' }).query()).toBeNull();
+		expect(page.getByRole('button', { name: 'Retry identification...' }).query()).toBeNull();
 	});
 
 	it('shows separate stacked workload cards and truthful metrics', async () => {
@@ -339,7 +381,69 @@ describe('LibraryScanningPanel', () => {
 		await expect.element(page.getByText(/Whole library/).first()).toBeVisible();
 		await expect.element(page.getByText(/Queued follow-up: rescan files/)).toBeVisible();
 		await expect.element(page.getByText('Administrator retries')).toBeVisible();
-		await expect.element(page.getByText(/provider to become available/)).toBeVisible();
+		await expect.element(page.getByText(/MusicBrainz is currently unavailable/)).toBeVisible();
+	});
+
+	it('surfaces an error alert when albums need attention, ahead of other tiers', async () => {
+		h.activity = {
+			data: {
+				items: [
+					activity('identification', {
+						attention_count: 3,
+						provider_unavailable: true,
+						deferred_count: 4,
+						deferred_reason_counts: { PROVIDER_TEMPORARILY_UNAVAILABLE: 4 }
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryScanningPanel);
+		await expect.element(page.getByText(/3\s+albums need attention/)).toBeVisible();
+		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
+		expect(page.getByText(/retry automatically/).query()).toBeNull();
+	});
+
+	it('explains deferred work with a reason breakdown when the provider is healthy', async () => {
+		h.activity = {
+			data: {
+				items: [
+					activity('identification', {
+						deferred_count: 3,
+						deferred_reason_counts: {
+							PROVIDER_TEMPORARILY_UNAVAILABLE: 2,
+							SUBJECT_NOT_AVAILABLE: 1
+						}
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryScanningPanel);
+		await expect.element(page.getByText(/3\s+metadata\s+checks are deferred/)).toBeVisible();
+		await expect.element(page.getByText(/provider temporarily unavailable: 2/)).toBeVisible();
+		await expect.element(page.getByText(/album no longer available: 1/)).toBeVisible();
+		expect(page.getByText(/need attention/).query()).toBeNull();
+		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
+	});
+
+	it('shows no identification alert when nothing is deferred or needs attention', async () => {
+		h.activity = {
+			data: {
+				items: [activity('identification', { deferred_count: 0 })]
+			},
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryScanningPanel);
+		await expect
+			.element(page.getByRole('heading', { name: 'Identification', exact: true }))
+			.toBeVisible();
+		expect(page.getByText(/need attention/).query()).toBeNull();
+		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
+		expect(page.getByText(/retry automatically/).query()).toBeNull();
 	});
 
 	it('projects a persisted pausing state and sends the current revision', async () => {

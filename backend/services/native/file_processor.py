@@ -25,7 +25,7 @@ from uuid import uuid4
 
 from rapidfuzz import fuzz
 
-from core.exceptions import AutomaticManagementHoldError
+from core.exceptions import AutomaticManagementHoldError, ConfigurationError
 from infrastructure.msgspec_fastapi import AppStruct
 from models.audio import AudioInfo, AudioTag
 from models.download_manifest import DownloadManifest, ExpectedFile, ExpectedTrack
@@ -1472,6 +1472,18 @@ class FileProcessor:
             logger.warning("Could not hold %s for review: %s", source.name, exc)
             return False
 
+    def _root_library_path(self) -> Path:
+        """The first configured library root, checked at the moment of use.
+
+        Held-retry paths run long after the original import - the roots may have
+        been cleared since. Unlike a missing held file (terminal), that is
+        recoverable, so it raises an actionable 400 instead of an IndexError 500."""
+        if not self._library_paths:
+            raise ConfigurationError(
+                "No library root is configured - restore one in Settings → Library, then try again."
+            )
+        return self._library_paths[0]
+
     async def place_held_management_bundle(
         self, held_files: list["HeldImport"]
     ) -> list[Path]:
@@ -1528,7 +1540,7 @@ class FileProcessor:
                     held.artist_mbid or tag.musicbrainz_album_artist_id
                 ),
             )
-            target_path = self._library_paths[0] / self._naming.format_path(
+            target_path = self._root_library_path() / self._naming.format_path(
                 held.naming_template or "", target_tag, info.file_format
             )
             replacement: dict | None = None
@@ -1612,7 +1624,7 @@ class FileProcessor:
             musicbrainz_album_artist_id=held.artist_mbid
             or tag.musicbrainz_album_artist_id,
         )
-        target_path = self._library_paths[0] / self._naming.format_path(
+        target_path = self._root_library_path() / self._naming.format_path(
             held.naming_template or "", target_tag, info.file_format
         )
         # D10 confirm-replace: an upgrade's held file (AcoustID disagreed, a human

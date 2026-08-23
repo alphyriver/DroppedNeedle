@@ -61,12 +61,14 @@ class AcquisitionCleanupService:
         client_getter: Callable[[str], DownloadClientProtocol],
         sab_mount_getter: Callable[[], Path],
         *,
+        sab_category_getter: Callable[[], str] = lambda: "*",
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._store = download_store
         self._library_store = library_store
         self._client_getter = client_getter
         self._sab_mount_getter = sab_mount_getter
+        self._sab_category_getter = sab_category_getter
         self._clock = clock
 
     async def run_once(self, worker_id: str) -> int:
@@ -595,6 +597,7 @@ class AcquisitionCleanupService:
             return 0
 
         processed = 0
+        category = self._sab_category_getter()
         while processed < max(1, limit):
             if progress.current_directory is None:
                 if not progress.pending_directories:
@@ -629,7 +632,9 @@ class AcquisitionCleanupService:
                         match,
                         is_symlink=is_symlink,
                     )
-                elif is_directory and not is_symlink:
+                elif is_directory and not is_symlink and _descend_allowed(
+                    name, category
+                ):
                     progress.pending_directories.append(relative.as_posix())
                 if processed >= max(1, limit):
                     break
@@ -998,14 +1003,34 @@ def _remove_tree_contents(directory_fd: int) -> None:
             os.unlink(name, dir_fd=directory_fd)
 
 
+def _descend_allowed(name: str, category: str) -> bool:
+    """Descend only into DN-owned trees: the job prefix, plus the configured SAB
+    category dir (case-insensitive) when it isn't ``*``. Sonarr/Radarr/Whisparr
+    trees sharing the mount are never visited."""
+    if name.startswith("droppedneedle"):
+        return True
+    return category != "*" and name.lower() == category.lower()
+
+
 def _directory_entries(path: Path) -> list[tuple[str, bool, bool]]:
-    with os.scandir(path) as entries:
-        result = [
-            (
-                entry.name,
-                entry.is_dir(follow_symlinks=False),
-                entry.is_symlink(),
-            )
-            for entry in entries
-        ]
+    try:
+        with os.scandir(path) as entries:
+            result = []
+            for entry in entries:
+                try:
+                    result.append(
+                        (
+                            entry.name,
+                            entry.is_dir(follow_symlinks=False),
+                            entry.is_symlink(),
+                        )
+                    )
+                except (FileNotFoundError, NotADirectoryError):
+                    logger.debug(
+                        "Acquisition cleanup entry vanished mid-scan: %s",
+                        path / entry.name,
+                    )
+    except (FileNotFoundError, NotADirectoryError):
+        logger.debug("Acquisition cleanup directory vanished: %s", path)
+        return []
     return sorted(result, key=lambda value: value[0])

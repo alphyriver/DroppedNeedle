@@ -181,6 +181,7 @@ class LibraryPolicyResolver:
                 staging_path=str(staging) if staging is not None else "",
                 naming_template=settings.naming_template,
                 acoustid_api_key=settings.acoustid_api_key,
+                enabled=settings.enabled,
             ),
             warnings,
         )

@@ -8,6 +8,7 @@ from datetime import datetime
 
 import logging
 import os
+import asyncio
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -91,6 +92,7 @@ from core.dependencies import (
     get_discovery_batch_service,
     get_home_service,
     get_home_charts_service,
+    get_legacy_pending_migration_service,
     get_local_files_service,
     get_navidrome_library_service,
     get_plex_library_service,
@@ -189,7 +191,7 @@ from core.exceptions import (
     StaleRevisionError,
     ValidationError,
 )
-from infrastructure.resilience.retry import CircuitOpenError
+from infrastructure.resilience.retry import CircuitOpenError, CircuitState
 from core.task_registry import TaskRegistry
 from core.tasks import (
     start_cache_cleanup_task,
@@ -207,9 +209,14 @@ from middleware import (
 )
 from services.native.library_scan_supervisor import start_target_scan_supervisor
 from services.native.target_application_runtime import (
+    CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME,
+    IDENTIFICATION_WORKER_TASK_NAME,
+    OPERATION_WORKER_TASK_NAME,
+    TARGET_WORKER_WATCHDOG_TASK_NAME,
     start_library_contribution_verification_worker,
     start_target_identification_worker,
     start_target_operation_worker,
+    start_target_worker_watchdog,
 )
 from services.native.target_application_lifecycle import (
     run_target_one_time_migrations,
@@ -559,6 +566,7 @@ async def production_target_lifespan(app: FastAPI):
             auth_store=auth_store,
             preferences=preferences,
             cache_dir=settings.cache_dir,
+            library_enabled=preferences.get_typed_library_settings().enabled,
         )
         logger.info("target_startup.data_ratchets_completed")
     async with target_startup_progress(settings, "management_recovery"):
@@ -607,6 +615,10 @@ async def production_target_lifespan(app: FastAPI):
             }
 
         work_wakeups = get_native_library_store().work_wakeups
+
+        def library_enabled() -> bool:
+            return get_preferences_service().get_typed_library_settings().enabled
+
         start_target_scan_supervisor(
             get_target_library_scan_coordinator,
             root_paths,
@@ -615,35 +627,78 @@ async def production_target_lifespan(app: FastAPI):
             resolver_getter=get_library_policy_resolver,
             schedule_settings_getter=schedule_settings,
         )
-        start_target_identification_worker(
-            get_target_identification_queue,
-            get_target_album_identification_service,
-            work_wakeups,
-            workload_gate=get_background_workload_gate(),
-        )
-        start_target_operation_worker(
-            get_target_library_operation_supervisor,
-            work_wakeups,
-            recovery_getter=get_library_management_recovery_service,
-        )
-        start_library_contribution_verification_worker(
-            get_library_contribution_verification_worker,
-            work_wakeups,
-        )
+
+        def mb_provider_state() -> CircuitState:
+            from repositories.musicbrainz_base import mb_circuit_breaker
+
+            return mb_circuit_breaker.state
+
+        async def probe_mb_provider() -> None:
+            # Thin background-priority probe mirroring verify_musicbrainz; the
+            # breaker records the outcome, resolving HALF_OPEN without traffic.
+            from infrastructure.queue.priority_queue import RequestPriority
+            from repositories.musicbrainz_base import mb_api_get
+
+            await mb_api_get(
+                "/artist",
+                params={"query": "test", "limit": 1},
+                priority=RequestPriority.BACKGROUND_SYNC,
+            )
+
+        def start_identification_worker() -> asyncio.Task[None]:
+            return start_target_identification_worker(
+                get_target_identification_queue,
+                get_target_album_identification_service,
+                work_wakeups,
+                workload_gate=get_background_workload_gate(),
+                provider_state_getter=mb_provider_state,
+                probe_provider=probe_mb_provider,
+                enabled_getter=library_enabled,
+            )
+
+        def start_operation_worker() -> asyncio.Task[None]:
+            return start_target_operation_worker(
+                get_target_library_operation_supervisor,
+                work_wakeups,
+                recovery_getter=get_library_management_recovery_service,
+                enabled_getter=library_enabled,
+            )
+
+        def start_contribution_worker() -> asyncio.Task[None]:
+            return start_library_contribution_verification_worker(
+                get_library_contribution_verification_worker,
+                work_wakeups,
+            )
+
+        worker_starters = {
+            IDENTIFICATION_WORKER_TASK_NAME: start_identification_worker,
+            OPERATION_WORKER_TASK_NAME: start_operation_worker,
+            CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME: start_contribution_worker,
+        }
+        for start_worker in worker_starters.values():
+            start_worker()
+        start_target_worker_watchdog(worker_starters)
         await start_target_operational_runtime(
             settings=settings,
             preferences=preferences,
             auth_store=auth_store,
         )
+        if library_enabled():
+            try:
+                await get_legacy_pending_migration_service().schedule()
+            except Exception:  # noqa: BLE001
+                logger.exception("Legacy pending migration scheduling failed")
         logger.info("target_startup.operational_runtime_started")
         logger.info("DroppedNeedle target application started")
 
     try:
         yield
     finally:
-        await TaskRegistry.get_instance().cancel_all(
-            grace_period=settings.shutdown_grace_period
-        )
+        registry = TaskRegistry.get_instance()
+        # Cancel the watchdog before the snapshot+cancel_all pass so it cannot
+        # restart a worker mid-shutdown and orphan the task.
+        await registry.cancel(TARGET_WORKER_WATCHDOG_TASK_NAME)
+        await registry.cancel_all(grace_period=settings.shutdown_grace_period)
         await cleanup_app_state(
             queue_manager_getter=get_target_discover_queue_manager,
             genre_prewarm_getter=get_target_genre_cover_prewarm_service,

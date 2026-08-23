@@ -31,6 +31,10 @@ class TypedLibrarySettings(AppStruct):
     staging_path: str = ""
     naming_template: str = DEFAULT_NAMING_TEMPLATE
     acoustid_api_key: str = ""
+    # Master switch (GH #276): when False the target application stops claiming
+    # new scan/identification/organization work. Deliberately excluded from the
+    # policy revision hash so toggling never churns boundary transitions.
+    enabled: bool = True
 
 
 class LibrarySettingsResponse(TypedLibrarySettings):

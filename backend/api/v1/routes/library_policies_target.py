@@ -13,7 +13,10 @@ from api.v1.schemas.library_policies import (
     LibrarySettingsResponse,
     LibrarySettingsUpdateRequest,
 )
-from core.dependencies import TargetLibraryPolicyServiceDep
+from core.dependencies import (
+    LegacyPendingMigrationServiceDep,
+    TargetLibraryPolicyServiceDep,
+)
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep
 
@@ -39,12 +42,16 @@ async def get_library_settings(
 @router.put("", response_model=LibrarySettingsResponse)
 async def update_library_settings(
     service: TargetLibraryPolicyServiceDep,
+    pending_migration: LegacyPendingMigrationServiceDep,
     request: LibrarySettingsUpdateRequest = MsgSpecBody(LibrarySettingsUpdateRequest),
 ) -> LibrarySettingsResponse:
-    return await service.save_settings(
+    response = await service.save_settings(
         request.settings,
         expected_policy_revision=request.expected_policy_revision,
     )
+    if response.enabled:
+        await pending_migration.schedule()
+    return response
 
 
 @router.get("/policy-tree", response_model=LibraryPolicyTreeResponse)
@@ -80,6 +87,10 @@ async def get_restorable_library_roots(
 @router.post("/restore-roots", response_model=LibrarySettingsResponse)
 async def restore_library_roots(
     service: TargetLibraryPolicyServiceDep,
+    pending_migration: LegacyPendingMigrationServiceDep,
     request: LibraryRestoreRootsRequest = MsgSpecBody(LibraryRestoreRootsRequest),
 ) -> LibrarySettingsResponse:
-    return await service.restore_roots(request)
+    response = await service.restore_roots(request)
+    if response.enabled:
+        await pending_migration.schedule()
+    return response

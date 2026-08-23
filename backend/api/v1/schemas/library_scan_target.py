@@ -52,6 +52,20 @@ class ScanRunDetailResponse(AppStruct):
     snapshot: ScanRunSnapshot
 
 
+class ScanRunFailureItem(AppStruct):
+    root_id: str
+    relative_path: str
+    failure_code: str
+    failure_detail: str
+    phase: Literal["discovering", "indexing", "reconciling"]
+    recorded_at: float
+
+
+class ScanRunFailuresResponse(AppStruct):
+    items: list[ScanRunFailureItem]
+    next_cursor: int | None = None
+
+
 class LibraryActivityItem(AppStruct):
     kind: Literal["scan", "identification"]
     state: str
@@ -67,6 +81,8 @@ class LibraryActivityItem(AppStruct):
     needs_review_count: int = 0
     failed_count: int = 0
     deferred_count: int = 0
+    deferred_reason_counts: dict[str, int] = msgspec.field(default_factory=dict)
+    attention_count: int = 0
     priority_band: str | None = None
     oldest_backlog_at: float | None = None
     provider_unavailable: bool = False

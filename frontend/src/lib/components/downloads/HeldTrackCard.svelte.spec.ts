@@ -4,11 +4,28 @@ import { render } from 'vitest-browser-svelte';
 
 import type { HeldImport } from '$lib/types';
 
-const h = vi.hoisted(() => ({ importMut: vi.fn(), discardMut: vi.fn() }));
+const h = vi.hoisted(() => ({
+	importMut: vi.fn(),
+	discardMut: vi.fn(),
+	importError: null as { message: string } | null,
+	discardError: null as { message: string } | null
+}));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
-	importHeldTrack: () => ({ mutate: h.importMut, isPending: false }),
-	discardHeldTrack: () => ({ mutate: h.discardMut, isPending: false })
+	importHeldTrack: () => ({
+		mutate: h.importMut,
+		isPending: false,
+		get error() {
+			return h.importError;
+		}
+	}),
+	discardHeldTrack: () => ({
+		mutate: h.discardMut,
+		isPending: false,
+		get error() {
+			return h.discardError;
+		}
+	})
 }));
 
 import HeldTrackCard from './HeldTrackCard.svelte';
@@ -52,6 +69,8 @@ describe('HeldTrackCard', () => {
 	beforeEach(() => {
 		h.importMut.mockReset();
 		h.discardMut.mockReset();
+		h.importError = null;
+		h.discardError = null;
 	});
 
 	it('shows the track, the couldn’t-verify state, and the AcoustID evidence', async () => {
@@ -70,6 +89,23 @@ describe('HeldTrackCard', () => {
 			expect.objectContaining({ onSuccess: expect.any(Function) })
 		);
 		expect(h.discardMut).not.toHaveBeenCalled();
+	});
+
+	it('renders a server error inline and leaves the buttons enabled for retry', async () => {
+		h.importError = {
+			message: 'No library root is configured - restore one in Settings → Library, then try again.'
+		};
+		renderCard(held());
+
+		const alert = page.getByRole('alert');
+		await expect.element(alert).toHaveTextContent(/No library root is configured/);
+		const importButton = page.getByRole('button', { name: /Import anyway/ });
+		const discardButton = page.getByRole('button', { name: /Discard/ });
+		await expect.element(importButton).toBeEnabled();
+		await expect.element(discardButton).toBeEnabled();
+
+		await importButton.click();
+		expect(h.importMut).toHaveBeenCalledTimes(1);
 	});
 
 	it('discards the held track on "Discard"', async () => {

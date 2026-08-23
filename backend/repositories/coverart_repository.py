@@ -5,7 +5,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Literal, Optional, TYPE_CHECKING
+from typing import Callable, Literal, Optional, TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
 import aiofiles
@@ -35,6 +35,7 @@ from repositories.coverart_album import AlbumCoverFetcher
 from repositories.coverart_disk_cache import CoverDiskCache
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.integration_result import IntegrationResult
+from infrastructure.service_health import report_breaker_health
 from models.library_management_artwork import ArtworkCandidate, ArtworkImageType
 from repositories.coverart_management_models import CaaManagementResponse
 
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     from services.audiodb_image_service import AudioDBImageService
     from services.audiodb_browse_queue import AudioDBBrowseQueue
     from infrastructure.persistence.library_db import LibraryDB
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +80,16 @@ def _sniff_image_content_type(data: bytes) -> Optional[str]:
 
 COVER_ART_ARCHIVE_BASE = "https://coverartarchive.org"
 COVER_NEGATIVE_TTL_SECONDS = 4 * 3600
+# Short marker for upstream-outage failures (breaker open / transient fetch error):
+# repeats serve the placeholder immediately instead of re-paying the fetch chain,
+# and recovered art reappears within minutes - unlike the 4h authoritative negative.
+COVER_TRANSIENT_NEGATIVE_TTL_SECONDS = 900
 COVER_MEMORY_MAX_ENTRIES = 128
 COVER_MEMORY_MAX_BYTES = 16 * 1024 * 1024
+# Folder-art probe names, most deliberate first; matched case-insensitively.
+_LOCAL_COVER_STEMS = ("cover", "folder", "front", "album", "artwork")
+_LOCAL_COVER_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+_LOCAL_COVER_MAX_BYTES = 25 * 1024 * 1024
 MANAGEMENT_ARTWORK_METADATA_MAX_BYTES = 5 * 1024 * 1024
 MANAGEMENT_ARTWORK_CACHE_TTL_SECONDS = 3600
 
@@ -91,7 +101,15 @@ def _default_cache_dir() -> Path:
 
 
 _coverart_circuit_breaker = CircuitBreaker(
-    failure_threshold=5, success_threshold=2, timeout=60.0, name="coverart"
+    failure_threshold=5,
+    success_threshold=2,
+    timeout=60.0,
+    name="coverart",
+    on_state_change=report_breaker_health(
+        "coverartarchive",
+        "cover art",
+        message="Cover Art Archive is temporarily unavailable.",
+    ),
 )
 
 _library_cover_circuit_breaker = CircuitBreaker(
@@ -226,6 +244,8 @@ class CoverArtRepository:
         cover_memory_cache_max_bytes: int = COVER_MEMORY_MAX_BYTES,
         cover_non_monitored_ttl_seconds: int = 604800,  # 7 days; non-monitored covers change rarely
         library_db: Optional["LibraryDB"] = None,
+        local_cover_priority: Optional[Callable[[], bool]] = None,
+        native_library_store: Optional["NativeLibraryStore"] = None,
     ):
         self._client = http_client
         self._cache = cache
@@ -233,6 +253,8 @@ class CoverArtRepository:
         self._library_repo = library_repo
         self._jellyfin_repo = jellyfin_repo
         self._library_db = library_db
+        self._native_library_store = native_library_store
+        self._local_cover_priority = local_cover_priority
         self._tagger = AudioTagger()
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -863,8 +885,13 @@ class CoverArtRepository:
             ExternalServiceError,
             RateLimitedError,
         ) as e:
-            # Transient failure: fail soft WITHOUT caching a negative (the artist may well have
-            # an image; it was just a blip) and without deferring - the next request retries.
+            # Transient failure: bank a SHORT negative (15 min) so a sustained upstream outage
+            # doesn't re-pay the full fetch chain on every request/poll; recovered art
+            # reappears on the first request after expiry. Authoritative no-art still uses
+            # the 4h negative below.
+            await self._disk_cache.write_negative(
+                file_path, ttl_seconds=COVER_TRANSIENT_NEGATIVE_TTL_SECONDS
+            )
             _record_degradation(f"Artist image fetch failed for {artist_id[:8]}: {e}")
             return None
 
@@ -923,9 +950,8 @@ class CoverArtRepository:
         identifier = f"rg_{release_group_id}"
         suffix = size or "orig"
         file_path = self._disk_cache.get_file_path(identifier, suffix)
-
         if cached_memory := await self._memory_get(identifier, suffix):
-            if cached_memory[2] in {"audiodb", "legacy-cache"}:
+            if self._is_terminal_cover_source(cached_memory[2]):
                 return cached_memory
             preferred = await self._prefer_audiodb_album_cover(
                 release_group_id,
@@ -945,7 +971,7 @@ class CoverArtRepository:
                 source = cached[2].get("source") or source
             result = (cached[0], cached[1], source)
             await self._memory_set_from_result(identifier, suffix, result)
-            if source in {"audiodb", "legacy-cache"}:
+            if self._is_terminal_cover_source(source):
                 return result
             return await self._prefer_audiodb_album_cover(
                 release_group_id,
@@ -956,7 +982,35 @@ class CoverArtRepository:
                 priority,
             )
 
+        if self._local_cover_preferred():
+            # The owner's own files beat every remote source: folder/embedded art is
+            # instant, follows the files, and stays up when the network sources don't.
+            # Tried before the negative check so a marker banked pre-toggle (or during
+            # an outage) can never hide art the files already have.
+            local = await self._local_album_cover(release_group_id, file_path)
+            if local is not None:
+                await self._memory_set_from_result(identifier, suffix, local)
+                return local
+
         if await self._disk_cache.is_negative(file_path):
+            return await self._prefer_audiodb_album_cover(
+                release_group_id,
+                identifier,
+                suffix,
+                file_path,
+                None,
+                priority,
+            )
+
+        if _coverart_circuit_breaker.is_open():
+            # Sustained CAA outage: skip the inline 2-attempt fetch (~12-15s hang per
+            # request) and do NOT spawn the deferred best-release resolve - it would
+            # fail the same way and then write the 4h negative meant for authoritative
+            # no-art. Bank a short transient negative so repeats serve the placeholder
+            # immediately; the first request after TTL expiry re-probes the breaker.
+            await self._disk_cache.write_negative(
+                file_path, ttl_seconds=COVER_TRANSIENT_NEGATIVE_TTL_SECONDS
+            )
             return await self._prefer_audiodb_album_cover(
                 release_group_id,
                 identifier,
@@ -991,11 +1045,12 @@ class CoverArtRepository:
             # here or the background resolve would be short-circuited by it.
             self._spawn_deferred_rg_resolve(release_group_id, size)
             return None
-        if result is None:
-            # Last resort: every external source missed - serve art embedded in a
-            # local library file for this album, if any has some. Beats the
-            # turntable placeholder for albums the internet has no cover for.
-            result = await self._embedded_album_cover(release_group_id, file_path)
+        if result is None and not self._local_cover_preferred():
+            # Last resort when the local-art preference is off: every external source
+            # missed - serve art from a local library file for this album, if any has
+            # some. Beats the turntable placeholder for albums the internet has no
+            # cover for.
+            result = await self._local_album_cover(release_group_id, file_path)
         if result is None:
             await self._disk_cache.write_negative(
                 file_path, ttl_seconds=COVER_NEGATIVE_TTL_SECONDS
@@ -1066,37 +1121,121 @@ class CoverArtRepository:
             return False
         return f"{artist_id}:{size}" in self._deferred_artist_inflight
 
-    async def _embedded_album_cover(
+    def _local_cover_preferred(self) -> bool:
+        return bool(self._local_cover_priority and self._local_cover_priority())
+
+    def _is_terminal_cover_source(self, source: str) -> bool:
+        """Sources never displaced by a later AudioDB hit on the read path."""
+        if source in {"audiodb", "legacy-cache"}:
+            return True
+        return self._local_cover_preferred() and source in {"folder", "embedded"}
+
+    async def _local_album_cover(
         self,
         release_group_id: str,
         file_path: Path,
     ) -> Optional[tuple[bytes, str, str]]:
-        """Front cover embedded in a local file for this release group, cached to
-        disk so subsequent loads hit the normal cache path. ``None`` when the native
-        library isn't wired, the album has no local files, or none carry raster art."""
-        if self._library_db is None:
-            return None
-        try:
-            rows = await self._library_db.get_library_files_for_album(release_group_id)
-        except Exception as e:  # noqa: BLE001
-            logger.debug(
-                f"Embedded-cover lookup failed for {release_group_id[:8]}: {e}"
-            )
+        """Cover art beside or inside the owner's local files for this release group,
+        cached to disk so subsequent loads hit the normal cache path. ``None`` when
+        the native library isn't wired, the album has no local files, or none yield
+        raster art."""
+        if self._library_db is None and self._native_library_store is None:
             return None
 
-        paths = [row["file_path"] for row in rows if row.get("file_path")]
+        paths: list[str] = []
+        if self._native_library_store is not None:
+            try:
+                paths = await self._native_library_store.get_indexed_track_paths_for_release_group(
+                    release_group_id
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    f"Native local-cover lookup failed for {release_group_id[:8]}: {e}"
+                )
+        if not paths and self._library_db is not None:
+            # Legacy rows may point at pre-organization paths; only consulted when
+            # the native catalog has no sealed files for this release group.
+            try:
+                rows = await self._library_db.get_library_files_for_album(
+                    release_group_id
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    f"Legacy local-cover lookup failed for {release_group_id[:8]}: {e}"
+                )
+                rows = []
+            paths = [row["file_path"] for row in rows if row.get("file_path")]
         if not paths:
             return None
 
-        extracted = await asyncio.to_thread(self._extract_first_embedded_cover, paths)
+        extracted = await asyncio.to_thread(self._extract_local_cover, paths)
         if extracted is None:
             return None
 
-        content, content_type = extracted
+        content, content_type, source = extracted
         await self._disk_cache.write(
-            file_path, content, content_type, {"source": "embedded"}
+            file_path, content, content_type, {"source": source}
         )
-        return content, content_type, "embedded"
+        return content, content_type, source
+
+    def _extract_local_cover(
+        self, paths: list[str]
+    ) -> Optional[tuple[bytes, str, str]]:
+        """Synchronous: an explicit folder image wins over embedded art. Runs in a
+        worker thread - directory scans and mutagen reads are blocking."""
+        folder = self._folder_cover(paths)
+        if folder is not None:
+            data, content_type = folder
+            return data, content_type, "folder"
+        embedded = self._extract_first_embedded_cover(paths)
+        if embedded is not None:
+            data, content_type = embedded
+            return data, content_type, "embedded"
+        return None
+
+    @staticmethod
+    def _folder_cover(paths: list[str]) -> Optional[tuple[bytes, str]]:
+        directories: list[Path] = []
+        for raw_path in paths:
+            parent = Path(raw_path).parent
+            if parent not in directories:
+                directories.append(parent)
+        if len(directories) > 1:
+            # Disc subdirectories (Album/CD1/track.flac) keep their art at the root,
+            # so probe one level up when every track dir shares a single parent.
+            # Sibling releases (Original/ + Deluxe/) share such a parent too; their
+            # artist folder is only probed when neither release folder has its own
+            # art, and inherited artist-level art beats the placeholder. Tracks
+            # spanning library roots have no single parent and are never probed up.
+            parents = {d.parent for d in directories}
+            if len(parents) == 1:
+                ancestor = parents.pop()
+                if ancestor.name and ancestor not in directories:
+                    directories.append(ancestor)
+        for directory in directories:
+            try:
+                entries = {
+                    entry.name.casefold(): entry
+                    for entry in directory.iterdir()
+                    if entry.is_file()
+                }
+            except OSError:
+                continue
+            for stem in _LOCAL_COVER_STEMS:
+                for extension in _LOCAL_COVER_EXTENSIONS:
+                    candidate = entries.get(stem + extension)
+                    if candidate is None:
+                        continue
+                    try:
+                        if not 0 < candidate.stat().st_size <= _LOCAL_COVER_MAX_BYTES:
+                            continue
+                        data = candidate.read_bytes()
+                    except OSError:
+                        continue
+                    content_type = _sniff_image_content_type(data)
+                    if content_type is not None:
+                        return data, content_type
+        return None
 
     def _extract_first_embedded_cover(
         self, paths: list[str]
@@ -1169,6 +1308,23 @@ class CoverArtRepository:
             )
 
         if await self._disk_cache.is_negative(file_path):
+            return await self._prefer_release_audiodb_cover(
+                release_id,
+                identifier,
+                suffix,
+                file_path,
+                None,
+                priority,
+                is_disconnected,
+            )
+
+        if _coverart_circuit_breaker.is_open():
+            # Sustained CAA outage: skip the inline 2-attempt fetch (~12-15s hang per
+            # request). Bank a short transient negative so repeats serve the placeholder
+            # immediately; the first request after TTL expiry re-probes the breaker.
+            await self._disk_cache.write_negative(
+                file_path, ttl_seconds=COVER_TRANSIENT_NEGATIVE_TTL_SECONDS
+            )
             return await self._prefer_release_audiodb_cover(
                 release_id,
                 identifier,

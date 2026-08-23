@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated
 
 from fastapi import Depends
@@ -168,6 +169,7 @@ from .service_providers import (
     get_library_administrative_work_service,
     get_target_album_coverage_service,
     get_target_album_identification_service,
+    get_mb_provider_availability,
     get_target_reidentification_service,
     get_target_album_edition_finder_service,
     get_target_library_review_service,
@@ -301,6 +303,9 @@ LibraryAdministrativeWorkServiceDep = Annotated[
 ]
 TargetAlbumIdentificationServiceDep = Annotated[
     AlbumIdentificationService, Depends(get_target_album_identification_service)
+]
+MbProviderAvailabilityDep = Annotated[
+    Callable[[], bool], Depends(get_mb_provider_availability)
 ]
 TargetAlbumCoverageServiceDep = Annotated[
     AlbumCoverageService, Depends(get_target_album_coverage_service)

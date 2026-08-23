@@ -1365,6 +1365,7 @@ class PreferencesService:
             staging_path=settings.staging_path,
             naming_template=settings.naming_template,
             acoustid_api_key=ACOUSTID_KEY_MASK if settings.acoustid_api_key else "",
+            enabled=settings.enabled,
         )
 
     def get_typed_library_settings_raw(self) -> TypedLibrarySettings:
@@ -1377,6 +1378,7 @@ class PreferencesService:
             staging_path=settings.staging_path,
             naming_template=settings.naming_template,
             acoustid_api_key=api_key,
+            enabled=settings.enabled,
         )
 
     def get_library_settings(self) -> LibrarySettings:
@@ -1468,6 +1470,7 @@ class PreferencesService:
                     staging_path=current.staging_path,
                     naming_template=current.naming_template,
                     acoustid_api_key=current.acoustid_api_key,
+                    enabled=current.enabled,
                 ),
                 allow_root_path_changes=True,
             )
@@ -1544,6 +1547,7 @@ class PreferencesService:
                     naming_template=normalized.naming_template
                     or DEFAULT_NAMING_TEMPLATE,
                     acoustid_api_key=api_key,
+                    enabled=normalized.enabled,
                 ),
             )
         except ConfigurationError:
