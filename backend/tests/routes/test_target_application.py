@@ -779,7 +779,12 @@ def test_target_cover_provider_has_no_legacy_catalog_inputs(monkeypatch) -> None
     repo_providers.get_target_coverart_repository.cache_clear()
 
     assert repo_providers.get_target_coverart_repository() is built
-    builder.assert_called_once_with()
+    # Native folder/embedded art is a provider-side input; the legacy catalog
+    # handles (library_repo, library_db) must stay absent.
+    assert builder.call_count == 1
+    assert builder.call_args.args == ()
+    assert set(builder.call_args.kwargs) == {"native_library_store"}
+    assert builder.call_args.kwargs["native_library_store"] is not None
 
     repo_providers.get_target_coverart_repository.cache_clear()
 
