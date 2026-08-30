@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import time
-import uuid
-from collections.abc import Awaitable, Callable
-from pathlib import Path
+from collections.abc import Sequence
 
 import msgspec
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 
 from infrastructure.degradation import (
     clear_degradation_context,
     init_degradation_context,
 )
+from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.identification import (
+    AlbumCandidate,
     CandidateEvidence,
     GroupingTrack,
     IdentificationAttempt,
@@ -23,19 +27,31 @@ from models.identification import (
     IdentificationEvidenceRecord,
     TrackEvidence,
 )
-from services.native.album_candidate_service import AlbumCandidateService
+from services.native.album_candidate_service import (
+    RECALL_SOURCE_KINDS,
+    AlbumCandidateService,
+)
 from services.native.album_evidence_engine import MATCHER_VERSION, AlbumEvidenceEngine
 from services.native.conditional_fingerprint_service import (
     FINGERPRINTER_VERSION,
     ConditionalFingerprintService,
 )
-from services.native.identification_queue_service import IdentificationQueueService
+from services.native.identification_queue_service import (
+    LEASE_SECONDS,
+    IdentificationQueueService,
+)
 from services.native.identification_revisions import (
     album_identity_revision,
     album_input_revisions,
 )
 
 CacheInvalidator = Callable[[set[str]], Awaitable[None]]
+# ST1: scoped hooks also receive the local album ids whose commits triggered
+# the invalidation, so providers can resolve entity ids post-commit.
+ScopedCacheInvalidator = (
+    Callable[[set[str]], Awaitable[None]]
+    | Callable[[set[str], Sequence[str] | None], Awaitable[None]]
+)
 PostIdentificationCallback = Callable[[str, str], Awaitable[object]]
 MAX_NEW_FINGERPRINTS_PER_ATTEMPT = 2
 
@@ -341,6 +357,54 @@ def _enforce_raw_track_identities(
         decision.selected_candidate_key = None
 
 
+_SIBLING_TRIAL_OUTCOMES = ("ambiguous", "insufficient_evidence")
+
+
+def _sibling_trial_release_groups(
+    decision: IdentificationDecision,
+    recalled: list[AlbumCandidate],
+) -> list[str]:
+    """EditionsEtc Phase 2 within-group sibling trial derivation.
+
+    A group qualifies when its best evidence in this decision is still not
+    SUPPORTED (the recalled edition failed to back the album), its
+    candidates carry at most one distinct release MBID (no sibling edition
+    was present yet), and the attempt actually recalled the group through
+    the bounded search path - never an exact-release fast path, whose
+    identity is pinned rather than evidence-ranked. Empty output means the
+    owner-approved budget of at most one extra full-release fetch per
+    qualifying group is spent nowhere.
+    """
+    best_by_group: dict[str, CandidateEvidence] = {}
+    editions_by_group: dict[str, set[str]] = {}
+    for item in decision.candidates:
+        best = best_by_group.get(item.release_group_mbid)
+        if best is None or item.score > best.score:
+            best_by_group[item.release_group_mbid] = item
+        if item.release_mbid:
+            editions_by_group.setdefault(item.release_group_mbid, set()).add(
+                item.release_mbid.casefold()
+            )
+    recalled_groups = {
+        candidate.release_group_mbid
+        for candidate in recalled
+        if RECALL_SOURCE_KINDS.intersection(candidate.source_kinds)
+    }
+    return [
+        group
+        for group, best in best_by_group.items()
+        if best.reason_code != "SUPPORTED"
+        and len(editions_by_group.get(group, ())) <= 1
+        and group in recalled_groups
+    ]
+
+
+# F-IDENT-02: deterministic payload-shape failures defer under this stable
+# code instead of PROVIDER_TEMPORARILY_UNAVAILABLE. The spelling is part of
+# the persisted contract (last_failure_code / attention_cause) and the API/UI.
+UNMAPPABLE_PROVIDER_PAYLOAD = "UNMAPPABLE_PROVIDER_PAYLOAD"
+
+
 class AlbumIdentificationService:
     def __init__(
         self,
@@ -349,7 +413,7 @@ class AlbumIdentificationService:
         candidates: AlbumCandidateService,
         evidence_engine: AlbumEvidenceEngine,
         fingerprints: ConditionalFingerprintService,
-        invalidate: CacheInvalidator | None = None,
+        invalidate: ScopedCacheInvalidator | None = None,
         on_identified: PostIdentificationCallback | None = None,
         provider_available: Callable[[], bool] | None = None,
     ) -> None:
@@ -394,6 +458,21 @@ class AlbumIdentificationService:
         decision: IdentificationDecision | None = None
 
         async def checkpoint() -> bool:
+            # F-057: renew the 60s claim lease on every phase checkpoint so a
+            # long recall + fpcalc pass cannot outlive the lease if a second
+            # claimant ever appears; failures stay inert while the
+            # single-claimer invariant holds (finish matches owner+revision).
+            try:
+                fresh_revision = await self._store.heartbeat_identification_job(
+                    str(job["id"]),
+                    worker_id,
+                    now=time.time(),
+                    lease_seconds=LEASE_SECONDS,
+                )
+                if fresh_revision is not None:
+                    job["row_revision"] = fresh_revision
+            except Exception:  # noqa: BLE001 - heartbeat must never fail a run
+                logger.debug("Identification lease heartbeat failed", exc_info=True)
             return not await self._queue.is_paused()
 
         try:
@@ -434,6 +513,7 @@ class AlbumIdentificationService:
                     )
                     return "provider_deferred"
                 cached_release_groups: list[str] = []
+                cached_outcomes: dict[str, object] = {}
                 for track, row in zip(tracks, raw_tracks, strict=True):
                     cached = await self._store.get_fingerprint_outcome(
                         track.local_track_id,
@@ -442,6 +522,7 @@ class AlbumIdentificationService:
                     )
                     if cached is not None:
                         cached_release_groups.extend(cached.release_group_ids)
+                        cached_outcomes[track.local_track_id] = cached
                         if (
                             not track.recording_mbid
                             and cached.state == "matched"
@@ -457,15 +538,13 @@ class AlbumIdentificationService:
                     checkpoint=checkpoint,
                 )
                 if await self._queue.is_paused():
-                    await self._pause(job, worker_id, "candidate_search", [])
+                    await self._pause(job, worker_id, "candidate_search")
                     return "paused"
                 decision = self._evidence_engine.decide(tracks, recalled)
+                new_release_groups: list[str] = []
                 if decision.outcome in ("ambiguous", "insufficient_evidence"):
                     requested = 0
-                    new_release_groups: list[str] = []
                     for track, row in zip(tracks, raw_tracks, strict=True):
-                        if requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT:
-                            break
                         supported_recordings = {
                             item.recording_mbid
                             for candidate in decision.candidates
@@ -477,6 +556,16 @@ class AlbumIdentificationService:
                         needed = (
                             not track.recording_mbid and len(supported_recordings) != 1
                         )
+                        if not needed:
+                            continue
+                        cached = cached_outcomes.get(track.local_track_id)
+                        cache_hit = cached is not None and getattr(
+                            cached, "state", ""
+                        ) in ("matched", "no_match", "skipped")
+                        if not cache_hit and (
+                            requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT
+                        ):
+                            break
                         outcome = await self._fingerprints.fingerprint_if_needed(
                             local_track_id=track.local_track_id,
                             path=Path(str(row["file_path"])),
@@ -485,18 +574,27 @@ class AlbumIdentificationService:
                             now=timestamp,
                             checkpoint=checkpoint,
                         )
-                        if not needed:
-                            continue
-                        requested += 1
+                        # F-042: an instant terminal cache hit did no fpcalc or
+                        # lookup work, so it must not consume budget slots that
+                        # later tracks need.
+                        if not cache_hit:
+                            requested += 1
                         if await self._queue.is_paused():
-                            await self._pause(
-                                job,
-                                worker_id,
-                                "fingerprinting",
-                                decision.candidates,
-                            )
+                            await self._pause(job, worker_id, "fingerprinting")
                             return "paused"
                         if outcome is not None and outcome.state == "failed":
+                            # F-MATCH-04: a local fpcalc failure is NOT a
+                            # provider outage. Defer under its own honest code
+                            # so the row never becomes eligible for the
+                            # provider-only reset/resurrection gates.
+                            if outcome.failure_code == "FINGERPRINT_LOCAL_FAILURE":
+                                await self._queue.defer(
+                                    job,
+                                    worker_id,
+                                    "FINGERPRINT_LOCAL_FAILURE",
+                                    now=timestamp,
+                                )
+                                return "provider_deferred"
                             await self._queue.defer(
                                 job,
                                 worker_id,
@@ -519,14 +617,56 @@ class AlbumIdentificationService:
                             checkpoint=checkpoint,
                         )
                         if await self._queue.is_paused():
-                            await self._pause(
-                                job, worker_id, "candidate_search", decision.candidates
-                            )
+                            await self._pause(job, worker_id, "candidate_search")
+                            return "paused"
+                        decision = self._evidence_engine.decide(tracks, recalled)
+                if (
+                    decision.outcome in _SIBLING_TRIAL_OUTCOMES
+                    and not (
+                        degradation.has_deterministic_failure()
+                        and not decision.candidates
+                    )
+                    and not (degradation.degraded_summary() and not decision.candidates)
+                    and (self._provider_available is None or self._provider_available())
+                ):
+                    # EditionsEtc Phase 2 within-group sibling trial: when the
+                    # wrong sibling edition was recalled, evidence stays
+                    # ambiguous/insufficient even though a usable edition
+                    # exists in the same release group. Retry ONCE per attempt,
+                    # including ranked siblings for the qualifying groups only.
+                    sibling_release_groups = _sibling_trial_release_groups(
+                        decision, recalled
+                    )
+                    if sibling_release_groups:
+                        recalled = await self._candidates.recall(
+                            tracks,
+                            cached_fingerprint_release_groups=list(
+                                dict.fromkeys(
+                                    [*cached_release_groups, *new_release_groups]
+                                )
+                            ),
+                            explicit=bool(job["requested_by_user_id"]),
+                            checkpoint=checkpoint,
+                            sibling_release_group_ids=sibling_release_groups,
+                        )
+                        if await self._queue.is_paused():
+                            await self._pause(job, worker_id, "candidate_search")
                             return "paused"
                         decision = self._evidence_engine.decide(tracks, recalled)
 
             _enforce_raw_track_identities(decision, raw_tracks)
             degraded = degradation.degraded_summary()
+            if degradation.has_deterministic_failure() and not decision.candidates:
+                # F-IDENT-02: a typed payload-shape failure is deterministic,
+                # not an outage. Defer under the honest code so the row keeps
+                # the ordinary bounded backoff but never provider-resurrects.
+                await self._queue.defer(
+                    job,
+                    worker_id,
+                    UNMAPPABLE_PROVIDER_PAYLOAD,
+                    now=timestamp,
+                )
+                return "provider_deferred"
             if degraded and not decision.candidates:
                 await self._queue.defer(
                     job,
@@ -572,10 +712,15 @@ class AlbumIdentificationService:
                 started_at=timestamp,
                 completed_at=timestamp,
             )
+            current_job = await self._store.get_identification_job_row(str(job["id"]))
             await self._store.finish_identification_job(
                 str(job["id"]),
                 worker_id=worker_id,
-                expected_job_revision=int(job["row_revision"]),
+                expected_job_revision=int(
+                    current_job["row_revision"]
+                    if current_job is not None
+                    else job["row_revision"]
+                ),
                 expected_album_revision=int(context["album"]["row_revision"]),
                 expected_input_revision=":".join(
                     (tag_revision, file_revision, policy_revision)
@@ -602,7 +747,17 @@ class AlbumIdentificationService:
                         "Automatic scan-discovered management scheduling failed",
                         exc_info=True,
                     )
+                    # F-061: durable marker so the gap is queryable (and can be
+                    # swept later) instead of silently relying on a full rescan.
+                    try:
+                        await self._store.mark_management_schedule_pending(
+                            str(job["local_album_id"])
+                        )
+                    except Exception:  # noqa: BLE001 - never mask the original
+                        logger.exception("Failed to record management_schedule_pending")
             if self._invalidate is not None:
+                # ST1: thread the local album id so the provider hook can
+                # resolve rg/artist entity ids from the committed row.
                 await self._invalidate(
                     {
                         "library",
@@ -613,25 +768,37 @@ class AlbumIdentificationService:
                         "compatibility",
                         "artwork",
                         "review",
-                    }
+                    },
+                    [str(job["local_album_id"])],
                 )
-            return decision.outcome
+            return str(decision.outcome)
+        except CircuitOpenError as exc:
+            # Defer with breaker deadline, not just queue backoff, per F-PERF-01
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            await self._queue.defer(
+                job,
+                worker_id,
+                "PROVIDER_TEMPORARILY_UNAVAILABLE",
+                now=timestamp,
+                retry_after_seconds=retry_after,
+            )
+            return "provider_deferred"
         finally:
             clear_degradation_context()
 
-    async def _pause(
-        self,
-        job: dict,
-        worker_id: str,
-        phase: str,
-        evidence: list[CandidateEvidence],
-    ) -> None:
+    async def _pause(self, job: dict, worker_id: str, phase: str) -> None:
+        """F-058: the pause checkpoint keeps ONLY the phase label and matcher
+        version for observability. The serialized candidate evidence was dead
+        weight implying replay semantics that do not exist - restoring
+        ``AlbumCandidate`` objects from post-decision ``CandidateEvidence``
+        would be lossy (no candidate-side titles/durations), so resume
+        deliberately re-runs recall under the queue's backoff bounds."""
+        current = await self._store.get_identification_job_row(str(job["id"]))
         await self._queue.checkpoint_pause(
             job,
             worker_id,
-            {
-                "phase": phase,
-                "evidence": msgspec.to_builtins(evidence),
-                "matcher_version": MATCHER_VERSION,
-            },
+            {"phase": phase, "matcher_version": MATCHER_VERSION},
+            expected_job_revision_override=(
+                int(current["row_revision"]) if current is not None else None
+            ),
         )

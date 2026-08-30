@@ -423,7 +423,10 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
     false-rejects valid tracks (e.g. a 2011 reissue + its BBC-session bonuses). Lidarr
     verifies recording identity, not edition, and fails OPEN - a non-pass result never
     rejects, leaving the tag/duration match to stand. ``expected_track`` may be None (the
-    slskd path has no per-file title), in which case only the artist is checked."""
+    slskd path has no per-file title), in which case only the artist is checked. When both
+    sides provide a recording ID, a PASS fingerprint mismatch rejects before artist
+    allowances and an exact match permits display-credit differences after the title veto.
+    Without both IDs, the existing conservative artist gate remains in force."""
     if getattr(fp, "status", None) != "pass":
         return False
     fp_title = (getattr(fp, "title", None) or "").strip()
@@ -437,6 +440,18 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
         and fuzz.token_set_ratio(fp_title, expected_title) < 50
     ):
         return True  # clearly the wrong song
+
+    fp_recording_id = (getattr(fp, "recording_id", None) or "").strip().casefold()
+    expected_recording_id = (
+        (getattr(expected_track, "recording_mbid", None) or "").strip().casefold()
+        if expected_track is not None
+        else ""
+    )
+    if fp_recording_id and expected_recording_id:
+        if fp_recording_id != expected_recording_id:
+            return True
+        return False
+
     # Wrong artist - but skip for various-artists compilations, where the album artist
     # legitimately differs from a track's performing artist.
     if fp_artist and expected_artist and "various" not in expected_artist.lower():
@@ -585,12 +600,16 @@ def _basename(filename: str) -> str:
 
 def _row_tier(row: dict) -> str:
     """A library_files row's quality tier, judged exactly like the scanner/gate."""
-    return tier_for(row.get("file_format") or "", row.get("bit_rate"))
+    return tier_for(
+        row.get("file_format") or "", row.get("bit_rate"), row.get("bit_depth")
+    )
 
 
 def _is_strict_upgrade(existing_tier: str, info: AudioInfo) -> bool:
     """Strictly-better only (D4): equal or worse NEVER replaces."""
-    return tier_rank(tier_for(info.file_format or "", info.bitrate)) > tier_rank(
+    return tier_rank(
+        tier_for(info.file_format or "", info.bitrate, info.bit_depth)
+    ) > tier_rank(
         existing_tier
     )
 
@@ -1352,7 +1371,7 @@ class FileProcessor:
             replacement=replacement,
         )
 
-    # --- Replace-on-import (CollectionManagement D4/D18/D19) --------------------
+    # Replace-on-import (CollectionManagement D4/D18/D19)
     # Fires ONLY for an origin='upgrade' import, and only strictly-better. Two
     # shapes: same-path (mp3_192 -> mp3_320, identical filename - recycle BEFORE the
     # in-place publish) and different-path (mp3 -> flac - publish, soft-delete the
@@ -1382,7 +1401,7 @@ class FileProcessor:
             _tag, info = await asyncio.to_thread(self._tagger.read_tags, path)
         except Exception:  # noqa: BLE001 - unreadable existing file -> don't touch it
             return None
-        return tier_for(info.file_format or "", info.bitrate)
+        return tier_for(info.file_format or "", info.bitrate, info.bit_depth)
 
     async def _same_path_upgrade_applies(
         self, origin: str, target_path: Path, info: AudioInfo
@@ -1648,16 +1667,26 @@ class FileProcessor:
             )
             if present is not None and present.get("file_path") != str(target_path):
                 if self._position_upgrade_target(origin, present, info) is None:
-                    # equal/worse never replaces (D4) - keep the existing copy
+                    # equal/worse never replaces (D4) - keep the existing copy.
+                    # F-INDEXREC-04 (DECISIONS-LIVE): the held source is now a
+                    # validated redundant no-op, so consume it off the event loop
+                    # before reporting success; a failed unlink stays retryable.
+                    await asyncio.to_thread(source.unlink, True)
                     return Path(present["file_path"])
                 replacement = present
         if target_path.exists() and replacement is None:
             if not await self._same_path_upgrade_applies(origin, target_path, info):
+                # F-INDEXREC-04: validated redundant no-op - consume the held
+                # source off the event loop before reporting success.
+                await asyncio.to_thread(source.unlink, True)
                 return target_path
             replacement = (
                 await self._library.get_attributions_for_paths([str(target_path)])
             ).get(str(target_path))
             if replacement is None or self._recycle_bin is None:
+                # F-INDEXREC-04: no safe replace is possible, so the held source
+                # is a validated redundant no-op - consume it off the event loop.
+                await asyncio.to_thread(source.unlink, True)
                 return target_path
         published = await self._publish_planned_imports(
             [

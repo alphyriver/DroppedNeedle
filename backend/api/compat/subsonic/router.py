@@ -32,6 +32,7 @@ from api.compat.subsonic.parameters import (
     parse_request_parameters,
 )
 from api.compat.subsonic.serialization import render, render_error
+from core.base_path import application_path
 from core.exceptions import (
     DroppedNeedleException,
     RangeNotSatisfiableError,
@@ -112,6 +113,20 @@ class Ctx:
     def server_version(self) -> str:
         return self.services.version.get_current_version().version
 
+    def cover_art_url(self, cover_id: str, *, size: int | None = None) -> str:
+        """Advertised getCoverArt URL: base_url already carries scope.root_path
+        (the configured base, mirrored once by BasePathMiddleware), so only the
+        fixed route is appended - /subsonic appears exactly once and there is
+        no credential/token in the query.
+        """
+        url = (
+            f"{str(self.request.base_url).rstrip('/')}"
+            f"/subsonic/rest/getCoverArt?id={cover_id}"
+        )
+        if size is not None:
+            url = f"{url}&size={size}"
+        return url
+
     def render(self, endpoint_key: str | None, payload: object) -> Response:
         return render(
             endpoint_key,
@@ -167,6 +182,7 @@ async def _dispatch(
     server_version = services.version.get_current_version().version
     is_binary = name in _BINARY
     client_ip = trusted_client_ip(request)
+    path = application_path(request.scope)
     # Preserve the requested error envelope even when strict body decoding fails.
     # Only a unique, already-valid query value is trusted at this early stage.
     early_formats = request.query_params.getlist("f")
@@ -228,10 +244,10 @@ async def _dispatch(
                             server_version=server_version,
                         )
                 raise
-            if not is_media_request(request.url.path):
+            if not is_media_request(path):
                 retry_after = await compat_rate_limits.principal_retry_after(
                     user.id,
-                    mutation=is_mutation_request(request.method, request.url.path),
+                    mutation=is_mutation_request(request.method, path),
                 )
                 if retry_after is not None:
                     return reject_subsonic(
@@ -478,12 +494,16 @@ async def _album_list(c: Ctx):
     to_year = None
     genre = None
     if typ == "byYear":
-        first = c.pint("fromYear", minimum=1, maximum=9999)
-        last = c.pint("toYear", minimum=1, maximum=9999)
+        # OpenSubsonic orders by the raw endpoint direction. Clients use year 0
+        # as an unbounded lower endpoint because real release years start at 1.
+        first = c.pint("fromYear", minimum=0, maximum=9999)
+        last = c.pint("toYear", minimum=0, maximum=9999)
         if first is None or last is None:
             raise SubsonicError(10, "fromYear and toYear are required for byYear")
-        from_year, to_year = min(first, last), max(first, last)
         sort = "year_asc" if first <= last else "year_desc"
+        nonzero_bounds = [year for year in (first, last) if year != 0]
+        from_year = min(nonzero_bounds) if len(nonzero_bounds) == 2 else None
+        to_year = max(nonzero_bounds) if nonzero_bounds else None
     elif c.p("fromYear") is not None or c.p("toYear") is not None:
         raise SubsonicError(10, "fromYear and toYear require type=byYear")
     if typ == "byGenre":
@@ -1470,9 +1490,6 @@ async def _get_artist_info(c: Ctx) -> Response:
         raise SubsonicError(70, "Artist not found")
     artist, _albums = result
     cover_id = encode("artist", artist_mbid)
-    cover_base = (
-        f"{str(c.request.base_url).rstrip('/')}/subsonic/rest/getCoverArt?id={cover_id}"
-    )
     return c.render(
         "artistInfo2" if c.endpoint_name == "getartistinfo2" else "artistInfo",
         m.SArtistInfo(
@@ -1481,9 +1498,9 @@ async def _get_artist_info(c: Ctx) -> Response:
                 if artist.provider_identity_projected
                 else (artist.artist_mbid if "-" in artist.artist_mbid else None)
             ),
-            smallImageUrl=f"{cover_base}&size=250",
-            mediumImageUrl=f"{cover_base}&size=500",
-            largeImageUrl=f"{cover_base}&size=1200",
+            smallImageUrl=c.cover_art_url(cover_id, size=250),
+            mediumImageUrl=c.cover_art_url(cover_id, size=500),
+            largeImageUrl=c.cover_art_url(cover_id, size=1200),
         ),
     )
 
@@ -1495,14 +1512,13 @@ async def _get_album_info(c: Ctx) -> Response:
     if album is None:
         raise SubsonicError(70, "Album not found")
     cover_id = encode("album", release_group_mbid)
-    cover_base = (
-        f"{str(c.request.base_url).rstrip('/')}/subsonic/rest/getCoverArt?id={cover_id}"
-    )
     return c.render(
         # Both variants wrap the payload in "albumInfo". getAlbumInfo2 is the
         # one place Subsonic breaks its own "<endpoint>2 -> <element>2" naming
         # convention (cf. getArtistInfo2 -> artistInfo2, getAlbumList2 ->
         # albumList2), so this deliberately does not mirror the endpoint name.
+        # Real clients index the key directly (Music Assistant KeyErrors on a
+        # mismatch); pinned by tests/compat/test_subsonic_response_keys.py.
         "albumInfo",
         m.SAlbumInfo(
             musicBrainzId=(
@@ -1510,9 +1526,9 @@ async def _get_album_info(c: Ctx) -> Response:
                 if album.provider_identity_projected
                 else album.rg_mbid
             ),
-            smallImageUrl=f"{cover_base}&size=250",
-            mediumImageUrl=f"{cover_base}&size=500",
-            largeImageUrl=f"{cover_base}&size=1200",
+            smallImageUrl=c.cover_art_url(cover_id, size=250),
+            mediumImageUrl=c.cover_art_url(cover_id, size=500),
+            largeImageUrl=c.cover_art_url(cover_id, size=1200),
         ),
     )
 

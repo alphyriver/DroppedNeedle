@@ -30,6 +30,7 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.resilience.retry import CircuitOpenError
 from models.download_identity import soulseek_identity, usenet_identity
 from models.wanted import WantedRetrying, WantedWatch
 from services.native.acquisition.status import is_terminal
@@ -37,7 +38,11 @@ from services.native.coverage import match_rows_to_tracks, uncovered_tracks
 
 # The availability-failure prefixes (§4.5). IMPORTED, never copied: the tie-test
 # in tests/services/test_wanted_watcher_service.py fails if either side drifts.
-from services.native.download_orchestrator import _NO_MATCH_MSG, _NO_SOURCE_MSG
+from services.native.download_orchestrator import (
+    _NO_MATCH_MSG,
+    _NO_SOURCE_MSG,
+    _TAG_MISMATCH_MSG,
+)
 from services.native.download_service import ALREADY_IN_LIBRARY
 
 if TYPE_CHECKING:
@@ -112,6 +117,16 @@ def _interval_days(
     return 28.0 if quiet_streak >= _QUIET_DOUBLING_STREAK else 14.0
 
 
+class _SweepMembershipState:
+    """Mutable per-sweep slot holding ONE immutable normalized membership."""
+
+    __slots__ = ("loaded", "mbids")
+
+    def __init__(self) -> None:
+        self.loaded = False
+        self.mbids: frozenset[str] = frozenset()
+
+
 class WantedWatcherService:
     def __init__(
         self,
@@ -125,6 +140,7 @@ class WantedWatcherService:
         sse_publisher: "SSEPublisher",
         preferences: "PreferencesService",
         inter_want_delay: float = 5.0,
+        provider_available: Callable[[], bool] | None = None,
     ) -> None:
         self._store = wanted_store
         self._requests = request_history
@@ -138,6 +154,7 @@ class WantedWatcherService:
         self._sse = sse_publisher
         self._preferences = preferences
         self._inter_want_delay = inter_want_delay
+        self._provider_available = provider_available
 
     async def run_sweep(self) -> WantedSweepSummary:
         # Read fresh every sweep so flipping the toggle needs no restart (§5.3).
@@ -148,15 +165,25 @@ class WantedWatcherService:
         enrolled = await self._enrol(settings)
 
         due = await self._store.list_due(time.time(), settings.max_checks_per_sweep)
+        membership_state = _SweepMembershipState()
         checked = dispatched = fulfilled = errors = 0
         for index, want in enumerate(due):
             try:
-                outcome = await self._check_want(want, settings)
+                outcome = await self._check_want(want, settings, membership_state)
                 checked += 1
                 if outcome == "auto_dispatched":
                     dispatched += 1
                 elif outcome == "satisfied":
                     fulfilled += 1
+            except CircuitOpenError as exc:
+                errors += 1
+                logger.error(
+                    "wanted.check_failed",
+                    extra={"release_group_mbid": want.release_group_mbid},
+                    exc_info=True,
+                )
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                await self._record_error_cycle(want, settings, retry_after_seconds=retry_after)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - one bad want must never kill the sweep
@@ -264,6 +291,31 @@ class WantedWatcherService:
         await self._store.clear_new_candidates(release_group_mbid)
         return await self._owned_watch(release_group_mbid, user_id, user_role)
 
+    async def _retrying_page(
+        self,
+        status: str,
+        cursor: tuple[str, str] | None,
+        owner_id: str | None,
+    ) -> tuple[list["RequestHistoryRecord"], tuple[str, str] | None, dict]:
+        """F-PERF-03 shared bounded page: one keyset history page plus ONE
+        batch task lookup for its linked tasks. ``owner_id=None`` keeps the
+        admin all-users scope; non-admin callers push their owner predicate
+        into SQL instead of filtering broad pages in Python."""
+        records, next_cursor = await self._requests.async_get_retrying_page(
+            status_filter=status,
+            page_size=_ENROL_PAGE_SIZE,
+            cursor=cursor,
+            owner_id=owner_id,
+            request_kind="album",
+        )
+        task_ids = [
+            record.download_task_id
+            for record in records
+            if record.download_task_id
+        ]
+        tasks = await self._download_store.get_tasks(task_ids)
+        return records, next_cursor, tasks
+
     async def list_retrying_for(
         self, user_id: str, user_role: str
     ) -> list[WantedRetrying]:
@@ -271,24 +323,20 @@ class WantedWatcherService:
         read-only 'still hunting' rows (owner decision 2026-07-06). Reads the
         SAME rows the enrolment classifier does - a failed/incomplete request
         whose linked task has a pending ``next_retry_at`` - so a row graduates
-        into a real watch the sweep after its ladder exhausts, with no gap."""
+        into a real watch the sweep after its ladder exhausts, with no gap.
+        F-PERF-03: one task BATCH per history page, never one query per row."""
         download_service = self._get_download_service()
         max_attempts = download_service.auto_retry_max
+        owner_id = user_id if user_role != "admin" else None
         items: list[WantedRetrying] = []
         for status in ("failed", "incomplete"):
-            page = 1
+            cursor: tuple[str, str] | None = None
             while True:
-                records, total = await self._requests.async_get_history(
-                    page=page, page_size=_ENROL_PAGE_SIZE, status_filter=status
+                records, next_cursor, tasks = await self._retrying_page(
+                    status, cursor, owner_id
                 )
-                if not records:
-                    break
                 for record in records:
-                    if user_role != "admin" and record.user_id != user_id:
-                        continue
-                    if not record.download_task_id:
-                        continue
-                    task = await self._download_store.get_task(record.download_task_id)
+                    task = tasks.get(record.download_task_id or "")
                     if task is None:
                         continue
                     next_retry_at = download_service.next_retry_at(task)
@@ -308,9 +356,9 @@ class WantedWatcherService:
                             user_id=record.user_id,
                         )
                     )
-                if page * _ENROL_PAGE_SIZE >= total:
+                if next_cursor is None:
                     break
-                page += 1
+                cursor = next_cursor
         items.sort(key=lambda item: item.next_retry_at)
         return items
 
@@ -415,6 +463,20 @@ class WantedWatcherService:
             raise ResourceNotFoundError("Watch not found")
         return watch
 
+    # -- sweep-local library membership snapshot (F-PERF-09) --
+
+    async def _library_membership_snapshot(self, state) -> frozenset[str]:
+        """Lazily load + case-normalize the album-only membership ONCE per
+        sweep; every later no-tracklist presence check compares against this
+        immutable object. A failed read stays fail-open: ``loaded`` remains
+        False so a later want in the SAME sweep retries exactly like the
+        pre-ticket per-want behavior, while successful loads are shared."""
+        if not state.loaded:
+            raw = await self._library.get_library_mbids(include_release_ids=False)
+            state.mbids = frozenset(str(m).lower() for m in (raw or ()))
+            state.loaded = True
+        return state.mbids
+
     # -- enrolment (§5.2.1) --
 
     async def _enrol(self, settings) -> int:  # noqa: ANN001 - WantedWatcherSettings
@@ -422,17 +484,27 @@ class WantedWatcherService:
         statuses = ["failed"]
         if settings.watch_partial_albums:
             statuses.append("incomplete")
+        # Sweep-level provider gate: read once, after enabled gate, for optional date enrichment
+        provider_available = self._provider_available() if self._provider_available is not None else True
+        cache: dict[str, str | None] = {}
+        if not provider_available:
+            logger.warning("wanted.enrol_provider_outage", extra={"reason": "circuit_open"})
         for status in statuses:
-            page = 1
+            cursor: tuple[str, str] | None = None
             while True:
-                records, total = await self._requests.async_get_history(
-                    page=page, page_size=_ENROL_PAGE_SIZE, status_filter=status
+                # All-users scope: enrolment must not lose a page because an
+                # unrelated user-owned row was filtered for the Wanted tab.
+                records, next_cursor, tasks = await self._retrying_page(
+                    status, cursor, None
                 )
-                if not records:
-                    break
                 for record in records:
                     try:
-                        if await self._maybe_enrol(record):
+                        if await self._maybe_enrol(
+                            record,
+                            provider_available,
+                            cache,
+                            task=tasks.get(record.download_task_id or ""),
+                        ):
                             enrolled += 1
                     except Exception:  # noqa: BLE001 - one bad row must not stop enrolment
                         logger.warning(
@@ -440,12 +512,18 @@ class WantedWatcherService:
                             extra={"release_group_mbid": record.musicbrainz_id},
                             exc_info=True,
                         )
-                if page * _ENROL_PAGE_SIZE >= total:
+                if next_cursor is None:
                     break
-                page += 1
+                cursor = next_cursor
         return enrolled
 
-    async def _maybe_enrol(self, record: "RequestHistoryRecord") -> bool:
+    async def _maybe_enrol(
+        self,
+        record: "RequestHistoryRecord",
+        provider_available: bool,
+        cache: dict[str, str | None],
+        task: "DownloadTask | None" = None,
+    ) -> bool:
         existing = await self._store.get_watch(record.musicbrainz_id)
         if existing is not None and existing.state != "fulfilled":
             # watching/dormant/stopped: never auto-revive - the human's choice
@@ -455,7 +533,7 @@ class WantedWatcherService:
         kind = self._classify_status(record.status)
         if kind is None:
             return False
-        if not await self._task_says_enrol(record):
+        if not await self._task_says_enrol(record, task=task):
             return False
 
         now = time.time()
@@ -481,7 +559,7 @@ class WantedWatcherService:
         if not record.user_id:
             return False  # no requester to act for (D7)
 
-        first_release_date = await self._first_release_date(record)
+        first_release_date = await self._first_release_date(record, provider_available, cache)
         next_check = now + self._interval_seconds(
             first_release_date, quiet_streak=0, now=now
         )
@@ -510,15 +588,20 @@ class WantedWatcherService:
             return "partial"
         return None
 
-    async def _task_says_enrol(self, record: "RequestHistoryRecord") -> bool:
+    async def _task_says_enrol(
+        self, record: "RequestHistoryRecord", task: "DownloadTask | None" = None
+    ) -> bool:
         """§4.5: the availability signal lives on the linked TASK, not the request.
         No linked task (a dispatch-time failure) cannot be classified and never
         enrols; a task still awaiting its auto-retry isn't dead yet; a 'failed'
         task enrols only when its message prefix-matches an availability constant
-        (local faults - mount/import errors - must NOT enrol)."""
+        (local faults - mount/import errors - must NOT enrol). F-PERF-03 accepts
+        the batched task from the page helper instead of re-reading per row;
+        direct callers still resolve the single task themselves."""
         if not record.download_task_id:
             return False
-        task = await self._download_store.get_task(record.download_task_id)
+        if task is None:
+            task = await self._download_store.get_task(record.download_task_id)
         if task is None or not is_terminal(task.status):
             return False
         if self._get_download_service().next_retry_at(task) is not None:
@@ -526,23 +609,43 @@ class WantedWatcherService:
         if record.status == "incomplete":
             return True
         message = task.error_message or ""
-        return message.startswith(_NO_SOURCE_MSG) or message.startswith(_NO_MATCH_MSG)
+        return (
+            message.startswith(_NO_SOURCE_MSG)
+            or message.startswith(_NO_MATCH_MSG)
+            or message.startswith(_TAG_MISMATCH_MSG)
+        )
 
-    async def _first_release_date(self, record: "RequestHistoryRecord") -> str | None:
+    async def _first_release_date(
+        self, record: "RequestHistoryRecord", provider_available: bool = True, cache: dict[str, str | None] | None = None
+    ) -> str | None:
+        if cache is None:
+            cache = {}
         return await self._first_release_date_for_mbid(
-            record.musicbrainz_id, record.year
+            record.musicbrainz_id, record.year, provider_available, cache
         )
 
     async def _first_release_date_for_mbid(
-        self, mbid: str, year: int | None
+        self, mbid: str, year: int | None, provider_available: bool = True, cache: dict[str, str | None] | None = None
     ) -> str | None:
+        if cache is None:
+            cache = {}
+        if mbid in cache:
+            cached = cache[mbid]
+            if cached is not None:
+                return cached
+            return str(year) if year else None
+        if not provider_available:
+            cache[mbid] = None
+            return str(year) if year else None
         rg = await self._mb.get_release_group_by_id(
             mbid, priority=RequestPriority.BACKGROUND_SYNC
         )
         first_release_date = (rg or {}).get("first-release-date")
         if first_release_date:
-            return str(first_release_date)
-        # degraded fetch: the row's year gives a coarse age bucket
+            result = str(first_release_date)
+            cache[mbid] = result
+            return result
+        cache[mbid] = None
         return str(year) if year else None
 
     def _log_enrolled(
@@ -560,7 +663,7 @@ class WantedWatcherService:
 
     # -- per-want check cycle (§5.2.3) --
 
-    async def _check_want(self, want: WantedWatch, settings) -> str:  # noqa: ANN001
+    async def _check_want(self, want: WantedWatch, settings, membership_state) -> str:  # noqa: ANN001
         now = time.time()
         mbid = want.release_group_mbid
 
@@ -589,7 +692,7 @@ class WantedWatcherService:
         elif want.kind == "missing":
             # tracklist unavailable: the library-presence semantic the requests
             # page uses (§5.2.3.a) - never raw file-row counts
-            if await self._in_library(mbid):
+            if await self._in_library(mbid, membership_state):
                 await self._fulfil(want)
                 return "satisfied"
         else:
@@ -693,16 +796,27 @@ class WantedWatcherService:
         self._log_checked(want, outcome, len(candidates), new_count or 0)
         return outcome
 
-    async def _record_error_cycle(self, want: WantedWatch, settings) -> None:  # noqa: ANN001
+    async def _record_error_cycle(
+        self, want: WantedWatch, settings, retry_after_seconds: float | None = None  # noqa: ANN001
+    ) -> None:  # noqa: ANN001
         """A per-want failure reschedules normally with last_outcome='error' -
         one bad want never kills the sweep (§5.2.3)."""
         try:
             now = time.time()
+            interval = self._interval_seconds(want.first_release_date, 0, now)
+            if retry_after_seconds is not None:
+                try:
+                    candidate = float(retry_after_seconds)
+                    import math
+
+                    if math.isfinite(candidate) and candidate > 0:
+                        interval = max(interval, candidate)
+                except (TypeError, ValueError):
+                    pass
             await self._store.record_cycle(
                 want.release_group_mbid,
                 outcome="error",
-                next_check_at=now
-                + self._interval_seconds(want.first_release_date, 0, now),
+                next_check_at=now + interval,
                 quiet=False,
                 go_dormant=(now - want.created_at) > settings.dormant_after_days * _DAY,
                 now=now,
@@ -832,12 +946,18 @@ class WantedWatcherService:
         except Exception:  # noqa: BLE001 - a rows failure reads as nothing held
             return []
 
-    async def _in_library(self, mbid: str) -> bool:
+    async def _in_library(self, mbid: str, membership_state=None) -> bool:
+        """Case-insensitive presence against the sweep-local immutable
+        snapshot (F-PERF-09); direct callers without sweep state keep the
+        per-call behavior."""
         try:
-            mbids = await self._library.get_library_mbids(include_release_ids=False)
+            if membership_state is None:
+                raw = await self._library.get_library_mbids(include_release_ids=False)
+                return mbid.lower() in {str(m).lower() for m in (raw or ())}
+            mbids = await self._library_membership_snapshot(membership_state)
         except Exception:  # noqa: BLE001 - presence check is best-effort
             return False
-        return mbid.lower() in {str(m).lower() for m in mbids}
+        return mbid.lower() in mbids
 
     async def _has_active_work(self, want: WantedWatch) -> bool:
         mbid = want.release_group_mbid

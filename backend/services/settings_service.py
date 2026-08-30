@@ -20,9 +20,6 @@ from core.config import get_settings
 from core.exceptions import ValidationError
 from models.common import ServiceStatus
 from infrastructure.cache.cache_keys import (
-    ARTIST_INFO_PREFIX,
-    ALBUM_INFO_PREFIX,
-    LIBRARY_ARTIST_ALBUMS_PREFIX,
     JELLYFIN_PREFIX,
     LOCAL_FILES_PREFIX,
     SOURCE_RESOLUTION_PREFIX,
@@ -134,8 +131,6 @@ class SettingsService:
         try:
             from repositories.listenbrainz_repository import ListenBrainzRepository
 
-            ListenBrainzRepository.reset_circuit_breaker()
-
             app_settings = get_settings()
             http_client = get_http_client(app_settings)
             temp_cache = InMemoryCache(max_entries=100)
@@ -159,15 +154,41 @@ class SettingsService:
                 valid=False, message="Couldn't finish the connection test"
             )
 
-    async def clear_caches_for_preference_change(self) -> int:
-        total = 0
-        total += await self._cache.clear_prefix(ARTIST_INFO_PREFIX)
-        total += await self._cache.clear_prefix(ALBUM_INFO_PREFIX)
-        total += await self._cache.clear_prefix(LIBRARY_ARTIST_ALBUMS_PREFIX)
-        for prefix in musicbrainz_prefixes():
-            total += await self._cache.clear_prefix(prefix)
-        logger.info(f"Cleared {total} cache entries for preference change")
-        return total
+    @staticmethod
+    def _type_filters(prefs) -> tuple[list[str], list[str]]:
+        return (
+            sorted(t.casefold() for t in prefs.primary_types),
+            sorted(t.casefold() for t in prefs.secondary_types),
+        )
+
+    async def apply_preference_change(self, previous, incoming) -> int:
+        """ST1 phase 1 diff gate for PUT /settings/preferences.
+
+        - Identical payload (same normalized type filters): NO sweep at all -
+          a no-change save no longer destroys artist/album/MB caches.
+        - Changed types: ZERO prefix sweeps. Raw MB caches apply filters at
+          request time from live preferences (artist_service), and the one
+          proven baked consumer (SearchService.search) now embeds the sorted
+          type sets in its cache key, so stale results are unreachable
+          immediately; the in-process search cache is still flushed as
+          belt-and-braces for the transition window.
+
+        Returns the number of cleared entries (always 0 in phase 1; kept for
+        call-site/logging compatibility).
+        """
+        if previous is not None and self._type_filters(previous) == self._type_filters(
+            incoming
+        ):
+            logger.info(
+                "Preferences payload unchanged; skipping catalog cache invalidation"
+            )
+            return 0
+
+        from services.search_service import SearchService
+
+        SearchService.clear_cached_results()
+        logger.info("Preference types changed; search cache flushed (no prefix sweeps)")
+        return 0
 
     async def clear_home_cache(self) -> int:
         total = 0
@@ -314,12 +335,44 @@ class SettingsService:
         await self.clear_home_cache()
         logger.info("ListenBrainz settings change: all caches/singletons reset")
 
+    async def on_listenbrainz_connection_changed(self) -> None:
+        """Invalidate shared ListenBrainz state after a per-user mutation.
+
+        This deliberately resets only the circuit breaker.  The process-global
+        rate-limit response window and cooldown remain intact so a user changing
+        credentials cannot bypass upstream pacing for other requests.
+        """
+        from repositories.listenbrainz_repository import ListenBrainzRepository
+        from core.dependencies import clear_listenbrainz_dependent_caches
+
+        ListenBrainzRepository.reset_circuit_breaker()
+        clear_listenbrainz_dependent_caches()
+        await self.clear_home_cache()
+        logger.info("ListenBrainz user connection changed: caches/singletons reset")
+
     async def on_youtube_settings_changed(self) -> None:
         from core.dependencies import get_youtube_repo
 
         get_youtube_repo.cache_clear()
         await self.clear_home_cache()
         logger.info("YouTube settings change: singleton reset, home caches cleared")
+
+    async def on_http_settings_changed(self) -> None:
+        """F-PERF-08: advanced HTTP timeout/pool values changed.
+
+        Retire the shared factory generations so the next resolution builds
+        clients from the saved settings, clear the provider graphs that hold
+        default/ListenBrainz/cover-art clients, and close the superseded
+        generations through the awaited lifecycle path."""
+        from infrastructure.http.client import HttpClientFactory
+
+        for logical_name in ("default", "listenbrainz", "coverart"):
+            HttpClientFactory.retire_name(logical_name)
+        from core.dependencies import clear_listenbrainz_dependent_caches
+
+        clear_listenbrainz_dependent_caches()
+        await self.on_coverart_settings_changed()
+        await HttpClientFactory.close_retired()
 
     async def on_coverart_settings_changed(self) -> None:
         from core.dependencies import (
@@ -650,8 +703,10 @@ class SettingsService:
             get_mb_api_base,
             set_mb_api_base,
             mb_rate_limiter,
+            mb_rate_limiter_bypassed,
             mb_circuit_breaker,
             mb_deduplicator,
+            set_mb_rate_limiter_bypass,
         )
         from api.v1.schemas.settings import (
             is_official_musicbrainz,
@@ -664,12 +719,17 @@ class SettingsService:
             settings.concurrent_searches = min(
                 settings.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
             )
+            # the Unlimited sentinel is off-official only
+            if settings.rate_limit <= 0:
+                settings.rate_limit = _OFFICIAL_MB_RATE_LIMIT
 
         # Compare against live module state, not stored settings: the route
         # saves before calling this handler, so stored == incoming always.
+        # While the sentinel bypasses the limiter its stored rate is inert.
+        effective_rate = 0.0 if mb_rate_limiter_bypassed() else mb_rate_limiter.rate
         if (
             get_mb_api_base() == settings.api_url
-            and mb_rate_limiter.rate == settings.rate_limit
+            and effective_rate == settings.rate_limit
             and mb_rate_limiter.capacity == settings.concurrent_searches
         ):
             logger.info(
@@ -679,7 +739,11 @@ class SettingsService:
             return
 
         set_mb_api_base(settings.api_url)
-        mb_rate_limiter.update_rate(settings.rate_limit)
+        if settings.rate_limit == 0:
+            set_mb_rate_limiter_bypass(True)
+        else:
+            set_mb_rate_limiter_bypass(False)
+            mb_rate_limiter.update_rate(settings.rate_limit)
         mb_rate_limiter.update_capacity(settings.concurrent_searches)
         mb_circuit_breaker.reset()
         mb_deduplicator.clear()

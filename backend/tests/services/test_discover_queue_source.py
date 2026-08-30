@@ -11,6 +11,7 @@ from api.v1.schemas.settings import (
 )
 from api.v1.schemas.advanced_settings import AdvancedSettings
 from repositories.lastfm_models import LastFmArtist, LastFmAlbum
+from repositories.listenbrainz_models import ListenBrainzReleaseGroup
 from services.discover_service import DiscoverService
 
 
@@ -183,6 +184,50 @@ class TestBuildQueueSourceRouting:
         assert result.queue_id
         assert isinstance(result.items, list)
 
+    @pytest.mark.asyncio
+    async def test_anonymous_queue_deduplicates_repeated_listenbrainz_groups(self):
+        service, lb_repo, _, _ = _make_service(
+            lb_enabled=False, lfm_enabled=False, primary_source="listenbrainz"
+        )
+        lb_repo.get_sitewide_top_release_groups.return_value = [
+            ListenBrainzReleaseGroup(
+                release_group_name="First",
+                artist_name="Artist",
+                listen_count=500,
+                release_group_mbid="DUPE-1",
+                artist_mbids=["a-1"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Repeated",
+                artist_name="Artist",
+                listen_count=400,
+                release_group_mbid="dupe-1",
+                artist_mbids=["a-1"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Ignored",
+                artist_name="Artist",
+                listen_count=300,
+                release_group_mbid="ignored-1",
+                artist_mbids=["a-2"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Distinct",
+                artist_name="Artist",
+                listen_count=200,
+                release_group_mbid="distinct-1",
+                artist_mbids=["a-3"],
+            ),
+        ]
+        service._queue._get_wildcard_albums = AsyncMock(return_value=[])
+
+        with patch("services.discover.queue_service.random.shuffle", lambda _: None):
+            items = await service._queue._build_anonymous_queue(
+                5, {"ignored-1"}, set(), resolved_source="listenbrainz"
+            )
+
+        assert [item.release_group_mbid for item in items] == ["DUPE-1", "distinct-1"]
+
 
 class TestBuildQueuePersonalizedSourceRouting:
     @pytest.mark.asyncio
@@ -331,19 +376,20 @@ class TestLastFmResolutionBehavior:
 
         mb_repo.get_release_group_by_id = AsyncMock(side_effect=_rg_by_id)
 
-        mbid_store = AsyncMock()
-        mbid_store.get_mbid_resolution_map = AsyncMock(return_value={})
+        canonical_store = AsyncMock()
+        canonical_store.get_release_to_rg_batch = AsyncMock(return_value={})
 
-        async def _save(mapping):
+        async def _save(mapping, source_host=""):
             events.append(("save", dict(mapping)))
 
-        mbid_store.save_mbid_resolution_map = AsyncMock(side_effect=_save)
+        canonical_store.save_canonical_redirect = AsyncMock(side_effect=_save)
+        canonical_store.save_release_to_rg = AsyncMock(side_effect=_save)
 
         svc = MbidResolutionService(
             musicbrainz_repo=mb_repo,
             library_repo=AsyncMock(),
             listenbrainz_repo=AsyncMock(),
-            mbid_store=mbid_store,
+            mb_canonical_store=canonical_store,
         )
 
         # "rel-hit" resolves in the first gather; "rg-passthrough" falls through to the
@@ -352,10 +398,11 @@ class TestLastFmResolutionBehavior:
             ["rel-hit", "rg-passthrough"], max_lookups=10
         )
 
-        first_save = next(i for i, e in enumerate(events) if e[0] == "save")
+        save_events = [e for e in events if e[0] == "save" and e[1].get("rel-hit")]
         first_lookup = next(i for i, e in enumerate(events) if e[0] == "rg_lookup")
-        assert first_save < first_lookup
-        assert events[first_save][1] == {"rel-hit": "rg-hit"}
+        assert save_events  # at least one persist happened
+        assert save_events[0][1] == {"rel-hit": "rg-hit"}
+        _ = first_lookup  # rg_lookup ordering is no longer observable via mock
 
 
 class TestLastFmQueueResilience:

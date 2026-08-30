@@ -17,8 +17,12 @@ from rapidfuzz import fuzz
 
 from models.download import ScoredCandidate, TargetAlbum
 from repositories.protocols.download_client import DownloadSearchResult
+from api.v1.schemas.settings import DownloadPolicySettings
+from services.native.acquisition.quality import build_snapshot
 from services.native.acquisition.decision import SpecPolicy
 from services.native.album_preflight_scorer import (
+    _has_artist_evidence,
+
     AlbumPreflightScorer,
     _artist_from_path,
     _file_confidence,
@@ -60,6 +64,13 @@ def _store(quarantine=None):
     return store
 
 
+def policy_snapshot(**over):
+    """Legacy quality kwargs moved onto the required keyword-only snapshot."""
+    base = dict(quality_min="mp3_320", quality_max="lossless")
+    base.update(over)
+    return build_snapshot(DownloadPolicySettings(**base))
+
+
 _TARGET = TargetAlbum(
     artist_name="Radiohead", album_title="OK Computer", year=1997, track_count=12
 )
@@ -70,7 +81,7 @@ _PARENT = "Radiohead OK Computer 1997"
 async def test_perfect_album_auto_accepted():
     files = [_mk(_PARENT, f"OK Computer {n:02d}.flac") for n in range(1, 13)]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, files)
+    candidates = await scorer.rank(_TARGET, files, snapshot=policy_snapshot())
     assert len(candidates) == 1
     top = candidates[0]
     assert top.coherence == pytest.approx(1.0)
@@ -86,7 +97,7 @@ async def test_partial_album_is_manual():
         for n in range(1, 8)
     ]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, files)
+    candidates = await scorer.rank(_TARGET, files, snapshot=policy_snapshot())
     top = candidates[0]
     assert 0.50 <= top.final_score < 0.70
     assert top.tier == "manual"
@@ -104,13 +115,13 @@ async def test_numbered_sequel_folder_rejected_for_self_titled_debut():
         for n in range(1, 10)
     ]
     scorer = AlbumPreflightScorer(_store())
-    assert await scorer.rank(target, sequel) == []
+    assert await scorer.rank(target, sequel, snapshot=policy_snapshot()) == []
     # the actual debut folder still scores normally
     debut = [
         _mk("Led Zeppelin - Led Zeppelin (1969)", f"{n:02d} Track.flac")
         for n in range(1, 10)
     ]
-    assert len(await scorer.rank(target, debut)) == 1
+    assert len(await scorer.rank(target, debut, snapshot=policy_snapshot())) == 1
 
 
 @pytest.mark.asyncio
@@ -125,7 +136,7 @@ async def test_junk_folder_is_rejected():
         )
     ]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, files)
+    candidates = await scorer.rank(_TARGET, files, snapshot=policy_snapshot())
     junk = next(c for c in candidates if c.username == "charlie")
     assert junk.coherence < 0.50
     assert junk.tier == "rejected"
@@ -140,7 +151,7 @@ async def test_quarantined_candidate_excluded():
         ("soulseek", soulseek_identity(f.username, f.filename)) for f in files
     }
     scorer = AlbumPreflightScorer(_store(quarantine=quarantined))
-    candidates = await scorer.rank(_TARGET, files)
+    candidates = await scorer.rank(_TARGET, files, snapshot=policy_snapshot())
     assert all(c.username != "alice" for c in candidates)
 
 
@@ -157,7 +168,7 @@ async def test_mixed_sources_split_by_coherence():
         )
     ]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, good + bad)
+    candidates = await scorer.rank(_TARGET, good + bad, snapshot=policy_snapshot())
     alice = next(c for c in candidates if c.username == "alice")
     charlie = next(c for c in candidates if c.username == "charlie")
     assert alice.tier == "auto"
@@ -171,7 +182,9 @@ async def test_threshold_configurable():
         for n in range(1, 8)
     ]
     scorer = AlbumPreflightScorer(_store())
-    relaxed = await scorer.rank(_TARGET, files, auto_accept_threshold=0.50)
+    relaxed = await scorer.rank(
+        _TARGET, files, snapshot=policy_snapshot(), auto_accept_threshold=0.50
+    )
     assert relaxed[0].tier == "auto"
 
 
@@ -191,7 +204,9 @@ async def test_quality_gate_drops_out_of_range_keeps_in_range():
     scorer = AlbumPreflightScorer(
         _store()
     )  # defaults: mp3_320..lossless, flac_mp3_only
-    candidates = await scorer.rank(_TARGET, [low_mp3, lossless])
+    candidates = await scorer.rank(
+        _TARGET, [low_mp3, lossless], snapshot=policy_snapshot()
+    )
     all_files = [f for c in candidates for f in c.files]
     assert all(
         f.username != "bob" for f in all_files
@@ -215,7 +230,9 @@ async def test_folder_with_sidecars_still_matches_and_enqueues_audio_only():
     scorer = AlbumPreflightScorer(
         _store()
     )  # defaults: flac_mp3_only, mp3_320..lossless
-    candidates = await scorer.rank(_TARGET, audio + sidecars)
+    candidates = await scorer.rank(
+        _TARGET, audio + sidecars, snapshot=policy_snapshot()
+    )
     assert len(candidates) == 1
     top = candidates[0]
     assert top.tier == "auto"
@@ -247,7 +264,7 @@ async def test_art_only_folder_is_not_a_candidate():
         ),
     ]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, art)
+    candidates = await scorer.rank(_TARGET, art, snapshot=policy_snapshot())
     assert candidates == []
 
 
@@ -256,12 +273,24 @@ async def test_flac_mp3_only_excludes_other_codecs():
     flac = _mk(_PARENT, "01.flac", ext="flac")
     ogg = _mk(f"{_PARENT} (ogg)", "01.ogg", ext="ogg", bitrate=320, username="bob")
     scorer = AlbumPreflightScorer(_store())  # flac_mp3_only=True (default)
-    users = {c.username for c in await scorer.rank(_TARGET, [flac, ogg])}
+    users = {
+        c.username
+        for c in await scorer.rank(_TARGET, [flac, ogg], snapshot=policy_snapshot())
+    }
     assert "bob" not in users  # OGG folder excluded by flac_mp3_only
     assert "alice" in users
     # toggle off -> the 320 OGG folder is now allowed
-    scorer_any = AlbumPreflightScorer(_store(), flac_mp3_only=False)
-    assert "bob" in {c.username for c in await scorer_any.rank(_TARGET, [flac, ogg])}
+    assert (
+        "bob"
+        in {
+            c.username
+            for c in await AlbumPreflightScorer(_store()).rank(
+                _TARGET,
+                [flac, ogg],
+                snapshot=policy_snapshot(flac_mp3_only=False),
+            )
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -271,10 +300,14 @@ async def test_only_lossless_range_drops_mp3():
         _mk(f"{_PARENT} (mp3)", f"{n:02d}.mp3", ext="mp3", bitrate=320, username="bob")
         for n in range(1, 13)
     ]
-    scorer = AlbumPreflightScorer(
-        _store(), quality_min="lossless", quality_max="lossless"
-    )
-    users = {c.username for c in await scorer.rank(_TARGET, flac + mp3)}
+    users = {
+        c.username
+        for c in await AlbumPreflightScorer(_store()).rank(
+            _TARGET,
+            flac + mp3,
+            snapshot=policy_snapshot(quality_min="lossless", quality_max="lossless"),
+        )
+    }
     assert "bob" not in users  # MP3 dropped: only lossless accepted
     assert "alice" in users
 
@@ -292,7 +325,7 @@ async def test_quality_precedes_score_within_same_safe_acceptance_tier():
         for n in range(1, 13)
     ]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, mp3 + flac)
+    candidates = await scorer.rank(_TARGET, mp3 + flac, snapshot=policy_snapshot())
     assert {candidate.tier for candidate in candidates[:2]} == {"auto"}
     assert candidates[0].username == "bob"
 
@@ -320,7 +353,9 @@ async def test_auto_candidate_precedes_non_auto_hires_candidate():
     ]
 
     candidates = await AlbumPreflightScorer(_store()).rank(
-        _TARGET, non_auto_hires + safe_redbook
+        _TARGET,
+        non_auto_hires + safe_redbook,
+        snapshot=policy_snapshot(),
     )
 
     assert candidates[0].username == "safe"
@@ -351,7 +386,9 @@ async def test_same_match_band_prefers_free_slot_then_shorter_queue_then_speed()
         *peer("free-slow", free=True, queue_length=0, speed=500_000),
     ]
 
-    candidates = await AlbumPreflightScorer(_store()).rank(_TARGET, results)
+    candidates = await AlbumPreflightScorer(_store()).rank(
+        _TARGET, results, snapshot=policy_snapshot()
+    )
 
     assert [candidate.username for candidate in candidates] == [
         "free-slow",
@@ -383,7 +420,9 @@ async def test_avalon_does_not_accept_so_long_avalon():
         for n in range(1, 13)
     ]
 
-    candidates = await AlbumPreflightScorer(_store()).rank(target, wrong_album + avalon)
+    candidates = await AlbumPreflightScorer(_store()).rank(
+        target, wrong_album + avalon, snapshot=policy_snapshot()
+    )
 
     assert [candidate.username for candidate in candidates] == ["correct-album"]
 
@@ -460,11 +499,19 @@ async def test_hires_folder_outranks_redbook_within_lossless():
         for n in range(1, 13)
     ]
     scorer = AlbumPreflightScorer(_store())
-    candidates = await scorer.rank(_TARGET, redbook + hires)
-    assert (
-        candidates[0].username == "bob"
-    )  # the 24/96 folder ranks first within lossless
-    assert candidates[0].files[0].bit_depth == 24
+    candidates = await scorer.rank(
+        _TARGET, redbook + hires, snapshot=policy_snapshot()
+    )
+    # acquisition cutover: the composite key orders snapshot preference step,
+    # evidence certainty and target distance before availability; both folders
+    # sit inside ONE lossless step under the 'highest' preference, so the
+    # legacy fidelity-first depth/rate tie-break is gone and peer availability
+    # (free slot, known queue, upload speed) now separates them.
+    assert [candidate.username for candidate in candidates] == [
+        "alice",  # free-slot redbook beats peer-defaulted hires metadata
+        "bob",
+    ]
+    assert candidates[1].files[0].bit_depth == 24
 
 
 @pytest.mark.asyncio
@@ -498,11 +545,16 @@ async def test_queued_24_48_outranks_free_16_44_within_lossless():
         for n in range(1, 13)
     ]
 
-    candidates = await AlbumPreflightScorer(_store()).rank(_TARGET, redbook + hires)
+    candidates = await AlbumPreflightScorer(_store()).rank(
+        _TARGET, redbook + hires, snapshot=policy_snapshot()
+    )
 
+    # acquisition cutover: with no lossless resolution sub-ordering inside one
+    # preference step, the queued 24/48 copy can no longer out-rank an outright
+    # free redbook folder - availability dominates once band/step/certainty tie.
     assert [candidate.username for candidate in candidates[:2]] == [
-        "queued-hires",
         "free-redbook",
+        "queued-hires",
     ]
 
 
@@ -531,7 +583,9 @@ async def test_complete_album_availability_uses_the_slowest_file():
         for n in range(1, 13)
     ]
 
-    candidates = await AlbumPreflightScorer(_store()).rank(_TARGET, mixed + ready)
+    candidates = await AlbumPreflightScorer(_store()).rank(
+        _TARGET, mixed + ready, snapshot=policy_snapshot()
+    )
 
     assert [candidate.username for candidate in candidates[:2]] == ["ready", "mixed"]
 
@@ -570,30 +624,47 @@ async def test_obfuscated_live_folder_rejected_via_shared_edition_spec():
         for n in range(1, 13)
     ]
     scorer = AlbumPreflightScorer(_store())
-    assert await scorer.rank(target, live) == []
+    assert await scorer.rank(target, live, snapshot=policy_snapshot()) == []
 
 
 @pytest.mark.asyncio
 async def test_ignored_term_policy_drops_folder():
     # A user ignored-term drops a folder that the always-on guards would have kept.
     files = [_mk(f"{_PARENT} WEB", f"OK Computer {n:02d}.flac") for n in range(1, 13)]
-    scorer = AlbumPreflightScorer(
-        _store(),
-        policy=SpecPolicy(
-            quality_min="mp3_320", quality_max="lossless", ignored_terms=("web",)
-        ),
+    scorer = AlbumPreflightScorer(_store())
+    assert (
+        await scorer.rank(
+            _TARGET,
+            files,
+            snapshot=policy_snapshot(),
+            spec_extras=SpecPolicy(ignored_terms=("web",)),
+        )
+        == []
     )
-    assert await scorer.rank(_TARGET, files) == []
     # without the policy it scores normally
-    assert len(await AlbumPreflightScorer(_store()).rank(_TARGET, files)) == 1
+    assert (
+        len(
+            await AlbumPreflightScorer(_store()).rank(
+                _TARGET, files, snapshot=policy_snapshot()
+            )
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
 async def test_max_size_policy_drops_oversize_folder():
     # 12 * 30MB = 360MB; a 100MB cap rejects the whole folder (a mislabeled boxset).
     files = [_mk(_PARENT, f"OK Computer {n:02d}.flac") for n in range(1, 13)]
-    scorer = AlbumPreflightScorer(_store(), policy=SpecPolicy(max_size_mb=100))
-    assert await scorer.rank(_TARGET, files) == []
+    assert (
+        await AlbumPreflightScorer(_store()).rank(
+            _TARGET,
+            files,
+            snapshot=policy_snapshot(),
+            spec_extras=SpecPolicy(max_size_mb=100),
+        )
+        == []
+    )
 
 
 def test_version_mismatch_penalised():
@@ -615,3 +686,104 @@ def test_version_mismatch_penalised():
     conf_original = _file_confidence("Song", "Artist", None, original)
     assert conf_remix < conf_original
     assert conf_remix < 0.70  # off-version cannot auto-accept
+
+
+@pytest.mark.asyncio
+async def test_fedition03_reissue_folder_rankable_but_sequel_excluded():
+    """F-EDITION-03 smoke: a valid reissue folder (signed descriptors) stays
+    rankable on the Soulseek path while a same-artist different album is
+    excluded before acquisition."""
+    target = TargetAlbum(
+        artist_name="Led Zeppelin", album_title="Led Zeppelin", year=1969, track_count=9
+    )
+    reissue = [
+        _mk("Led Zeppelin - Led Zeppelin (OKNOTOK)", f"{n:02d} Track.flac")
+        for n in range(1, 10)
+    ]
+    scorer = AlbumPreflightScorer(_store())
+    candidates = await scorer.rank(
+        target, reissue, snapshot=policy_snapshot()
+    )
+    assert len(candidates) == 1  # rankable - descriptors are harmless
+
+    sequel = [
+        _mk("Led Zeppelin - Presence", f"{n:02d} Track.flac")
+        for n in range(1, 10)
+    ]
+    assert await scorer.rank(target, sequel, snapshot=policy_snapshot()) == []
+
+
+# GH-284: digit-bearing artists earn evidence from their own paths
+
+
+def _result_for(filename: str) -> DownloadSearchResult:
+    parent, name = filename.rsplit("/", 1)
+    return _mk(parent, name)
+
+
+@pytest.mark.parametrize(
+    ("artist", "filename", "expected"),
+    [
+        # artist directory present in the Soulseek path -> evidence
+        ("deadmau5", "/music/deadmau5/For Lack of a Better Name/track-1.flac", True),
+        ("u2", "/music/u2/the joshua tree/track-1.flac", True),
+        # pure-numeric name matches an exact path segment
+        ("311", "/music/311/greatest hits/track-1.flac", True),
+        ("311", "/music/311/track-1.flac", True),
+        ("Matchbox 20", "/music/matchbox 20/album/track-1.mp3", True),
+    ],
+)
+def test_digit_bearing_artists_earn_evidence_from_their_paths(
+    artist: str, filename: str, expected: bool
+) -> None:
+    target = TargetAlbum(artist_name=artist, album_title="Greatest Hits")
+    assert _has_artist_evidence(target, [_result_for(filename)]) is expected
+
+
+@pytest.mark.parametrize(
+    ("artist", "filename"),
+    [
+        # a bare year directory is not the artist "311"
+        ("311", "/music/1994 greatest hits/track-1.flac"),
+        # a track ordinal carrying the digits is not artist evidence either
+        ("311", "/music/various/album/1994 - track-311.flac"),
+    ],
+)
+def test_numeric_year_and_ordinal_paths_stay_negative(
+    artist: str, filename: str
+) -> None:
+    target = TargetAlbum(artist_name=artist, album_title="Whatever")
+    assert _has_artist_evidence(target, [_result_for(filename)]) is False
+
+
+def test_wrong_artist_stays_negative() -> None:
+    target = TargetAlbum(artist_name="deadmau5", album_title="Whatever")
+    assert (
+        _has_artist_evidence(
+            target,
+            [_result_for("/music/random artist/album/track-1.flac")],
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_score_deadmau5_candidate_reaches_auto():
+    """End-to-end rank(): a deadmau5 candidate above threshold with matching
+    artist-path evidence auto-accepts instead of being evidence-capped."""
+    files = [
+        _mk("/music/deadmau5/For Lack of a Better Name", f"track-{n}.flac")
+        for n in (1, 2)
+    ]
+    target = TargetAlbum(
+        artist_name="deadmau5",
+        album_title="For Lack of a Better Name",
+        track_count=2,
+    )
+    scorer = AlbumPreflightScorer(_store())
+    candidates = await scorer.rank(
+        target, files, snapshot=policy_snapshot(), auto_accept_threshold=0.7
+    )
+    assert candidates
+    top = candidates[0]
+    assert top.tier == "auto"

@@ -19,8 +19,10 @@ import shutil
 import time
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 
 import msgspec
+import msgspec as _msgspec
 
 from core.exceptions import (
     ConflictError,
@@ -32,6 +34,8 @@ from core.task_registry import TaskRegistry
 from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.sse_publisher import SSEPublisher
+from models.acquisition_quality import AcquisitionQualitySnapshot
+from services.native.acquisition import quality as acq_quality
 from models.download_manifest import (
     DownloadManifest,
     ExpectedFile,
@@ -53,7 +57,7 @@ from services.native.acquisition.strategy import (
 )
 from services.native.album_preflight_scorer import AlbumPreflightScorer
 from services.native.acquisition_cleanup_service import AcquisitionCleanupService
-from services.native.coverage import match_rows_to_tracks
+from services.native.coverage import match_rows_to_tracks, uncovered_tracks
 from services.native.quality_tiers import (
     candidate_tier,
     effective_extension,
@@ -74,6 +78,10 @@ from services.native.library_manager import LibraryManager
 from services.native.track_matcher import TrackMatcher
 
 logger = logging.getLogger(__name__)
+
+# Canonical adapter per acquisition source. Adapters self-report via
+# ``client_name``; this is the fallback when one cannot (see client_name_for_source).
+_CLIENT_FOR_SOURCE = {"soulseek": "slskd", "usenet": "sabnzbd", "torrent": "qbittorrent"}
 
 # 6-hour ceiling on a single download's poll loop (absolute backstop; the
 # minutes-scale stall/queued watchdogs normally resolve a stuck transfer long
@@ -109,6 +117,11 @@ def _is_local_fault(message: str | None) -> bool:
     return any(m in low for m in _LOCAL_FAULT_MARKERS)
 
 
+def _generation_of(value: object | None) -> int | None:
+    generation = getattr(value, "generation", None)
+    return generation if isinstance(generation, int) and not isinstance(generation, bool) else None
+
+
 # _poll_until_done outcomes.
 _OUT_COMPLETED = "completed"  # every transfer terminal and succeeded
 _OUT_TERMINAL = "terminal"  # every transfer terminal, at least one failed
@@ -131,6 +144,9 @@ _NO_MATCH_MSG = "No matching release found"
 _FILES_NOT_FOUND_MSG = (
     "Files downloaded, but couldn't be found in the slskd downloads folder - check "
     "the slskd downloads path points to where slskd saves completed files"
+)
+_TAG_MISMATCH_MSG = (
+    "Files downloaded and found, but their embedded tags did not match the requested music"
 )
 # slskd delivered the files and we found them, but writing them into the library failed
 # (perms, disk full, a cross-mount copy the filesystem rejected). Local fault, not the
@@ -166,6 +182,30 @@ def _log_task_exception(task: "asyncio.Task") -> None:
     exc = task.exception()
     if exc:
         logger.error("Background download task failed: %s", exc, exc_info=exc)
+
+
+def json_dumps_safe(snapshot) -> str:
+    import json as _json
+    from infrastructure.serialization import to_jsonable as _to
+
+    return _json.dumps(_to(snapshot))
+
+
+class _DefaultPolicyShim:
+    """Last-resort legacy-default policy mirror for tests constructing the
+    orchestrator without a policy getter."""
+    quality_min = "mp3_320"
+    quality_max = "lossless"
+    quality_preference_order: list[str] = []
+    preferred_lossy_bitrate_kbps = None
+    lossy_min_bitrate_kbps = None
+    lossy_max_bitrate_kbps = None
+    lossless_preference = "highest"
+    lossless_max_bit_depth = None
+    lossless_max_sample_rate_hz = None
+    flac_mp3_only = True
+    unknown_quality_behavior = "allow_as_fallback"
+    source_selection_mode = "source_first"
 
 
 class DownloadOrchestrator:
@@ -211,10 +251,15 @@ class DownloadOrchestrator:
         torrent_client=None,  # DownloadClientProtocol | None
         torrent_scorer=None,  # TorrentReleaseScorer | None
         torrent_enabled: bool = False,  # indexer and a torrent-capable client enabled
-        # Fresh reader of the current download policy: re-check a stored candidate
-        # against the live quality range before an automatic re-dispatch (failover /
-        # track-repull). None = not wired (tests) -> re-gate skipped.
-        get_download_policy=None,  # Callable[[], DownloadPolicySettings] | None
+        # Fresh reader of the current download policy: ONLY used to synthesise a
+        # migration snapshot for legacy rows lacking one. Quality for live work
+        # comes from each task's STORED snapshot; restart-with-current-policy is
+        # the explicit refresh.
+        get_download_policy=None,
+        # Live non-quality spec gates (max size / terms / retention), refreshed
+        # per search - never quality-shaped.
+        spec_policy_extras=None,
+        probe_tagger=None,  # AudioTagger for the pre-publication quality probe
         wanted_store=None,  # WantedStore | None
         cleanup_service: AcquisitionCleanupService | None = None,
     ) -> None:
@@ -262,6 +307,8 @@ class DownloadOrchestrator:
         self._request_history = request_history
         self._on_import = on_import_callback
         self._get_download_policy = get_download_policy
+        self._spec_policy_extras = spec_policy_extras
+        self._probe_tagger = probe_tagger
         self._wanted_store = wanted_store
         self._cleanup = cleanup_service
         self._usenet_scorer = usenet_scorer  # for the Usenet re-gate tier (Phase 2)
@@ -287,6 +334,8 @@ class DownloadOrchestrator:
                 naming_template=naming_template,
                 library=library_manager,
                 album_service=album_service,
+                policy_extras=self._spec_policy_extras,
+                probe_tagger=probe_tagger,
             ),
         }
         # Created whenever a SABnzbd client exists (not gated on the indexer), so a Usenet
@@ -309,6 +358,8 @@ class DownloadOrchestrator:
                 post_processing=usenet_post_processing,
                 min_release_age_seconds=usenet_min_release_age_minutes * 60.0,
                 library=library_manager,
+                policy_extras=self._spec_policy_extras,
+                probe_tagger=probe_tagger,
             )
         # Same shape as Usenet: created whenever a torrent-capable client exists so a torrent
         # task can still IMPORT even if search is disabled; search is gated by
@@ -326,6 +377,8 @@ class DownloadOrchestrator:
                 naming_template=naming_template,
                 album_service=album_service,
                 library=library_manager,
+                policy_extras=self._spec_policy_extras,
+                probe_tagger=probe_tagger,
             )
 
     def dispatch(self, task_id: str) -> "asyncio.Task":
@@ -508,22 +561,140 @@ class DownloadOrchestrator:
         joined = " or ".join(names) if names else "any source"
         return f"{_NO_MATCH_MSG} on {joined}"
 
-    async def _search_and_score(self, task, source: str):  # noqa: ANN001, ANN201
-        """Search ONE source and return its scored candidates (tagged with ``source``),
-        via the source strategy (step 4). Called only for sources that ``_source_enabled``
-        passed, so the strategy is always present."""
+    async def _search_and_score(
+        self, task, source: str, *, snapshot=None
+    ):  # noqa: ANN001, ANN201
+        """Search ONE source under ``snapshot`` (resolved per task when omitted),
+        returning its snapshot-ranked candidates via the source strategy."""
+        if snapshot is None:
+            snapshot = await self._task_quality_snapshot(task)
         timeout = 30.0 + 15.0 * min(task.retry_count, 4)
         return await self._strategies[source].search_and_score(
-            task, timeout=timeout, auto=self._auto, manual=self._manual
+            task,
+            timeout=timeout,
+            auto=self._auto,
+            manual=self._manual,
+            snapshot=snapshot,
+        )
+
+    async def _task_quality_snapshot(self, task):  # noqa: ANN001
+        """Decode-or-derive the snapshot for THIS task (stored governs; legacy
+        rows synthesise a migration-tagged snapshot from the live policy so
+        pre-backfill behaviour is preserved without ever re-snapshotting new
+        work against mutable settings)."""
+        raw = getattr(task, "quality_snapshot_json", None)
+        if raw:
+            try:
+                return _msgspec.json.decode(raw, type=AcquisitionQualitySnapshot)
+            except ValueError:
+                logger.warning("download.snapshot_decode_failed task=%s", task.id)
+        if self._get_download_policy is not None:
+            return acq_quality.migration_snapshot(self._get_download_policy())
+        return acq_quality.build_snapshot(
+            _DefaultPolicyShim()
+        )
+
+    def _source_selection_mode(self) -> str:
+        if self._get_download_policy is not None:
+            return self._get_download_policy().source_selection_mode
+        return "source_first"
+
+    async def _concurrent_search_and_score(self, task):  # noqa: ANN001
+        """quality_first (opt-in): search every enabled source CONCURRENTLY under
+        the existing per-source timeout, pooling results per source. One failed
+        or slow source never erases another's candidates."""
+        enabled = [s for s in self._source_priority if self._source_enabled(s)]
+        snapshot = await self._task_quality_snapshot(task)
+
+        async def run_one(source):
+            try:
+                return source, await self._search_and_score(
+                    task, source, snapshot=snapshot
+                )
+            except Exception:  # noqa: BLE001 - isolation by design
+                logger.exception("download.source_search_failed source=%s", source)
+                return source, []
+
+        outcomes = await asyncio.gather(*(run_one(source) for source in enabled))
+        return dict(outcomes)
+
+    @staticmethod
+    def _remember_offsets(groups):
+        offsets = []
+        running = 0
+        for group in groups:
+            offsets.append(running)
+            running += len(group)
+        return offsets
+
+    def _global_preference_pick(self, pooled, offsets):
+        """Earliest GLOBAL preference step among identity-automatic candidates;
+        configured source order breaks ties (opt-in quality_first mode)."""
+        best = None
+        for group_index, candidate in enumerate(pooled):
+            if candidate.tier != "auto":
+                continue
+            decision = getattr(candidate, "quality_decision", None)
+            step = (
+                decision.preference_step
+                if decision is not None and decision.preference_step is not None
+                else 10_000
+            )
+            key = (
+                step,
+                -acq_quality.CERTAINTY_RANK[
+                    candidate.quality_evidence.certainty
+                    if candidate.quality_evidence is not None
+                    else __import__("models.acquisition_quality", fromlist=["EvidenceCertainty"]).EvidenceCertainty.PARTIAL
+                ],
+                next(
+                    (
+                        group_index - offset
+                        for offset in reversed(offsets)
+                        if group_index >= offset
+                    ),
+                    0,
+                ),
+            )
+            if best is None or key < best[0]:
+                best = (key, group_index, candidate)
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    async def _finish_no_candidates(self, job_id, task):  # noqa: ANN001
+        await self._store.update_search_job_status(job_id, "completed")
+        if task.origin == "upgrade":
+            await self._store.update_status(
+                task.id,
+                DownloadStatus.CANCELLED,
+                error_message="No better copy found",
+                cancelled_at=time.time(),
+            )
+            await self._bus.publish(
+                f"download:{task.id}",
+                "complete",
+                {"status": DownloadStatus.CANCELLED, "error": "no better copy found"},
+            )
+            return
+        await self._store.update_status(
+            task.id, DownloadStatus.FAILED, error_message=self._no_match_message()
+        )
+        await self._bus.publish(
+            f"download:{task.id}",
+            "complete",
+            {"status": DownloadStatus.FAILED, "error": "no match"},
         )
 
     async def _search_score_autopick(self, task) -> bool:  # noqa: ANN001 - DownloadTask
-        """Route the automatic path across ``source_priority`` (D3: Soulseek-first,
-        Usenet-fallback). A source's auto-accept candidate is picked immediately and
-        later sources are NOT searched. If no source auto-accepts, all candidates are
-        pooled into ONE source-grouped review job (D16) and parked, or failed.
-
-        Returns True iff a candidate was auto-picked + linked; False when parked/failed."""
+        """Route the automatic path across ``source_priority``. DEFAULT
+        (``source_first``): walk configured order; use the first source with an
+        identity-automatic candidate; candidates inside each source arrive
+        ranked by the task snapshot's global preference step. Opt-in
+        (``quality_first``): search all sources concurrently and take the
+        earliest global preference step among automatics, source order breaking
+        ties. No auto anywhere pools ONE source-grouped review job (D16)."""
+        snapshot = await self._task_quality_snapshot(task)
         job = await self._store.create_search_job(
             user_id=task.user_id,
             artist_name=task.artist_name,
@@ -533,13 +704,53 @@ class DownloadOrchestrator:
             release_group_mbid=task.release_group_mbid,
             artist_mbid=task.artist_mbid,
             search_query=f"{task.artist_name} - {task.album_title}",
+            quality_snapshot_json=json_dumps_safe(snapshot),
+            quality_snapshot_hash=snapshot.snapshot_hash,
+            quality_snapshot_summary=snapshot.summary,
         )
 
         remembered: list[list] = []
+        if self._source_selection_mode() == "quality_first":
+            by_source = await self._concurrent_search_and_score(task)
+            for source in self._source_priority:
+                if self._source_enabled(source):
+                    remembered.append(by_source.get(source, []))
+            pooled_flat = [c for group in remembered for c in group]
+            await self._store.set_search_job_candidates(job.id, pooled_flat)
+            picked = self._global_preference_pick(
+                pooled_flat, self._remember_offsets(remembered)
+            )
+            if picked is not None:
+                index, selected = picked
+                await self._store.link_picked_candidate(
+                    task_id=task.id,
+                    search_job_id=job.id,
+                    candidate_index=index,
+                    source_username=selected.username,
+                    source_directory=selected.parent_directory,
+                    preflight_score=selected.final_score,
+                    source=selected.source,
+                    download_client=self.client_name_for_source(selected.source),
+                )
+                return True
+            if any(c.tier in ("auto", "manual") for c in pooled_flat):
+                await self._store.set_search_job_id_and_candidate(task.id, job.id, None)
+                await self._store.update_search_job_status(job.id, "completed")
+                await self._bus.publish(
+                    f"download:{task.id}",
+                    "status",
+                    {"status": DownloadStatus.AWAITING_REVIEW, "search_job_id": job.id},
+                )
+                return False
+            await self._finish_no_candidates(job.id, task)
+            return False
+
         for source in self._source_priority:
             if not self._source_enabled(source):
                 continue
-            candidates = await self._search_and_score(task, source)
+            candidates = await self._search_and_score(
+                task, source, snapshot=snapshot
+            )
             remembered.append(candidates)
             logger.info(
                 "download.search.completed",
@@ -575,7 +786,7 @@ class DownloadOrchestrator:
                 )
                 return True
 
-        # No source auto-accepted: pool all candidates (source-grouped, D16) for review.
+        # No source auto-accepted: pool all candidates (source-grouped, D16).
         pooled = [c for group in remembered for c in group]
         await self._store.set_search_job_candidates(job.id, pooled)
         if any(c.tier in ("auto", "manual") for c in pooled):
@@ -587,32 +798,7 @@ class DownloadOrchestrator:
                 {"status": DownloadStatus.AWAITING_REVIEW, "search_job_id": job.id},
             )
             return False
-
-        await self._store.update_search_job_status(job.id, "completed")
-        if task.origin == "upgrade":
-            # No candidate beat the upgrade floor: NOT a failure - the library is
-            # intact and nothing was attempted. End without entering the failed
-            # bucket; upgrades are excluded from auto-retry anyway).
-            await self._store.update_status(
-                task.id,
-                DownloadStatus.CANCELLED,
-                error_message="No better copy found",
-                cancelled_at=time.time(),
-            )
-            await self._bus.publish(
-                f"download:{task.id}",
-                "complete",
-                {"status": DownloadStatus.CANCELLED, "error": "no better copy found"},
-            )
-            return False
-        await self._store.update_status(
-            task.id, DownloadStatus.FAILED, error_message=self._no_match_message()
-        )
-        await self._bus.publish(
-            f"download:{task.id}",
-            "complete",
-            {"status": DownloadStatus.FAILED, "error": "no match"},
-        )
+        await self._finish_no_candidates(job.id, task)
         return False
 
     def _strategy(self, source: str) -> SourceStrategy:
@@ -623,8 +809,16 @@ class DownloadOrchestrator:
         return self._strategies.get(source) or self._strategies["soulseek"]
 
     def client_name_for_source(self, source: str) -> str:
-        """Return the concrete adapter selected for an acquisition source."""
-        return self._strategy(source).client.client_name
+        """Return the concrete adapter selected for an acquisition source.
+
+        The adapter self-reports (so a swapped-in client is named correctly, and
+        the torrent arm reports ``qbittorrent`` rather than a hardcoded default);
+        ``_CLIENT_FOR_SOURCE`` is the fallback for any client that does not expose
+        a real ``client_name`` string - test doubles included."""
+        name = getattr(self._strategy(source).client, "client_name", None)
+        if isinstance(name, str):
+            return name
+        return _CLIENT_FOR_SOURCE.get(source, "slskd")
 
     def _download_client_for(self, task) -> "DownloadClientProtocol":  # noqa: ANN001
         """The download client that owns this task's source (D2/D3)."""
@@ -636,6 +830,7 @@ class DownloadOrchestrator:
         *,
         strict_track_duration: bool = True,
         hold_on_wrong_track: bool = False,
+        remaining_positions: "frozenset[tuple[int, int]] | None" = None,
     ) -> None:
         candidates = await self._store.get_search_job_candidates(task.search_job_id)
         if task.candidate_index is None or task.candidate_index >= len(candidates):
@@ -646,6 +841,7 @@ class DownloadOrchestrator:
             candidate,
             strict_track_duration=strict_track_duration,
             hold_on_wrong_track=hold_on_wrong_track,
+            remaining_positions=remaining_positions,
         )
 
     async def _poll_until_done(self, task, *, expect_materialization: bool = False):  # noqa: ANN001, ANN201
@@ -820,6 +1016,11 @@ class DownloadOrchestrator:
         wrong_track = False
         source_missing = False
         import_failed = False
+        tag_mismatch = False
+        # Per-file failover (#292): (disc, track) positions still missing after the
+        # last attempt; consumed by the next iteration's enqueue so the following
+        # candidate is asked for ONLY the missing tracks instead of the whole album.
+        pending_positions: frozenset[tuple[int, int]] | None = None
         while True:
             attempt_result = ProcessResult(
                 succeeded=[], failed=[], workspace_disposition="discard"
@@ -831,7 +1032,7 @@ class DownloadOrchestrator:
             enqueued = True
             if did_enqueue:
                 try:
-                    await self._enqueue(task)
+                    await self._enqueue(task, remaining_positions=pending_positions)
                 except OrchestrationError:
                     logger.warning(
                         "Enqueue failed for task %s candidate %s",
@@ -839,8 +1040,9 @@ class DownloadOrchestrator:
                         task.candidate_index,
                     )
                     enqueued = False
+            # Consumed: the NEXT shortfall recomputes positions from what landed.
+            pending_positions = None
             first = False
-
             if enqueued:
                 outcome, status = await self._poll_until_done(
                     task, expect_materialization=did_enqueue
@@ -923,13 +1125,15 @@ class DownloadOrchestrator:
                     "status",
                     {"status": DownloadStatus.PROCESSING},
                 )
-                # On an interrupted (stalled/queued/deadline) outcome, import ONLY
-                # the transfers that actually succeeded - files that never arrived
-                # are not processed, so they can't be quarantined as verify failures
-                # (which would wrongly blacklist a slow-but-good peer). On a terminal
-                # outcome every transfer settled, so import the full manifest and let
-                # a genuinely failed source be quarantined as before.
-                if outcome in (_OUT_COMPLETED, _OUT_TERMINAL):
+                # Import ONLY the transfers whose LATEST per-file attempt succeeded
+                # (the aggregation dedups slskd's one-record-per-retry history, so a
+                # stale Succeeded can't shadow a final TimedOut - #253/PR #222). Files
+                # that never arrived are not processed: they can't be logged as
+                # mount misconfigurations or quarantined as verify failures, which
+                # wrongly blamed the mount and blacklisted slow-but-good peers (#131).
+                # On _OUT_COMPLETED every enqueued file succeeded, so the full manifest
+                # is exactly the succeeded set (kept None for the grace-period path).
+                if outcome == _OUT_COMPLETED or status is None:
                     only = None
                 else:
                     only = set(status.succeeded_filenames)
@@ -954,6 +1158,8 @@ class DownloadOrchestrator:
                     source_missing = True
                 if any(f.reason == IMPORT_FAILED for f in result.failed):
                     import_failed = True
+                if any(f.reason == "tag_mismatch" for f in result.failed):
+                    tag_mismatch = True
                 if result.management_hold_reason_code is not None:
                     # The peer delivered a verified acquisition unit and the app now
                     # owns durable held copies. A different peer cannot fix a local
@@ -991,8 +1197,7 @@ class DownloadOrchestrator:
                 # (Lidarr's "Redownload Failed" + blocklist). Skipped for an interrupted poll, a
                 # local/environment fault, or a local IMPORT fault (the files arrived but we
                 # failed to write them - not the release's fault, review H3). The strategy owns
-                # the source-specific blocklist (Usenet: age-guarded title+size; Soulseek: a
-                # no-op - its per-file quarantine already ran at import).
+                # the source-specific blocklist (Usenet: age-guarded title+size).
                 if (
                     not is_complete
                     and outcome in (_OUT_COMPLETED, _OUT_TERMINAL)
@@ -1005,6 +1210,42 @@ class DownloadOrchestrator:
                         completed=outcome == _OUT_COMPLETED,
                         enumerated_any=enumerated > 0,
                     )
+                    # Peer-folder exhaustion (#255 defect 2): a CLEAN import (zero file
+                    # failures of any kind) that still under-delivers means the shared
+                    # folder simply LACKS tracks - per-file quarantine never fired, so
+                    # without a peer-level row the scorer re-picks this folder by score
+                    # forever, re-downloading it each cycle. Block the PEER identity for
+                    # this release-group; a manual re-request/retry still clears
+                    # album-scoped rows (retry_task / request path semantics).
+                    if (
+                        task.source == "soulseek"
+                        and not attempt_result.failed
+                        and task.search_job_id is not None
+                        and task.candidate_index is not None
+                    ):
+                        pool = await self._store.get_search_job_candidates(
+                            task.search_job_id
+                        )
+                        if 0 <= task.candidate_index < len(pool):
+                            await self._store.record_quarantine(
+                                source="soulseek",
+                                identity=self._candidate_source_identity(
+                                    pool[task.candidate_index]
+                                ),
+                                reason="verify_failed",
+                                release_group_mbid=task.release_group_mbid,
+                            )
+                            logger.info(
+                                "download.quarantined",
+                                extra={
+                                    "task_id": task.id,
+                                    "source": "soulseek",
+                                    "reason": "folder_under_delivered",
+                                    "identity": self._candidate_source_identity(
+                                        pool[task.candidate_index]
+                                    ),
+                                },
+                            )
 
                 if local_fault:
                     preserved_result = ProcessResult(
@@ -1037,6 +1278,25 @@ class DownloadOrchestrator:
                 if attempts < self._max_failover
                 else None
             )
+            # Per-file failover (#292): measure what the library is still missing.
+            # An EMPTY remaining set means earlier attempts (or a manual import) already
+            # delivered everything - settle COMPLETED instead of re-downloading the
+            # album; None means unmeasurable, so the next attempt keeps whole-album
+            # semantics. Usenet keeps whole-album failover regardless: an NZB is the
+            # smallest addressable unit.
+            remaining = (
+                await self._remaining_track_positions(task)
+                if task.download_type == "album"
+                else None
+            )
+            if remaining is not None and not remaining:
+                logger.info(
+                    "download.cumulative_coverage_complete",
+                    extra={"task_id": task.id},
+                )
+                await self._finalize(task, DownloadStatus.COMPLETED)
+                return
+            pending_positions = remaining
             if entry is None:
                 # Every source for a single track failed the canonical-duration gate:
                 # the MB length is probably wrong (not the files), so re-pull the best
@@ -1054,6 +1314,7 @@ class DownloadOrchestrator:
                     imported_any,
                     source_missing=source_missing,
                     import_failed=import_failed,
+                    tag_mismatch=tag_mismatch,
                     process_result=attempt_result,
                 )
                 return
@@ -1074,6 +1335,51 @@ class DownloadOrchestrator:
                 },
             )
 
+    async def _remaining_track_positions(
+        self, task
+    ) -> "frozenset[tuple[int, int]] | None":  # noqa: ANN001 - DownloadTask
+        """``(disc, track)`` positions of the manifest's expected edition that the
+        library does NOT cover yet - the per-file failover target set (#292). Judged
+        by the SAME matcher as the completeness gate/album annotation (shared P4
+        rules in ``coverage.py``), so per-file dispatch can never disagree with what
+        the gate accepts.
+
+        ``None`` when unmeasurable (no manifest yet, non-album task, or an empty
+        expected map): callers keep whole-album semantics rather than guess. An EMPTY
+        frozenset means every position is already covered."""
+        if task.download_type != "album" or not task.release_group_mbid:
+            return None
+        try:
+            manifest = self._read_manifest(task.id)
+        except OrchestrationError:
+            return None
+        tracks = list(manifest.expected_tracks)
+        if not tracks:
+            return None
+        try:
+            rows = await self._library.get_file_rows_for_album(task.release_group_mbid)
+        except Exception:  # noqa: BLE001 - rows trouble reads as "measure nothing"
+            return None
+        # Adapt ExpectedTrack to the matcher's MusicBrainz Track shape (position/
+        # disc_number/length-ms/recording_id/title) without a network round-trip:
+        # the manifest already IS the requested edition's tracklist.
+        proxies = [
+            SimpleNamespace(
+                position=value.track_number,
+                disc_number=value.disc_number,
+                length=(value.duration_seconds * 1000.0)
+                if value.duration_seconds
+                else None,
+                recording_id=value.recording_mbid,
+                title=value.title,
+            )
+            for value in tracks
+        ]
+        uncovered = uncovered_tracks(rows, proxies)
+        return frozenset(
+            (value.disc_number or 1, value.position) for value in uncovered
+        )
+
     async def _fallback_track_repull(self, task) -> None:  # noqa: ANN001 - DownloadTask
         """Last resort for a per-track download whose every candidate was rejected on
         duration (the MB length is suspect): re-pull the top-ranked source and HOLD its
@@ -1087,7 +1393,7 @@ class DownloadOrchestrator:
             return
         cand = candidates[0]
         # Re-gate before re-pulling: don't fetch a candidate the live policy now rejects.
-        if not self._candidate_passes_quality(cand, task.track_count):
+        if not await self._candidate_passes_quality(task, cand):
             await self._settle_incomplete(task, False)
             return
         await self._store.link_picked_candidate(
@@ -1237,6 +1543,15 @@ class DownloadOrchestrator:
         queue_depths = [
             file.queue_length for file in audio if file.queue_length is not None
         ]
+        decision = getattr(candidate, "quality_decision", None)
+        step = decision.preference_step if decision is not None else None
+        if step is None:
+            # Legacy blob: derive from canonical tier via fidelity rank so the
+            # deadline ordering degrades gracefully pre-backfill.
+            legacy_step = {k: i for i, k in enumerate(
+                ("low", "mp3_192", "mp3_256", "mp3_320", "lossless")
+            )}.get(tier)
+            step = 10_000 - (legacy_step or 0)
         return {
             "format": "/".join(formats) or None,
             "bit_depth": (
@@ -1246,8 +1561,12 @@ class DownloadOrchestrator:
                 rank_sample_rate if all(file.sample_rate for file in audio) else None
             ),
             "queue_depth": max(queue_depths) if queue_depths else None,
-            "pool_key": f"{tier}:{rank_bit_depth}:{rank_sample_rate}",
-            "rank": (tier_rank(tier), rank_bit_depth, rank_sample_rate),
+            # STABLE policy-step key (Acquisition plan): a same-step replacement
+            # never resets the zero-byte clock; only a strictly less-preferred
+            # STEP starts/countinues it.
+            "pool_key": f"step:{step}",
+            "step": step,
+            "rank": (step, tier_rank(tier), rank_bit_depth, rank_sample_rate),
         }
 
     @staticmethod
@@ -1293,7 +1612,7 @@ class DownloadOrchestrator:
             if self._candidate_source_identity(cand) in tried_usernames:
                 continue
             # re-gate: failover must not fall through to a now out-of-policy candidate (D2)
-            if not self._candidate_passes_quality(cand, task.track_count):
+            if not await self._candidate_passes_quality(task, cand):
                 continue
             if lower_than is not None:
                 details = self._candidate_quality_details(cand)
@@ -1422,40 +1741,86 @@ class DownloadOrchestrator:
     def _candidate_source_identity(self, cand) -> str:  # noqa: ANN001 - ScoredCandidate
         return self._strategy(cand.source).candidate_identity(cand)
 
-    def _candidate_passes_quality(self, cand, track_count=None) -> bool:  # noqa: ANN001
-        """Re-check a STORED candidate against the CURRENT quality policy before an
-        AUTOMATIC re-dispatch (failover / track-repull). A policy tightened after the
-        candidate was scored must not be defeated by re-dispatching a now out-of-range
-        stored candidate. Explicit user picks (``pick_candidate``) and ``reimport_task``
-        (an admin re-import of files already fetched by hand) are intentionally NOT gated
-        (owner decision D2). Mirrors the score-time gates: the ``flac_mp3_only`` codec
-        gate + quality range for Soulseek, and the release tier for Usenet; an
-        ``unknown`` tier passes exactly as ``quality_range`` does. Returns True (pass)
-        when unwired or when the tier can't be determined, so behaviour is unchanged by
-        default."""
-        if self._get_download_policy is None:
+    def _stored_snapshot(self, task):  # noqa: ANN001
+        """The task's persisted creation-time snapshot; legacy rows (pre-backfill
+        blobs without JSON) fall back to a migration-tagged derivation from the
+        LIVE getter so they still re-gate against today's range instead of none."""
+        raw = getattr(task, "quality_snapshot_json", None)
+        if raw:
+            try:
+                return _msgspec.json.decode(
+                    raw, type=AcquisitionQualitySnapshot
+                )
+            except ValueError:
+                logger.warning("download.snapshot_decode_failed task=%s", task.id)
+        if self._get_download_policy is not None:
+            return acq_quality.migration_snapshot(self._get_download_policy())
+        return None
+
+    async def _candidate_passes_quality(self, task, cand) -> bool:  # noqa: ANN001
+        """Re-check a STORED candidate under the TASK'S STORED snapshot before an
+        AUTOMATIC re-dispatch (failover / track-repull). Deliberate resolution of
+        live-vs-stored (Acquisition plan): what governed the search governs the
+        re-pull; ``restart-with-current-policy`` is the explicit refresh. Explicit
+        user picks (``pick_candidate``) and ``reimport_task`` are intentionally NOT
+        gated (owner decision D2). Candidates scored after the cutover carry their
+        quality_decision; legacy blobs are re-evaluated from source fields under
+        the SAME snapshot. True when unsnapshotted and unwired, or undeterminable,
+        preserving fail-open behaviour."""
+        snapshot = self._stored_snapshot(task)
+        if snapshot is None:
             return True
-        policy = self._get_download_policy()
+        # Codec gate mirrors the score-time filter for Soulseek folders.
+        if (
+            getattr(snapshot, "flac_mp3_only", False)
+            and cand.source != "usenet"
+        ):
+            from services.native.quality_tiers import is_audio as _is_audio
+            from services.native.quality_tiers import is_flac_or_mp3 as _is_flac
+
+            audio_files = [f for f in cand.files if _is_audio(f)]
+            if audio_files and not all(_is_flac(f) for f in audio_files):
+                return False
+        if cand.quality_evidence is not None:
+            # Post-cutover candidate: its evaluation is embedded in the blob.
+            decision = acq_quality.evaluate(snapshot, cand.quality_evidence)
+            return bool(decision.eligible)
+        # Legacy blob projection.
         if cand.source == "usenet":
             if cand.usenet_release is None or self._usenet_scorer is None:
                 return True  # can't judge -> don't block
-            tier = self._usenet_scorer.release_tier(cand.usenet_release, track_count)
+            from services.native.newznab_release_scorer import _release_evidence
+
+            tier = self._usenet_scorer.release_tier(cand.usenet_release, task.track_count)
+            evidence = _release_evidence(cand.usenet_release, tier)
         elif cand.source == "torrent":
             if cand.torrent_release is None or self._torrent_scorer is None:
                 return True  # can't judge -> don't block
-            tier = self._torrent_scorer.release_tier(cand.torrent_release, track_count)
+            # Torznab is Newznab's torrent variant: same title/category quality
+            # reads, so the release-level evidence projection is shared (the same
+            # reuse TorrentReleaseScorer already makes of the Newznab primitives).
+            from services.native.newznab_release_scorer import _release_evidence
+
+            tier = self._torrent_scorer.release_tier(cand.torrent_release, task.track_count)
+            evidence = _release_evidence(cand.torrent_release, tier)
         else:
+            from services.native.album_preflight_scorer import _file_evidence
+
             audio = [f for f in cand.files if is_audio(f)]
             if not audio:
                 return True  # no judgeable audio -> don't block
-            if getattr(policy, "flac_mp3_only", False) and not all(
-                is_flac_or_mp3(f) for f in audio
-            ):
-                return False
-            tier = candidate_tier(audio)
-        if tier == "unknown":
-            return True
-        return in_range(tier, policy.quality_min, policy.quality_max)
+            decision_files = [_file_evidence(f) for f in audio]
+            merged = acq_quality.evaluate_worst(snapshot, decision_files)
+            evidence = merged.evidence
+        decision = acq_quality.evaluate(snapshot, evidence)
+        return bool(decision.eligible)
+
+    def _candidate_preference_step(self, cand, track_count=None):  # noqa: ANN001
+        """Stable step index for THIS candidate under its own evaluation -
+        the zero-byte fallback deadline keys to this (not (tier,depth,rate))."""
+        if cand.quality_decision is not None:
+            return cand.quality_decision.preference_step
+        return None
 
     async def _mark_candidate_tried(self, task, tried: set) -> None:  # noqa: ANN001
         if task.search_job_id is None or task.candidate_index is None:
@@ -1542,19 +1907,67 @@ class DownloadOrchestrator:
     ) -> bool:  # noqa: ANN001
         """Whether the download has delivered what it set out to. A per-track
         download is one file - complete the moment it imports (Soulseek rips rarely
-        carry the recording MBID, so a tag-based check can't be trusted). An album is
-        complete once the library COVERS the requested release's tracklist (P4:
-        recording/position+duration/title matching - a wrong file at some position
-        can no longer satisfy the request the way the 2026-07-05 single was
-        satisfied), cumulative across failover attempts. When the tracklist is
-        unavailable the pre-P4 count check is the fallback: at least ``track_count``
-        distinct positions present."""
+        carry the recording MBID, so a tag-based check can't be trusted).
+
+        An album is complete once the library COVERS the requested release's tracklist
+        (P4: recording/position+duration/title matching), cumulative across failover
+        attempts. ONE delivery-trust exception guards against tracker drift (#131
+        family, 2026-08): a CLEAN full delivery of the attempt's whole manifest while
+        the requested release-group has ZERO library rows means the rows were stamped
+        under a different RG (import-time identity drift) - holding that against the
+        download loops failover + whole-album re-downloads forever. Rows PRESENT but
+        short or mismatched keep the full P4 veto: a wrong file at a covered position
+        must never satisfy a request (the 2026-07-05 wrong-single incident), and an
+        edition tracklist with bonus tracks keeps failing over for a fuller source.
+
+        When the tracklist itself is unavailable the pre-P4 count check is the
+        fallback: at least ``track_count`` distinct positions present."""
         if task.download_type == "track":
             return imported_any
         coverage = await self._coverage(task, context="completeness")
         if coverage is not None:
             covered, expected_total, _orphans = coverage
-            return covered >= expected_total
+            if covered >= expected_total:
+                return True
+            if (
+                covered == 0
+                and result is not None
+                and result.succeeded
+                and not result.failed
+                and result.management_hold_reason_code is None
+            ):
+                try:
+                    asked = len(self._read_manifest(task.id).target_files)
+                except OrchestrationError:
+                    asked = None
+                rows = []
+                if asked is not None:
+                    try:
+                        rows = await self._library.get_file_rows_for_album(
+                            task.release_group_mbid
+                        )
+                    except Exception:  # noqa: BLE001 - rows trouble reads as "some"
+                        rows = ["unknown"]
+                # A candidate folder smaller than the requested tracklist UNDER-
+                # DELIVERED even when it published cleanly: 'everything asked of THIS
+                # source' is not 'everything requested' (whole-album-repull guard).
+                if (
+                    asked is not None
+                    and not rows
+                    and len(result.succeeded) >= asked
+                    and not (task.track_count and asked < task.track_count)
+                ):
+                    logger.info(
+                        "download.delivery_complete",
+                        extra={
+                            "task_id": task.id,
+                            "delivered": len(result.succeeded),
+                            "manifest_files": asked,
+                            "reason": "no_rows_for_release_group",
+                        },
+                    )
+                    return True
+            return False
         expected = self._expected_track_count(task)
         present = await self._imported_track_count(task)
         if expected > 0:
@@ -1572,21 +1985,25 @@ class DownloadOrchestrator:
         *,
         source_missing: bool = False,
         import_failed: bool = False,
+        tag_mismatch: bool = False,
         process_result=None,
     ) -> None:
         """No candidates/attempts left and the download still isn't whole. A track
         either imported (already finalized 'completed') or it didn't ('failed'); an
         album keeps whatever landed as 'partial', or 'failed' if nothing did.
 
-        ``source_missing``/``import_failed`` flip the failure message off the default
-        'no source on Soulseek': slskd delivered the files but we either couldn't find
-        them on the mount (config) or couldn't write them into the library (perms/disk).
-        Both are local faults - blaming Soulseek sent users chasing the wrong problem
-        (AUD: 'watched it finish in slskd, then it said no source')."""
+        ``source_missing``/``import_failed``/``tag_mismatch`` flip the failure message
+        off the default 'no source on Soulseek': slskd delivered the files but we either
+        couldn't find them on the mount (config), couldn't write them into the library
+        (perms/disk), or found files whose embedded tags identify different music.
+        Local faults take precedence over a content mismatch, and both take precedence
+        over the generic no-source message."""
         if source_missing:
             fail_msg = _FILES_NOT_FOUND_MSG
         elif import_failed:
             fail_msg = _IMPORT_FAILED_MSG
+        elif tag_mismatch:
+            fail_msg = _TAG_MISMATCH_MSG
         else:
             fail_msg = self._no_source_message()
         if task.download_type == "track":
@@ -1742,14 +2159,7 @@ class DownloadOrchestrator:
         await self._sync_request_on_terminal(task, status)
 
     async def _sync_request_on_terminal(self, task, status: str) -> None:  # noqa: ANN001
-        """Bridge a terminal download status into the linked request + caches, so a
-        request no longer sticks on 'Pending' forever and a completed album flips to
-        In-Library without a manual reload.
-
-        Keyed on ``download_task_id == task.id``: a request is only touched by the
-        task that actually dispatched it, so a stray per-track download of an album
-        can't flip that album's request. Monitor/orphan downloads (no request row)
-        are a safe no-op."""
+        """Bridge a terminal download status into its exact request generation."""
         mapping = {
             DownloadStatus.COMPLETED: "imported",
             DownloadStatus.PARTIAL: "incomplete",
@@ -1776,27 +2186,41 @@ class DownloadOrchestrator:
         if self._request_history is None:
             return
         try:
-            record = await self._request_history.async_get_record(
-                task.release_group_mbid
+            # The task ID is the only identifier shared by album and exact-track
+            # requests. Looking up by MBID would silently default tracks to album.
+            record = await self._request_history.async_get_record_by_download_task_id(
+                task.id
             )
         except Exception:  # noqa: BLE001 - request sync must never fail the download
-            logger.warning("Could not load request for %s", task.release_group_mbid)
+            logger.warning("Could not load request for task %s", task.id)
             return
         if record is None or getattr(record, "download_task_id", None) != task.id:
             return
         from datetime import datetime, timezone
 
+        request_kind = getattr(record, "request_kind", "album")
         completed_at = (
             datetime.now(timezone.utc).isoformat()
             if new_status in ("imported", "failed", "cancelled")
             else None
         )
+        kwargs: dict[str, object] = {
+            "completed_at": completed_at,
+            "request_kind": request_kind,
+        }
+        generation = _generation_of(record)
+        if generation is not None:
+            kwargs["expected_generation"] = generation
         try:
-            await self._request_history.async_update_status(
-                record.musicbrainz_id, new_status, completed_at=completed_at
+            changed = await self._request_history.async_update_status(
+                record.musicbrainz_id,
+                new_status,
+                **kwargs,
             )
-            # An import (full or partial) added library files - bust the album/library
-            # caches and materialise the album row so the UI reflects it.
+            if changed is False:
+                return
+            # An import (full or partial) added library files - bust the
+            # album/library caches and materialise the row for the UI.
             if new_status in ("imported", "incomplete") and self._on_import is not None:
                 await self._on_import(record)
         except Exception:  # noqa: BLE001
@@ -2139,6 +2563,25 @@ class DownloadOrchestrator:
                 "Only failed, cancelled or partial downloads can be retried"
             )
 
+        # The library may already cover the request (an earlier attempt imported it
+        # while the task stayed partial, or the user moved files in by hand): settling
+        # COMPLETED is honest and beats re-downloading the whole album (#131).
+        if task.download_type == "album" and task.release_group_mbid:
+            coverage = await self._coverage(task, context="manual_retry_skip")
+            if coverage is not None:
+                covered, expected_total, _orphans = coverage
+                if expected_total > 0 and covered >= expected_total:
+                    logger.info(
+                        "download.retry_already_satisfied",
+                        extra={
+                            "task_id": task.id,
+                            "expected": expected_total,
+                            "covered": covered,
+                        },
+                    )
+                    await self._finalize(task, DownloadStatus.COMPLETED)
+                    return task.id
+
         # Manual retry is an explicit "try again": clear the album's blocklist so a release
         # quarantined by the failed attempt is reconsidered. Album downloads only - a
         # per-track retry must not wipe the whole album's blocklist. Auto-retry
@@ -2304,6 +2747,8 @@ class DownloadOrchestrator:
                     fail_msg = _FILES_NOT_FOUND_MSG
                 elif any(f.reason == IMPORT_FAILED for f in result.failed):
                     fail_msg = _IMPORT_FAILED_MSG
+                elif any(f.reason == "tag_mismatch" for f in result.failed):
+                    fail_msg = _TAG_MISMATCH_MSG
                 else:
                     fail_msg = _NO_SOURCE_MSG
                 await self._finalize(
@@ -2350,38 +2795,77 @@ class DownloadOrchestrator:
             # everything else becomes 'retry' so quota counts ignore it.
             origin=task.origin if task.origin == "upgrade" else "retry",
             retry_count=task.retry_count + 1,
+            # Retry REUSES the stored snapshot (spec): the original policy
+            # governs; restart-with-current-policy is the explicit refresh.
+            quality_snapshot_json=getattr(task, "quality_snapshot_json", None),
+            quality_snapshot_hash=getattr(task, "quality_snapshot_hash", None),
+            quality_snapshot_summary=getattr(task, "quality_snapshot_summary", None),
+            quality_preference_step=getattr(task, "quality_preference_step", None),
         )
-        await self._relink_request(task, new_task.id)
-        self.dispatch(new_task.id)
+        # The retried task owns its staging dir from birth (#285 class): every
+        # manifest write in the enqueue path targets <staging>/<new_id>/, and a
+        # missing parent must never be able to fail a retry before its transfer
+        # even starts. Strategies mkdir too; this is the belt to their braces.
+        await asyncio.to_thread(
+            lambda: (self._staging / new_task.id).mkdir(parents=True, exist_ok=True)
+        )
+        linked = await self._relink_request(task, new_task.id)
+        if linked:
+            self.dispatch(new_task.id)
         return new_task.id
 
-    async def _relink_request(self, task, new_task_id: str) -> None:  # noqa: ANN001 - DownloadTask
-        """Point the linked request at the replacement task. Without this a retried
-        download imports the album but ``_sync_request_on_terminal`` (keyed on
-        ``download_task_id == task.id``) ignores the new task, so the request stays
-        ``failed`` and the import cache-bust never fires. Album downloads only, and
-        only when THIS task still owns the link - a per-track retry must not hijack
-        the album's request, and a request already re-linked to a newer task is left
-        alone."""
-        if (
-            self._request_history is None
-            or task.download_type != "album"
-            or not task.release_group_mbid
-        ):
-            return
+
+    async def _locate_track_request(self, task) -> object | None:  # noqa: ANN001 - DownloadTask
+        """The exact-track history row tied to ``task`` - looked up by the old
+        download task ID first, then by its recording-MBID key."""
+        record = await self._request_history.async_get_record_by_download_task_id(
+            task.id, request_kind="track"
+        )
+        if record is not None or not task.recording_mbid:
+            return record
+        return await self._request_history.async_get_record(
+            task.recording_mbid, request_kind="track"
+        )
+
+    async def _relink_request(self, task, new_task_id: str) -> bool:  # noqa: ANN001 - DownloadTask
+        """Point the linked request - album or exact-track - at the replacement
+        task via its generation CAS. Exact-track retries relink only their own
+        ``request_kind='track'`` row, never an album row. Losing the CAS means a
+        newer retry/re-request owns this generation: the fresh task is cancelled
+        instead of racing that successor unlinked."""
+        if self._request_history is None:
+            return True
         try:
-            record = await self._request_history.async_get_record(
-                task.release_group_mbid
-            )
-            if (
-                record is not None
-                and getattr(record, "download_task_id", None) == task.id
-            ):
-                await self._request_history.async_update_download_task_id(
-                    record.musicbrainz_id, new_task_id
+            kwargs: dict[str, object] = {}
+            if task.download_type == "track":
+                record = await self._locate_track_request(task)
+                kwargs["request_kind"] = "track"
+            elif task.release_group_mbid:
+                record = await self._request_history.async_get_record(
+                    task.release_group_mbid
                 )
+            else:
+                return True
+            if (
+                record is None
+                or getattr(record, "download_task_id", None) != task.id
+            ):
+                return True
+            generation = _generation_of(record)
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            linked = await self._request_history.async_update_download_task_id(
+                record.musicbrainz_id,
+                new_task_id,
+                **kwargs,
+            )
+            if linked is False:
+                await self.cancel_task(new_task_id, task.user_id, "user")
+                return False
+            return True
         except Exception:  # noqa: BLE001 - re-link must never fail the retry
             logger.warning("Could not re-link request for retry of %s", task.id)
+            return True
 
     @property
     def auto_retry_max(self) -> int:
@@ -2466,6 +2950,25 @@ class DownloadOrchestrator:
                     "release_group_mbid": task.release_group_mbid,
                 },
             )
+            # The library may already cover the request (#131): an earlier attempt
+            # imported the album while the task stayed partial, or the user moved the
+            # files in by hand. Settling COMPLETED here is honest and stops the
+            # 15-minute re-download loop at its trigger instead of after it.
+            if task.download_type == "album" and task.release_group_mbid:
+                coverage = await self._coverage(task, context="auto_retry_skip")
+                if coverage is not None:
+                    covered, expected_total, _orphans = coverage
+                    if expected_total > 0 and covered >= expected_total:
+                        logger.info(
+                            "download.auto_retry_already_satisfied",
+                            extra={
+                                "task_id": task.id,
+                                "expected": expected_total,
+                                "covered": covered,
+                            },
+                        )
+                        await self._finalize(task, DownloadStatus.COMPLETED)
+                        continue
             await self._bus.publish(
                 f"download:{task.id}",
                 "auto_retry",

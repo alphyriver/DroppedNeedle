@@ -1,10 +1,11 @@
-import { createQuery } from '@tanstack/svelte-query';
+import { createQuery, queryOptions } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { api } from '$lib/api/client';
 import { API, CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
+import { ttl } from '$lib/stores/cacheTtl.svelte';
 import type {
 	Album,
 	Artist,
@@ -19,39 +20,51 @@ import type {
 import { SearchQueryKeyFactory } from './SearchQueryKeyFactory';
 
 const enabled = (query: string) => Boolean(authStore.user?.id && query.trim().length >= 2);
-const successfulSearchStaleTime = (query: { state: { data?: { status?: string } } }) =>
-	query.state.data?.status === 'ok' ? CACHE_TTL.SEARCH : 0;
-const successfulSuggestStaleTime = (query: { state: { data?: { remote_status?: string } } }) =>
-	query.state.data?.remote_status === 'ok' ? CACHE_TTL.SEARCH : 0;
 
-export const getLocalArtistSearchQuery = (getQuery: Getter<string>, limit = 24) =>
-	createQuery(() => {
-		const query = getQuery().trim();
-		return {
-			enabled: enabled(query),
-			staleTime: CACHE_TTL.SEARCH,
-			queryKey: SearchQueryKeyFactory.localArtists(authStore.user?.id, query, limit),
-			queryFn: ({ signal }) =>
-				api.global.get<NativeArtistsResponse>(API.library.artists(limit, 0, 'name', 'asc', query), {
-					signal
-				})
-		};
+// B6: a failed remote search used to collapse staleTime to 0, so every tab return during a
+// provider outage re-ran the backend MB fan-out. Failures now hold a short floor instead;
+// success paths are byte-identical (full SEARCH window).
+export const SEARCH_FAILURE_STALE_TIME_MS = 60_000;
+export const successfulSearchStaleTime = (query: { state: { data?: { status?: string } } }) =>
+	query.state.data?.status === 'ok'
+		? ttl('search', CACHE_TTL.SEARCH)
+		: SEARCH_FAILURE_STALE_TIME_MS;
+export const successfulSuggestStaleTime = (query: {
+	state: { data?: { remote_status?: string } };
+}) =>
+	query.state.data?.remote_status === 'ok'
+		? ttl('search', CACHE_TTL.SEARCH)
+		: SEARCH_FAILURE_STALE_TIME_MS;
+
+// B7 prefetch surface: the two LOCAL buckets are warmed from routes/search/+page.ts.
+export const getLocalArtistSearchQueryOptions = (query: string, limit = 24) =>
+	queryOptions({
+		enabled: enabled(query),
+		staleTime: ttl('search', CACHE_TTL.SEARCH),
+		queryKey: SearchQueryKeyFactory.localArtists(authStore.user?.id, query, limit),
+		queryFn: ({ signal }) =>
+			api.global.get<NativeArtistsResponse>(API.library.artists(limit, 0, 'name', 'asc', query), {
+				signal
+			})
 	});
 
-export const getLocalAlbumSearchQuery = (getQuery: Getter<string>, limit = 24) =>
-	createQuery(() => {
-		const query = getQuery().trim();
-		return {
-			enabled: enabled(query),
-			staleTime: CACHE_TTL.SEARCH,
-			queryKey: SearchQueryKeyFactory.localAlbums(authStore.user?.id, query, limit),
-			queryFn: ({ signal }) =>
-				api.global.get<NativeAlbumsResponse>(
-					API.library.albums(1, 'recent', query, undefined, limit),
-					{ signal }
-				)
-		};
+export const getLocalArtistSearchQuery = (getQuery: Getter<string>, _limit = 24) =>
+	createQuery(() => getLocalArtistSearchQueryOptions(getQuery().trim()));
+
+export const getLocalAlbumSearchQueryOptions = (query: string, limit = 24) =>
+	queryOptions({
+		enabled: enabled(query),
+		staleTime: ttl('search', CACHE_TTL.SEARCH),
+		queryKey: SearchQueryKeyFactory.localAlbums(authStore.user?.id, query, limit),
+		queryFn: ({ signal }) =>
+			api.global.get<NativeAlbumsResponse>(
+				API.library.albums(1, 'recent', query, undefined, limit),
+				{ signal }
+			)
 	});
+
+export const getLocalAlbumSearchQuery = (getQuery: Getter<string>, _limit = 24) =>
+	createQuery(() => getLocalAlbumSearchQueryOptions(getQuery().trim()));
 
 export const getRemoteArtistSearchQuery = (getQuery: Getter<string>, limit = 6) =>
 	createQuery(() => {

@@ -13,8 +13,11 @@
 	import LastFmEnrichment from '$lib/components/LastFmEnrichment.svelte';
 	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
+	import LocalArtistPage from './LocalArtistPage.svelte';
+	import { getLibraryArtistDetailQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { libraryStore } from '$lib/stores/library';
 	import { type MusicSource, isMusicSource } from '$lib/stores/musicSource';
 	import {
@@ -114,7 +117,12 @@
 		}
 		return null;
 	});
-
+	// MusicBrainz-down fallback: the library artist endpoint is MB-free, so a
+	// locally known artist still renders (and plays) when the provider fetch
+	// fails. The service_status stamp on the degraded payload drives the
+	// global banner; this branch covers cold caches and restarts.
+	const localArtistDetailQuery = getLibraryArtistDetailQuery(() => data.artistId);
+	const degradedLocalArtist = $derived(localArtistDetailQuery.data ?? null);
 	const artist = $derived.by(() => {
 		if (!artistBasic) return null;
 		return {
@@ -142,17 +150,22 @@
 		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
 	}
 
+	const providerReleaseRequest = requestAlbum();
+
 	async function handleRequest(releaseId: string, releaseTitle?: string) {
 		requestedReleaseIds.add(releaseId);
 		requestedReleaseIds = requestedReleaseIds;
 
 		try {
-			const result = await requestAlbum(releaseId, {
-				artist: artist?.name,
-				album: releaseTitle
-			});
+			const result = await providerReleaseRequest
+				.mutateAsync({
+					release_group_mbid: releaseId,
+					artist_name: artist?.name,
+					album_title: releaseTitle
+				})
+				.catch(() => null);
 
-			if (result.success && artist) {
+			if (result?.success && artist) {
 				await updateArtistReleaseInCache(data.artistId, {
 					id: releaseId,
 					requested: true
@@ -231,7 +244,17 @@
 </script>
 
 <div class="w-full px-2 sm:px-4 lg:px-8 py-4 sm:py-8 max-w-7xl mx-auto">
-	{#if error}
+	{#if artistBasicQuery.error && degradedLocalArtist}
+		<div class="mb-4 flex justify-center">
+			<div class="alert alert-info text-sm">
+				<span
+					>MusicBrainz is unreachable right now, so this page is built from your local files. Some
+					extras are hidden until it returns.</span
+				>
+			</div>
+		</div>
+		<LocalArtistPage artistId={degradedLocalArtist.id} />
+	{:else if error}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
 				<span>{error}</span>
@@ -284,7 +307,7 @@
 						<div class="flex flex-wrap gap-2 justify-center sm:justify-start -mt-2">
 							{#each [...new Set(artist.tags)].slice(0, 10) as tag (tag)}
 								<a
-									href="/genre?name={encodeURIComponent(tag)}"
+									href={withBasePath(`/genre?name=${encodeURIComponent(tag)}`)}
 									class="badge badge-lg cursor-pointer hover:opacity-80 transition-opacity"
 									style="background-color: {colors.primary}; color: {colors.secondary};">{tag}</a
 								>

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import random
 import time
 from enum import Enum
@@ -8,8 +9,8 @@ from typing import Awaitable, Callable, TypeVar, ParamSpec, Optional
 
 logger = logging.getLogger(__name__)
 
-P = ParamSpec('P')
-T = TypeVar('T')
+P = ParamSpec("P")
+T = TypeVar("T")
 
 
 class CircuitState(Enum):
@@ -18,7 +19,9 @@ class CircuitState(Enum):
     HALF_OPEN = "half_open"
 
 
-CircuitStateChangeCallback = Callable[["CircuitBreaker", CircuitState, CircuitState, str], None]
+CircuitStateChangeCallback = Callable[
+    ["CircuitBreaker", CircuitState, CircuitState, str], None
+]
 
 # The per-call "breaker is OPEN" warning is rate-limited so a hot retry loop
 # cannot flood the logs while the breaker stays open; the CircuitOpenError
@@ -27,7 +30,6 @@ OPEN_WARNING_INTERVAL_SECONDS = 30.0
 
 
 class CircuitBreaker:
-    
     def __init__(
         self,
         failure_threshold: int = 5,
@@ -42,7 +44,7 @@ class CircuitBreaker:
         self.name = name
         self._on_state_change = on_state_change
         self._lock = asyncio.Lock()
-        
+
         self.failure_count = 0
         self.success_count = 0
         self.last_failure_time: float = 0
@@ -65,7 +67,7 @@ class CircuitBreaker:
                 "Circuit breaker '%s' state change callback failed",
                 self.name,
             )
-    
+
     def is_open(self) -> bool:
         if self.state == CircuitState.OPEN:
             if time.time() - self.last_failure_time > self.timeout:
@@ -77,13 +79,24 @@ class CircuitBreaker:
             return True
         return False
 
+    def remaining_open_seconds(self) -> float:
+        if self.state != CircuitState.OPEN:
+            return 0.0
+        elapsed = time.time() - self.last_failure_time
+        remaining = self.timeout - elapsed
+        return max(0.0, remaining)
+
+    async def aremaining_open_seconds(self) -> float:
+        async with self._lock:
+            return self.remaining_open_seconds()
+
     def should_log_open_warning(self) -> bool:
         now = time.monotonic()
         if now - self._last_open_warning < OPEN_WARNING_INTERVAL_SECONDS:
             return False
         self._last_open_warning = now
         return True
-    
+
     def record_success(self):
         if self.state == CircuitState.HALF_OPEN:
             self.success_count += 1
@@ -92,13 +105,24 @@ class CircuitBreaker:
                 self.state = CircuitState.CLOSED
                 self.failure_count = 0
                 self.success_count = 0
-                self._notify_state_change(previous_state, self.state, "success_threshold_reached")
+                self._notify_state_change(
+                    previous_state, self.state, "success_threshold_reached"
+                )
         elif self.state == CircuitState.CLOSED:
             self.failure_count = 0
-    
+
     def record_failure(self):
+        """One breaker outcome per LOGICAL call (QW11 Part 1 contract).
+
+        ``with_retry`` calls this exactly once, after the final attempt of a
+        logical call - never once per attempt - so ``failure_threshold``
+        means "5 bad calls", not "5 bad attempts". HALF_OPEN is deliberately
+        conservative: a single probe failure reopens immediately instead of
+        waiting out the full threshold, because the provider just failed on
+        its first real request after the timeout window.
+        """
         self.last_failure_time = time.time()
-        
+
         if self.state == CircuitState.HALF_OPEN:
             logger.warning(
                 "Circuit breaker '%s' reopening after failure in HALF_OPEN",
@@ -119,17 +143,19 @@ class CircuitBreaker:
                 )
                 previous_state = self.state
                 self.state = CircuitState.OPEN
-                self._notify_state_change(previous_state, self.state, "failure_threshold_reached")
-    
+                self._notify_state_change(
+                    previous_state, self.state, "failure_threshold_reached"
+                )
+
     def get_state(self) -> dict:
         return {
             "name": self.name,
             "state": self.state.value,
             "failure_count": self.failure_count,
             "success_count": self.success_count,
-            "last_failure_time": self.last_failure_time
+            "last_failure_time": self.last_failure_time,
         }
-    
+
     def reset(self):
         previous_state = self.state
         self.state = CircuitState.CLOSED
@@ -152,7 +178,10 @@ class CircuitBreaker:
         if self.state != CircuitState.OPEN:
             return
         async with self._lock:
-            if self.state == CircuitState.OPEN and time.time() - self.last_failure_time > self.timeout:
+            if (
+                self.state == CircuitState.OPEN
+                and time.time() - self.last_failure_time > self.timeout
+            ):
                 previous_state = self.state
                 self.state = CircuitState.HALF_OPEN
                 self.success_count = 0
@@ -160,9 +189,24 @@ class CircuitBreaker:
 
 
 class CircuitOpenError(Exception):
-    def __init__(self, message: str, breaker_name: str = ""):
+    def __init__(
+        self,
+        message: str,
+        breaker_name: str = "",
+        retry_after_seconds: float | None = None,
+    ):
         super().__init__(message)
         self.breaker_name = breaker_name
+        try:
+            value = (
+                float(retry_after_seconds) if retry_after_seconds is not None else None
+            )
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value) or value <= 0:
+            self.retry_after_seconds: float | None = None
+        else:
+            self.retry_after_seconds = value
 
 
 def _get_retry_after_seconds(exception: Exception) -> Optional[float]:
@@ -188,76 +232,123 @@ def with_retry(
     retriable_exceptions: tuple = (Exception,),
     non_breaking_exceptions: tuple = (),
     non_retriable_exceptions: tuple = (),
+    retry_budget_seconds: float | None = None,
 ):
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
+    if retry_budget_seconds is not None and (
+        not math.isfinite(retry_budget_seconds) or retry_budget_seconds <= 0
+    ):
+        raise ValueError("retry_budget_seconds must be a positive finite number")
 
     def decorator(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+        # QW11 Part 1: report once per logical call - after the final attempt,
+        # not per retry, so a 3-attempt failure chain bumps failure_count once.
+        # See ``CircuitBreaker.record_failure`` for HALF_OPEN policy.
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             service_name = circuit_breaker.name if circuit_breaker else "unknown"
             func_name = func.__name__
-            
+
             if circuit_breaker:
                 await circuit_breaker.atry_transition()
+                retry_after = await circuit_breaker.aremaining_open_seconds()
                 if circuit_breaker.is_open():
                     if circuit_breaker.should_log_open_warning():
                         logger.warning(
                             "Circuit breaker '%s' is OPEN",
                             circuit_breaker.name,
-                            extra={"service_name": service_name, "function": func_name}
+                            extra={"service_name": service_name, "function": func_name},
                         )
+                    if (
+                        retry_after is None
+                        or not math.isfinite(retry_after)
+                        or retry_after <= 0
+                    ):
+                        retry_after = circuit_breaker.timeout
+                        if not math.isfinite(retry_after) or retry_after <= 0:
+                            retry_after = None
                     raise CircuitOpenError(
                         f"Circuit breaker '{circuit_breaker.name}' is OPEN",
                         breaker_name=circuit_breaker.name,
+                        retry_after_seconds=retry_after,
                     )
-            
+
             last_exception = None
-            
+            attempts_made = 0
+            started_at = time.monotonic()
+            should_log_failure = False
+
             for attempt in range(1, max_attempts + 1):
+                attempts_made = attempt
                 try:
                     result = await func(*args, **kwargs)
-                    
+
                     if circuit_breaker:
                         await circuit_breaker.arecord_success()
-                    
+
                     return result
-                
+
                 except retriable_exceptions as e:
                     last_exception = e
 
                     if non_retriable_exceptions and isinstance(
                         e, non_retriable_exceptions
                     ):
-                        # deterministic failure (e.g. a payload that can never
-                        # decode); retrying it only wastes provider quota
+                        should_log_failure = not (
+                            non_breaking_exceptions
+                            and isinstance(e, non_breaking_exceptions)
+                        )
                         break
 
                     if attempt >= max_attempts:
-                        logger.error(
-                            "%s failed after %d attempts: %s",
-                            func_name,
-                            max_attempts,
-                            e,
-                        )
+                        should_log_failure = True
                         break
 
                     retry_after_override = _get_retry_after_seconds(e)
                     if retry_after_override is not None:
                         delay = retry_after_override
                     else:
-                        delay = min(base_delay * (exponential_base ** (attempt - 1)), max_delay)
+                        delay = min(
+                            base_delay * (exponential_base ** (attempt - 1)),
+                            max_delay,
+                        )
                         if jitter:
-                            delay *= (0.5 + random.random())
-                    
+                            delay *= 0.5 + random.random()
+
+                    if retry_budget_seconds is not None:
+                        elapsed = time.monotonic() - started_at
+                        remaining = retry_budget_seconds - elapsed
+                        if remaining <= 0 or delay >= remaining:
+                            should_log_failure = True
+                            break
+
                     await asyncio.sleep(delay)
-            
-            if circuit_breaker and last_exception:
-                is_non_breaking = isinstance(last_exception, non_breaking_exceptions) if non_breaking_exceptions else False
+
+            if last_exception is None:
+                raise RuntimeError(f"{func_name} retry loop ended without an exception")
+
+            if should_log_failure:
+                logger.error(
+                    "%s failed after %d attempt%s (%s): %s",
+                    func_name,
+                    attempts_made,
+                    "" if attempts_made == 1 else "s",
+                    type(last_exception).__name__,
+                    last_exception,
+                )
+
+            if circuit_breaker:
+                is_non_breaking = (
+                    isinstance(last_exception, non_breaking_exceptions)
+                    if non_breaking_exceptions
+                    else False
+                )
                 if not is_non_breaking:
                     await circuit_breaker.arecord_failure()
 
             raise last_exception
-        
+
         return wrapper
+
     return decorator

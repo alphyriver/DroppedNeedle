@@ -2,13 +2,14 @@ import { createMutation, createQuery } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 
 import { api } from '$lib/api/client';
+import { CACHE_TTL } from '$lib/constants';
 import { DownloadQueryKeyFactory } from '$lib/queries/downloads/DownloadQueryKeyFactory';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { authStore } from '$lib/stores/authStore.svelte';
 import type { AlbumEditionsResponse, EditionAcquireResponse } from '$lib/types';
 
-// Album edition selection (CollectionManagement Feature E). The picker is an
-// admin/trusted surface; viewing the list is open to any authenticated user.
+// CollectionManagement Feature E: the picker is an admin/trusted surface,
+// viewing the list is open to any authenticated user.
 
 const editionsUrl = (mbid: string) => `/api/v1/albums/${encodeURIComponent(mbid)}/editions`;
 const pinUrl = (mbid: string) => `/api/v1/albums/${encodeURIComponent(mbid)}/edition`;
@@ -19,6 +20,7 @@ export const getAlbumEditionsQuery = (mbid: Getter<string>, enabled: Getter<bool
 	createQuery(() => ({
 		queryKey: editionsKey(mbid()),
 		enabled: enabled() && !!mbid(),
+		staleTime: CACHE_TTL.ALBUM_DETAIL_EDITIONS,
 		queryFn: ({ signal }) => api.global.get<AlbumEditionsResponse>(editionsUrl(mbid()), { signal })
 	}));
 

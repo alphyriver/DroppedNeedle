@@ -96,12 +96,13 @@ def library_policy_prefixes() -> list[str]:
 
 
 def library_identification_prefixes() -> list[str]:
+    # ST1 note: LIBRARY_ARTIST_IMAGE_PREFIX / LIBRARY_ALBUM_IMAGE_PREFIX were
+    # removed - repo-wide grep found zero writers (only sweeps), so sweeping
+    # them was dead weight. Restore alongside a real writer if one appears.
     return [
         LIBRARY_PREFIX,
-        LIBRARY_ARTIST_IMAGE_PREFIX,
         LIBRARY_ARTIST_DETAILS_PREFIX,
         LIBRARY_ARTIST_ALBUMS_PREFIX,
-        LIBRARY_ALBUM_IMAGE_PREFIX,
         LIBRARY_ALBUM_DETAILS_PREFIX,
         LIBRARY_ALBUM_TRACKS_PREFIX,
         LIBRARY_TRACKFILE_PREFIX,
@@ -123,6 +124,34 @@ def library_identification_prefixes() -> list[str]:
         ARTIST_DISCOVERY_PREFIX,
         DISCOVER_QUEUE_ENRICH_PREFIX,
         SOURCE_RESOLUTION_PREFIX,
+    ]
+
+
+def catalog_entity_prefixes() -> list[str]:
+    """ST1: the slice of library_identification_prefixes() whose keys are
+    shaped ``{prefix}{mbid}`` and therefore deletable per entity. Shape
+    verified against every remaining delete/write site (e.g.
+    album_service refresh_album, service_providers import hook); MBID values
+    never contain ':', so the concatenation is unambiguous."""
+    return [
+        ARTIST_INFO_PREFIX,
+        ALBUM_INFO_PREFIX,
+        ALBUM_TRACKS_INFO_PREFIX,
+        LIBRARY_ARTIST_DETAILS_PREFIX,
+        LIBRARY_ARTIST_ALBUMS_PREFIX,
+        LIBRARY_ALBUM_DETAILS_PREFIX,
+    ]
+
+
+def catalog_list_prefixes() -> list[str]:
+    """ST1 complement: cheap locally-rebuilt snapshots plus the legacy
+    LIBRARY_ALBUM_TRACKS/trackfile prefixes (kept bulk because their writers
+    could not be confirmed to use bare ``{id}`` key shapes - see grep notes in
+    the ST1 ledger entry). Partition of library_identification_prefixes()
+    once the two dead image prefixes are excluded."""
+    entity = set(catalog_entity_prefixes())
+    return [
+        prefix for prefix in library_identification_prefixes() if prefix not in entity
     ]
 
 
@@ -161,6 +190,10 @@ def musicbrainz_prefixes() -> list[str]:
         MB_DUPLICATE_SEARCH_PREFIX,
         MB_RELEASE_EDITION_SEARCH_PREFIX,
         MB_MANAGEMENT_RELEASE_PREFIX,
+        # QW10/C2: ALBUM_INFO is an MB-derived composite (RG lookup + release
+        # enrichments) exactly like ALBUM_TRACKS_INFO - a mirror/endpoint
+        # switch must re-cold both together or pages mix pre/post-switch data.
+        ALBUM_INFO_PREFIX,
         ALBUM_TRACKS_INFO_PREFIX,
     ]
 
@@ -292,6 +325,17 @@ def mb_artist_detail_key(mbid: str) -> str:
 
 def mb_artist_release_groups_key(artist_mbid: str) -> str:
     return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}"
+
+
+def mb_artist_rgs_browse_key(artist_mbid: str, limit: int) -> str:
+    """Key for the single-page artist->release-groups browse (QW1).
+
+    Extends MB_ARTIST_RGS_PREFIX, so it is swept by musicbrainz_prefixes()
+    consumers without any new prefix-list membership. Collision-safe: the
+    sibling builder above stores bare casefolded MBIDs and MBIDs never
+    contain ':', so the ':browse:' segment cannot collide.
+    """
+    return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}:browse:{limit}"
 
 
 def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str:

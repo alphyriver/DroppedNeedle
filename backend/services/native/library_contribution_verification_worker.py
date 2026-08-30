@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import math
 import time
 import uuid
-
-from core.exceptions import ExternalServiceError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    InvalidExternalPayloadError,
+    ResourceNotFoundError,
+)
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.resilience.retry import CircuitOpenError
 from models.identification import IdentificationAttempt, IdentificationEvidenceRecord
 from models.library_contribution import ContributionRecord
 from repositories.protocols.musicbrainz import MusicBrainzRepositoryProtocol
@@ -18,6 +23,11 @@ MAX_AUTOMATIC_WINDOW_SECONDS = 2 * 60 * 60
 MAX_AUTOMATIC_ATTEMPTS = 10
 MAX_RETRY_SECONDS = 10 * 60
 CLEANUP_INTERVAL_SECONDS = 60 * 60
+# Deterministic MusicBrainz payload-shape failure (InvalidExternalPayloadError).
+# Owner option A (2026-08-20): review immediately, breaker stays closed, no provider
+# resurrection, manual retry_verification after an application update. Kept local to the
+# contribution path; F-IDENT-02 owns the eventual shared constant (identical spelling).
+UNMAPPABLE_PROVIDER_PAYLOAD = "UNMAPPABLE_PROVIDER_PAYLOAD"
 
 
 class LibraryContributionVerificationWorker:
@@ -85,6 +95,38 @@ class LibraryContributionVerificationWorker:
                 contribution.result_release_mbid,
                 priority=RequestPriority.BACKGROUND_SYNC,
                 bypass_cache=True,
+            )
+        except InvalidExternalPayloadError:
+            # Deterministic, schema-level payload problem: review immediately and do not
+            # retry (the shape will not change until the model is updated; the shared
+            # breaker stays closed and the row is never provider-resurrected). Manual
+            # retry_verification becomes available after an application update.
+            return await self._finish_without_candidate(
+                job,
+                job_revision=job_revision,
+                worker_id=worker_id,
+                contribution=contribution,
+                failure_code=UNMAPPABLE_PROVIDER_PAYLOAD,
+                now=timestamp,
+            )
+        except CircuitOpenError as exc:
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            try:
+                cand = float(retry_after) if retry_after is not None else None
+                if cand is None or not math.isfinite(cand) or cand <= 0:
+                    retry_after = None
+                else:
+                    retry_after = cand
+            except (TypeError, ValueError):
+                retry_after = None
+            return await self._retry_or_review(
+                job,
+                job_revision=job_revision,
+                worker_id=worker_id,
+                contribution=contribution,
+                failure_code="MUSICBRAINZ_TEMPORARILY_UNAVAILABLE",
+                now=timestamp,
+                retry_after_seconds=retry_after,
             )
         except ExternalServiceError:
             return await self._retry_or_review(
@@ -183,6 +225,7 @@ class LibraryContributionVerificationWorker:
         contribution: ContributionRecord,
         failure_code: str,
         now: float,
+        retry_after_seconds: float | None = None,
     ) -> str:
         received_at = contribution.result_received_at or now
         attempts = int(job["attempt_count"])
@@ -191,6 +234,13 @@ class LibraryContributionVerificationWorker:
             and now - received_at < MAX_AUTOMATIC_WINDOW_SECONDS
         ):
             delay = min(MAX_RETRY_SECONDS, 15 * (2 ** min(attempts - 1, 6)))
+            if retry_after_seconds is not None:
+                try:
+                    cand = float(retry_after_seconds)
+                    if math.isfinite(cand) and cand > 0:
+                        delay = max(delay, cand)
+                except (TypeError, ValueError):
+                    pass
             await self._store.retry_library_contribution_verification(
                 job_id=str(job["id"]),
                 worker_id=worker_id,

@@ -320,7 +320,7 @@ async def test_pick_candidate_missing_job_raises_not_found():
         await service.pick_candidate("u1", "job1", 0)
 
 
-# --- single-track identity threading + parked-task resume (2026-07-05 incident, P1) ---
+# single-track identity threading + parked-task resume (2026-07-05 incident, P1)
 
 
 def _single_album_service(*, tracks=None, total=1, fail=False):
@@ -972,7 +972,7 @@ def test_mount_reason_prefers_a_known_boundary_over_a_stat_error(tmp_path, monke
     assert status.reason == "different_filesystem"
 
 
-# -- held imports (import anyway / discard) --
+# held imports (import anyway / discard)
 
 
 def _held_service(store, file_processor, library_reconciler=None, album_service=None):
@@ -1864,3 +1864,67 @@ async def test_torrent_only_manual_search_and_scout_use_torrent_pipeline():
     assert scouted == [torrent_candidate]
     assert torrent_indexer.search_album.await_count == 2
     assert torrent_scorer.rank.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_import_held_resolves_only_after_source_consumption(tmp_path):
+    """F-INDEXREC-04: a result-aware seam proves import_held resolves the row as
+    imported only after the validated no-op consumed the held source off disk."""
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    consumption_order: list[str] = []
+
+    async def place(held):
+        # Simulate the validated no-op branch: consume the source, then return.
+        await asyncio.to_thread(Path(held.held_path).unlink, True)
+        consumption_order.append("unlinked")
+        return Path("/music/Led Zeppelin/03 You Shook Me.flac")
+
+    fp.place_held_file = AsyncMock(side_effect=place)
+    svc = _held_service(store, fp)
+
+    final_path = await svc.import_held(hid, "user-a", "user")
+
+    assert final_path.endswith("03 You Shook Me.flac")
+    assert consumption_order == ["unlinked"]
+    assert not held_file.exists()
+    assert await store.list_held_imports("user-a", "user") == []
+    assert await store.has_unresolved_held_for_task("t-1") is False
+
+
+@pytest.mark.asyncio
+async def test_import_held_unlink_failure_leaves_row_retryable(tmp_path):
+    """F-INDEXREC-04 negative boundary: an unlink I/O error inside the no-op
+    branch propagates and the held row is NOT resolved as imported."""
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+
+    async def place(_held):
+        raise OSError("disk I/O error during unlink")
+
+    fp.place_held_file = AsyncMock(side_effect=place)
+    svc = _held_service(store, fp)
+
+    with pytest.raises(OSError, match="disk I/O error"):
+        await svc.import_held(hid, "user-a", "user")
+
+    held = await store.list_held_imports("user-a", "user")
+    assert [value.id for value in held] == [hid]
+    assert await store.has_unresolved_held_for_task("t-1") is True
+    assert held_file.exists()

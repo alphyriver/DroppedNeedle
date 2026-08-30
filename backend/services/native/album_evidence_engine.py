@@ -7,6 +7,8 @@ import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
 
+from unidecode import unidecode
+
 from models.identification import (
     AlbumCandidate,
     CandidateEvidence,
@@ -15,6 +17,7 @@ from models.identification import (
     IdentificationDecision,
     TrackEvidence,
 )
+from services.native.edition_suffix import strip_edition_suffix
 from services.native.local_album_grouper import _hungarian_min
 
 MATCHER_VERSION = "feedback-fixes-v2"
@@ -29,13 +32,26 @@ DURATION_HARD_LIMIT_SECONDS = 30.0
 MAX_CANDIDATES = 10
 
 _NON_WORD = re.compile(r"[^\w]+", re.UNICODE)
+# F-059: mirrors musicbrainz_matcher's CJK guard - transliterating CJK/Kana is
+# lossy and hurts matching (D3), so those stay verbatim through the fold.
+_CJK = re.compile("[\u4e00-\u9fff\u3040-\u304f\u30a0-\u30ff]")
 
 
 def _fold(value: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", value.strip())
-    without_marks = "".join(
-        character for character in decomposed if not unicodedata.combining(character)
-    )
+    """Comparison fold aligned with the recall-side matchers (F-059): NFKD
+    strips combining marks, then non-CJK text is transliterated through
+    unidecode so ligatures (\u00e6/\u00f8/\u00df) compare equal to the ASCII
+    forms that cleared recall, instead of degrading to review."""
+    stripped = value.strip()
+    if _CJK.search(stripped):
+        decomposed = unicodedata.normalize("NFKD", stripped)
+        without_marks = "".join(
+            character
+            for character in decomposed
+            if not unicodedata.combining(character)
+        )
+    else:
+        without_marks = unidecode(unicodedata.normalize("NFKD", stripped))
     return _NON_WORD.sub("", without_marks.casefold())
 
 
@@ -153,6 +169,19 @@ def _album_metadata_class(local: str, candidate: str) -> str:
     if not local.strip():
         return "unknown"
     return "supported" if _distance(local, candidate) <= 0.20 else "contradictory"
+
+
+def _album_title_class(local: str, candidate: str) -> str:
+    """Album-title gate with edition-suffix normalization (F-MATCH-01).
+
+    Both operands pass through the shared suffix helper before the existing
+    fold/distance pipeline; the 0.20 threshold is unchanged. Applied to album
+    titles only - artist names, track titles, and MBIDs never see it.
+    """
+    return _album_metadata_class(
+        strip_edition_suffix(local),
+        strip_edition_suffix(candidate),
+    )
 
 
 class AlbumEvidenceEngine:
@@ -430,7 +459,7 @@ class AlbumEvidenceEngine:
             ),
             "",
         )
-        title_class = _album_metadata_class(album_title, candidate.album_title)
+        title_class = _album_title_class(album_title, candidate.album_title)
         artist_class = _album_metadata_class(album_artist, candidate.album_artist_name)
         supported = sum(item.classification == "supported" for item in track_evidence)
         comparable = sum(item.classification != "unknown" for item in track_evidence)

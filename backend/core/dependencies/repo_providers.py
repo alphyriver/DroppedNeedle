@@ -19,6 +19,7 @@ from .cache_providers import (
     get_cache,
     get_disk_cache,
     get_library_db,
+    get_mb_canonical_store,
     get_mbid_store,
     get_native_library_store,
     get_preferences_service,
@@ -40,10 +41,13 @@ def _get_configured_http_client() -> httpx.AsyncClient:
 
 @singleton
 def get_library_repository() -> "LibraryRepositoryProtocol":
-    # answers the wide legacy surface for services not yet migrated to the native engine
-    from services.native.library_manager import LibraryManager
+    from services.native.target_library_repository import TargetLibraryRepository
 
-    return LibraryManager(get_library_db())
+    from .cache_providers import get_native_library_store
+
+    return TargetLibraryRepository(
+        get_native_library_store(), get_request_history_store()
+    )
 
 
 @singleton
@@ -53,7 +57,12 @@ def get_musicbrainz_repository() -> "MusicBrainzRepository":
     cache = get_cache()
     preferences_service = get_preferences_service()
     http_client = _get_configured_http_client()
-    return MusicBrainzRepository(http_client, cache, preferences_service)
+    return MusicBrainzRepository(
+        http_client,
+        cache,
+        preferences_service,
+        mb_canonical_store=get_mb_canonical_store(),
+    )
 
 
 @singleton
@@ -689,8 +698,9 @@ def get_newznab_indexer() -> "NewznabIndexer":
         # at a tracker and log every item as unparseable.
         if s.type == "newznab"
     ]
-    # Keep the search cache TTL BELOW the auto-retry interval (02-… §Rate-limiting) so a
-    # delayed re-search actually re-hits the indexer instead of serving a stale result -
+    # Keep the search cache TTL BELOW the auto-retry interval
+    # (02-newznab-indexer-reference.md §Rate-limiting) so a delayed re-search
+    # actually re-hits the indexer instead of serving a stale result -
     # honoured even when the admin sets a sub-5-minute retry interval.
     retry_interval_s = (
         prefs.get_download_policy().auto_retry_base_interval_minutes * 60.0

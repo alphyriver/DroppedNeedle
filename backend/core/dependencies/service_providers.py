@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from infrastructure.cache.cache_keys import (
     library_raw_albums_key,
@@ -18,6 +18,7 @@ from infrastructure.cache.cache_keys import (
     LIBRARY_ALBUM_DETAILS_PREFIX,
     library_identification_prefixes,
 )
+from infrastructure.cache.catalog_invalidation import invalidate_catalog_scope
 from infrastructure.persistence.request_history import RequestHistoryRecord
 
 from ._registry import singleton
@@ -29,7 +30,6 @@ from .cache_providers import (
     get_youtube_store,
     get_mbid_store,
     get_sync_state_store,
-    get_scan_state_store,
     get_discovery_snapshot_store,
     get_preferences_service,
 )
@@ -79,6 +79,11 @@ async def _schedule_scanned_album_work(local_album_id: str) -> str | None:
 
 
 async def _invalidate_artist_reconciliation_catalog() -> None:
+    # ST1: this callback is invoked from enqueue contexts that do not carry
+    # the touched entity ids (threading them stalled in phase 1), so it keeps
+    # the WHOLE library_identification sweep. Bounded blast radius: fires only
+    # on artist-reconciliation commits. Phase 2 may thread ids like the
+    # album-identification hook does.
     from services.search_service import SearchService
 
     SearchService.clear_cached_results()
@@ -103,6 +108,22 @@ def get_background_workload_gate() -> "BackgroundWorkloadGate":
     from services.native.background_workload_gate import BackgroundWorkloadGate
 
     return BackgroundWorkloadGate()
+
+
+@singleton
+def get_bootstrap_demand_signal() -> "BootstrapDemandSignal":
+    from services.native.bootstrap_demand_signal import BootstrapDemandSignal
+
+    return BootstrapDemandSignal()
+
+
+@singleton
+def get_wal_checkpoint_service() -> "WalCheckpointService":
+    from core.config import get_settings
+
+    from services.native.wal_checkpoint_service import WalCheckpointService
+
+    return WalCheckpointService(get_settings().library_db_path)
 
 
 @singleton
@@ -456,7 +477,9 @@ def get_target_library_scan_coordinator() -> "LibraryScanCoordinator":
         LibraryIndexer(
             store,
             get_audio_tagger(),
-            grouping=LocalAlbumGroupingService(store, get_target_identification_queue()),
+            grouping=LocalAlbumGroupingService(
+                store, get_target_identification_queue()
+            ),
             filesystem_coordinator=filesystem,
         ),
         LibraryReconciler(store, filesystem),
@@ -519,13 +542,46 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
     store = get_native_library_store()
     cache = get_cache()
 
-    async def invalidate(_domains: set[str]) -> None:
-        await asyncio.gather(
-            *(
-                cache.clear_prefix(prefix)
-                for prefix in library_identification_prefixes()
+    async def invalidate(
+        domains: set[str], local_album_ids: Sequence[str] | None = None
+    ) -> None:
+        # ST1: resolve entity ids from the committed rows and delete exactly
+        # the touched identity-bearing keys; lists still sweep wholesale.
+        rg_ids: set[str] = set()
+        artist_ids: set[str] = set()
+        resolved_any = False
+        for local_album_id in local_album_ids or ():
+            try:
+                rg_scope, artist_scope = store.album_catalog_scope_ids(
+                    str(local_album_id)
+                )
+            except Exception:  # noqa: BLE001 - resolution failure falls back to bulk sweep
+                logger.warning(
+                    "Failed to resolve catalog scope ids for %s",
+                    str(local_album_id)[:8],
+                    exc_info=True,
+                )
+                continue
+            resolved_any = True
+            rg_ids |= rg_scope
+            artist_ids |= artist_scope
+
+        if not resolved_any:
+            # Defensive fallback: a commit with no resolvable identity keeps
+            # the old bulk behavior rather than deleting nothing.
+            await asyncio.gather(
+                *(
+                    cache.clear_prefix(prefix)
+                    for prefix in library_identification_prefixes()
+                )
             )
-        )
+        else:
+            await invalidate_catalog_scope(
+                cache,
+                album_mbids=rg_ids,
+                artist_mbids=artist_ids,
+                include_lists=True,
+            )
         await get_discovery_snapshot_store().mark_discover_stale()
 
     return AlbumIdentificationService(
@@ -620,6 +676,8 @@ def get_artist_identity_reconciliation_service() -> (
         get_musicbrainz_repository(),
         get_background_workload_gate(),
         _invalidate_artist_reconciliation_catalog,
+        get_bootstrap_demand_signal(),
+        get_wal_checkpoint_service(),
     )
 
 
@@ -635,6 +693,8 @@ def get_catalog_identity_hygiene_service() -> "CatalogIdentityHygieneService":
         get_native_library_store(),
         get_background_workload_gate(),
         _invalidate_artist_reconciliation_catalog,
+        get_bootstrap_demand_signal(),
+        get_wal_checkpoint_service(),
     )
 
 
@@ -651,6 +711,11 @@ def get_target_identity_repair_service() -> "IdentityRepairService":
         AlbumEvidenceEngine(),
         get_musicbrainz_repository(),
         provider_available=get_mb_provider_availability(),
+        wal_checkpoint=get_wal_checkpoint_service(),
+        # D-EDITION-AUTO S-3: profile-level opt-in with per-root override.
+        edition_opt_in=(
+            get_library_management_profile_service().automatic_edition_acceptance_enabled
+        ),
     )
 
 
@@ -1012,60 +1077,6 @@ def get_library_manager() -> "LibraryManager":
 
 
 @singleton
-def get_library_scanner() -> "LibraryScanner":
-    from services.native.library_scanner import LibraryScanner
-
-    # singleton so the cancel route and the running scan share one `_cancel` event
-    return LibraryScanner(
-        audio_tagger=get_audio_tagger(),
-        fingerprinter=get_audio_fingerprinter(),
-        mb_matcher=get_musicbrainz_matcher(),
-        album_identifier=get_album_identifier(),
-        library_manager=get_library_manager(),
-        scan_state_store=get_scan_state_store(),
-        event_bus=get_sse_publisher(),
-        invalidate_albums=_build_scan_invalidation(
-            get_cache(), get_disk_cache(), get_discovery_snapshot_store()
-        ),
-    )
-
-
-def _build_file_processor(
-    library_manager,
-    library_paths,
-    *,
-    library_root_ids=None,
-    publish_import_bundle=None,
-    policy_revision_getter=None,
-) -> "FileProcessor":
-    from pathlib import Path
-
-    from core.config import get_settings
-    from services.native.file_processor import FileProcessor
-    from services.native.recycle_bin import resolve_bin_path
-
-    from .repo_providers import get_download_client_repository, get_download_store
-
-    policy = get_preferences_service().get_download_policy()
-    return FileProcessor(
-        get_audio_tagger(),
-        naming_engine=get_naming_template_engine(),
-        library_manager=library_manager,
-        library_paths=[Path(path) for path in library_paths],
-        client=get_download_client_repository(),
-        slskd_downloads_path=Path(get_settings().slskd_downloads_path),
-        fingerprinter=get_audio_fingerprinter(),
-        verify_downloads=policy.verify_downloads,
-        download_store=get_download_store(),
-        held_dir=Path(get_settings().cache_dir) / "held",
-        recycle_bin=resolve_bin_path(policy.recycle_bin_path, library_paths),
-        library_root_ids=library_root_ids,
-        publish_import_bundle=publish_import_bundle,
-        policy_revision_getter=policy_revision_getter,
-    )
-
-
-@singleton
 def get_file_processor() -> "FileProcessor":
     return get_target_file_processor()
 
@@ -1084,6 +1095,42 @@ def get_target_import_library_service() -> "TargetImportLibraryService":
         filesystem_coordinator=get_library_filesystem_coordinator(),
         management_publisher=get_library_management_publisher(),
         automatic_management=get_automatic_import_management_service(),
+    )
+
+
+def _build_file_processor(
+    library_manager,
+    library_paths,
+    *,
+    library_root_ids=None,
+    publish_import_bundle=None,
+    policy_revision_getter=None,
+) -> "FileProcessor":
+    from core.config import get_settings
+    from pathlib import Path
+
+    from services.native.file_processor import FileProcessor
+    from services.native.recycle_bin import resolve_bin_path
+
+    from .repo_providers import get_download_client_repository, get_download_store
+
+    policy = get_preferences_service().get_download_policy()
+    settings = get_settings()
+    return FileProcessor(
+        get_audio_tagger(),
+        naming_engine=get_naming_template_engine(),
+        library_manager=library_manager,
+        library_paths=[Path(path) for path in library_paths],
+        client=get_download_client_repository(),
+        slskd_downloads_path=Path(settings.slskd_downloads_path),
+        fingerprinter=get_audio_fingerprinter(),
+        verify_downloads=policy.verify_downloads,
+        download_store=get_download_store(),
+        held_dir=Path(get_settings().cache_dir) / "held",
+        recycle_bin=resolve_bin_path(policy.recycle_bin_path, library_paths),
+        library_root_ids=library_root_ids,
+        publish_import_bundle=publish_import_bundle,
+        policy_revision_getter=policy_revision_getter,
     )
 
 
@@ -1130,6 +1177,7 @@ def _build_free_music_service(drop_import, file_processor) -> "FreeMusicService"
         preferences_service=get_preferences_service(),
         sse_publisher=get_sse_publisher(),
         file_processor=file_processor,
+        probe_tagger=get_audio_tagger(),
     )
 
 
@@ -1323,6 +1371,7 @@ def _build_artist_service(
     library_repo, library_db=None, ownership_service=None
 ) -> "ArtistService":
     from services.artist_service import ArtistService
+    from .cache_providers import get_native_library_store
 
     mb_repo = get_musicbrainz_repository()
     wikidata_repo = get_wikidata_repository()
@@ -1342,6 +1391,7 @@ def _build_artist_service(
         browse_queue,
         library_db,
         ownership_service,
+        native_library_store=get_native_library_store(),
     )
 
 
@@ -1433,6 +1483,7 @@ def _build_wanted_watcher_service(
         mb_repo=get_musicbrainz_repository(),
         sse_publisher=get_sse_publisher(),
         preferences=get_preferences_service(),
+        provider_available=get_mb_provider_availability(),
     )
 
 
@@ -1836,7 +1887,7 @@ def get_playlist_service() -> "PlaylistService":
 def get_library_service() -> "LibraryService":
     from services.library_service import LibraryService
 
-    library_repo = get_library_repository()
+    library_repo = get_target_library_repository()
     library_db = get_library_db()
     cover_repo = get_coverart_repository()
     preferences_service = get_preferences_service()
@@ -1923,7 +1974,15 @@ def _build_home_service(
 
 @singleton
 def get_home_service() -> "HomeService":
-    return _build_home_service(get_library_repository(), get_play_history_store())
+    from .compat_providers import get_target_consumer_composition
+
+    target = get_target_consumer_composition()
+    return _build_home_service(
+        target.repository,
+        target.history,
+        target.ownership,
+        get_genre_artwork_service(),
+    )
 
 
 @singleton
@@ -2183,19 +2242,28 @@ def get_per_user_client_factory() -> "PerUserClientFactory":
 
 @singleton
 def get_spotify_import_service() -> "SpotifyImportService":
-    from services.spotify_import_service import SpotifyImportService
+    from infrastructure.http.client import get_spotify_cover_http_client
+    from services.spotify_import_service import (
+        SpotifyImportService,
+        cover_fetcher_for,
+    )
 
     return SpotifyImportService(
         client_factory=get_per_user_client_factory(),
         playlist_repo=get_playlist_repository(),
         mb_repo=get_musicbrainz_repository(),
         playlist_service=get_playlist_service(),
+        cover_fetcher=cover_fetcher_for(get_spotify_cover_http_client()),
     )
 
 
 @singleton
 def get_target_spotify_import_service() -> "SpotifyImportService":
-    from services.spotify_import_service import SpotifyImportService
+    from infrastructure.http.client import get_spotify_cover_http_client
+    from services.spotify_import_service import (
+        SpotifyImportService,
+        cover_fetcher_for,
+    )
     from .compat_providers import get_target_consumer_composition
 
     target = get_target_consumer_composition()
@@ -2205,6 +2273,7 @@ def get_target_spotify_import_service() -> "SpotifyImportService":
         mb_repo=get_musicbrainz_repository(),
         playlist_service=target.playlists,
         async_playlist_repo=target.playlist_repository,
+        cover_fetcher=cover_fetcher_for(get_spotify_cover_http_client()),
     )
 
 
@@ -2395,7 +2464,7 @@ def get_jellyfin_playback_service() -> "JellyfinPlaybackService":
 def get_local_files_service() -> "LocalFilesService":
     from services.local_files_service import LocalFilesService
 
-    library_repo = get_library_repository()
+    library_repo = get_target_library_repository()
     preferences_service = get_preferences_service()
     cache = get_cache()
     return LocalFilesService(library_repo, preferences_service, cache)
@@ -2514,6 +2583,17 @@ def get_version_service() -> "VersionService":
     return VersionService(github_repo)
 
 
+def _acquisition_snapshot_factory():
+    from services.native.acquisition.quality import build_snapshot
+
+    prefs = get_preferences_service()
+
+    def factory():
+        return build_snapshot(prefs.get_download_policy())
+
+    return factory
+
+
 def _build_spec_policy(policy):
     """Map the API ``DownloadPolicySettings`` onto the decoupled spec ``SpecPolicy`` (the
     composition root is the one place coupling the two is fine). The size/term gates
@@ -2537,12 +2617,9 @@ def get_album_preflight_scorer() -> "AlbumPreflightScorer":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return AlbumPreflightScorer(
-        get_download_store(),
-        flac_mp3_only=policy.flac_mp3_only,
-        policy=_build_spec_policy(policy),
-    )
+    # Quality travels via the task's persisted snapshot at rank() time; the
+    # scorer singleton holds nothing policy-shaped (freshness by construction).
+    return AlbumPreflightScorer(get_download_store())
 
 
 @singleton
@@ -2551,13 +2628,7 @@ def get_track_matcher() -> "TrackMatcher":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return TrackMatcher(
-        get_download_store(),
-        quality_min=policy.quality_min,
-        quality_max=policy.quality_max,
-        flac_mp3_only=policy.flac_mp3_only,
-    )
+    return TrackMatcher(get_download_store())
 
 
 @singleton
@@ -2566,12 +2637,7 @@ def get_newznab_release_scorer() -> "NewznabReleaseScorer":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return NewznabReleaseScorer(
-        get_download_store(),
-        flac_mp3_only=policy.flac_mp3_only,
-        policy=_build_spec_policy(policy),
-    )
+    return NewznabReleaseScorer(get_download_store())
 
 
 @singleton
@@ -2580,12 +2646,7 @@ def get_torrent_release_scorer() -> "TorrentReleaseScorer":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return TorrentReleaseScorer(
-        get_download_store(),
-        flac_mp3_only=policy.flac_mp3_only,
-        policy=_build_spec_policy(policy),
-    )
+    return TorrentReleaseScorer(get_download_store())
 
 
 @singleton
@@ -2611,9 +2672,9 @@ def get_acquisition_cleanup_service() -> "AcquisitionCleanupService":
         lambda: Path(
             get_preferences_service().get_sabnzbd_connection_raw().downloads_mount
         ),
-        sab_category_getter=lambda: get_preferences_service()
-        .get_sabnzbd_connection_raw()
-        .category,
+        sab_category_getter=lambda: (
+            get_preferences_service().get_sabnzbd_connection_raw().category
+        ),
     )
 
 
@@ -2652,6 +2713,10 @@ def _build_download_orchestrator(
         else Path(get_settings().cache_dir) / "download-staging"
     )
     return DownloadOrchestrator(
+        spec_policy_extras=lambda: _build_spec_policy(
+            get_preferences_service().get_download_policy()
+        ),
+        probe_tagger=get_audio_tagger(),
         client=get_download_client_repository(),
         indexer=get_slskd_indexer(),
         download_store=get_download_store(),
@@ -2745,6 +2810,7 @@ def _build_download_service(
     # The service is "enabled" if ANY source can act (slskd OR usenet), so a Usenet-only
     # install isn't blocked by the slskd-disabled guard.
     return DownloadService(
+        snapshot_factory=_acquisition_snapshot_factory(),
         download_client=get_download_client_repository(),
         indexer=get_slskd_indexer(),
         scorer=get_album_preflight_scorer(),

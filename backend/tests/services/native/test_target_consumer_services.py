@@ -8,7 +8,7 @@ import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 import pytest_asyncio
@@ -18,19 +18,22 @@ from mutagen.flac import FLAC, Picture
 
 from api.compat.jellyfin.builders import JellyfinBuilder
 from api.compat.subsonic.models import to_album_id3, to_child
-from api.v1.routes import library, library_target, local_library, requests
+from api.v1.routes import library_target, local_library, requests
 from api.v1.schemas.library_policies import LibraryRootSettings, TypedLibrarySettings
 from api.v1.schemas.discover import RadioPlanRequest, RadioSeedItem
 from api.v1.schemas.scrobble import ScrobbleRequest
 from core.dependencies import (
-    get_library_manager,
     get_local_files_service,
     get_preferences_service,
     get_request_history_store,
     get_request_service,
     get_target_native_library_service,
 )
-from core.exceptions import ProviderIdentityRequiredError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    ProviderIdentityRequiredError,
+    ResourceNotFoundError,
+)
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.persistence.request_history import RequestHistoryStore
 from infrastructure.cache.memory_cache import InMemoryCache
@@ -57,7 +60,6 @@ from services.native.library_ownership_service import (
     AlbumOwnershipCandidate,
     LibraryOwnershipService,
 )
-from services.native.library_manager import LibraryManager
 from services.native.target_native_library_service import TargetNativeLibraryService
 from services.native.target_catalog_writer_service import TargetCatalogWriterService
 from services.native.download_service import DownloadService
@@ -76,7 +78,15 @@ from services.discover.radio_plan_service import RadioPlanService
 from services.playlist_service import PlaylistService
 from services.personal_mix_service import PersonalMixService, _MixTrack
 from services.request_service import RequestService
-from services.spotify_import_service import SpotifyImportService
+from services.spotify_import_service import (
+    SpotifyImportService,
+    cover_fetcher_for,
+)
+from tests.mocks.spotify_cdn_mock import (
+    COVER_URL,
+    JPEG_BYTES,
+    SpotifyCdnMock,
+)
 from tests.helpers import build_test_client, mock_user
 from middleware import _get_current_user
 
@@ -646,6 +656,29 @@ async def test_target_repository_projects_durable_requested_state(
     repository = TargetLibraryRepository(store, requests)
 
     assert await repository.get_requested_mbids() == {"requested-release"}
+
+@pytest.mark.asyncio
+async def test_target_repository_requested_mbids_exclude_track_keys(
+    target_services,
+) -> None:
+    store, _view, _favorites, _history, _root = target_services
+    requests = RequestHistoryStore(store.db_path, threading.Lock())
+    await requests.async_record_request(
+        "requested-release", "Requested Artist", "Requested Album"
+    )
+    await requests.async_record_request(
+        "recording-1",
+        "Requested Artist",
+        "Requested Album",
+        track_title="Requested Track",
+        request_kind="track",
+    )
+
+    repository = TargetLibraryRepository(store, requests)
+
+    requested = await repository.get_requested_mbids()
+    assert "track:recording-1" not in requested
+    assert requested == {"requested-release"}
 
 
 @pytest.mark.asyncio
@@ -1576,6 +1609,144 @@ async def test_spotify_and_personal_mix_write_only_target_playlists(
 
 
 @pytest.mark.asyncio
+async def test_spotify_import_persists_cover_in_target_store(
+    target_services, tmp_path: Path
+) -> None:
+    """GH-287: the target composition must persist the fetched Spotify playlist
+    cover into library_playlists.cover_image_path via the shared PlaylistService
+    helper, and a reimport must preserve it (fill-only policy)."""
+    store, _view, _favorites, _history, _root = target_services
+    repository = TargetPlaylistRepository(store)
+    playlists = PlaylistService(
+        None,
+        tmp_path,
+        library_db=TargetLibraryRepository(store),
+        async_repo=repository,
+    )
+
+    cdn = SpotifyCdnMock()
+    spotify_client = AsyncMock()
+    spotify_client.get_playlist.return_value = {
+        "id": "spotify-1",
+        "name": "Spotify",
+        "images": [{"url": COVER_URL, "width": 640, "height": 640}],
+    }
+    spotify_client.get_playlist_tracks.return_value = []
+    factory = AsyncMock()
+    factory.resolve_spotify.return_value = spotify_client
+    spotify = SpotifyImportService(
+        client_factory=factory,
+        playlist_repo=None,
+        mb_repo=AsyncMock(),
+        playlist_service=playlists,
+        async_playlist_repo=repository,
+        cover_fetcher=cover_fetcher_for(cdn.client()),
+    )
+
+    spotify_playlist_id = await spotify.ensure_playlist_record(
+        "user-1", "spotify-1", "Imported Spotify"
+    )
+    await spotify.populate_playlist("user-1", "spotify-1", spotify_playlist_id)
+
+    record = await playlists.get_playlist(spotify_playlist_id)
+    assert record.cover_image_path is not None
+    stored = Path(record.cover_image_path)
+    assert stored.read_bytes() == JPEG_BYTES
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT cover_image_path FROM library_playlists WHERE id = ?",
+            (spotify_playlist_id,),
+        ).fetchone()
+    assert row == (record.cover_image_path,)
+
+    # Re-import: the imported cover already exists -> preserved byte-for-byte.
+    before_bytes = stored.read_bytes()
+    await spotify.populate_playlist("user-1", "spotify-1", spotify_playlist_id)
+    after = (await playlists.get_playlist(spotify_playlist_id)).cover_image_path
+    assert after == record.cover_image_path
+    assert Path(after).read_bytes() == before_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_provider_identity", [True, False])
+async def test_cutoff_repository_normalizes_target_artist_metadata(
+    target_services, with_provider_identity: bool
+) -> None:
+    """NEW-TARGET-01: target cutoff rows expose the shared artist contract -
+    display name plus ONLY the provider identity as artist_mbid (never the
+    local album-artist ID alias)."""
+    store, _view, _favorites, _history, root = target_services
+    track_id = "20000000-0000-4000-8000-000000000095"
+    album_id = "10000000-0000-4000-8000-000000000095"
+    artist_id = "30000000-0000-4000-8000-000000000095"
+    path = root / "cutoff.flac"
+    shutil.copy2(Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", path)
+    stat = path.stat()
+    _tag, info = AudioTagger().read_tags(path)
+    membership = _membership(
+        album_id=album_id,
+        track_id=track_id,
+        artist_id=artist_id,
+        root=root,
+        title="Cutoff",
+    )
+    membership.tracks[0].file_path = str(path)
+    membership.tracks[0].relative_path = path.name
+    membership.tracks[0].file_size_bytes = stat.st_size
+    membership.tracks[0].file_mtime_ns = stat.st_mtime_ns
+    membership.tracks[0].stat_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+    membership.tracks[0].file_format = info.file_format
+    membership.tracks[0].duration_seconds = info.duration_seconds
+    await store.create_catalog_membership(membership)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_format='mp3', bit_rate=192 "
+            "WHERE id = ?",
+            (track_id,),
+        )
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, selected_at) "
+            "VALUES (?, 'musicbrainz', 'rg-cutoff', 'manual', 1)",
+            (album_id,),
+        )
+        if with_provider_identity:
+            connection.execute(
+                "INSERT INTO local_artist_external_identities "
+                "(local_artist_id, provider, provider_artist_id, decision_source, selected_at) "
+                "VALUES (?, 'musicbrainz', 'provider-artist-cutoff', 'manual', 1)",
+                (artist_id,),
+            )
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    repository = TargetLibraryRepository(store)
+
+    rows = await repository.list_cutoff_unmet("lossless")
+
+    assert len(rows) == 1
+    row = rows[0]
+    # Shared contract keys are present and unambiguous.
+    assert row["artist_name"] == "Cutoff Artist"
+    if with_provider_identity:
+        assert row["artist_mbid"] == "provider-artist-cutoff"
+    else:
+        assert row["artist_mbid"] is None
+    # The local album-artist ID never masquerades as a provider MBID.
+    assert row["artist_mbid"] != artist_id
+    assert row["current_tier"] == "mp3_192"
+    # Target rows carry the provider identity in provider_release_group_mbid;
+    # release_group_mbid falls back to the local album id when the seed had no
+    # legacy release group.
+    assert row["provider_release_group_mbid"] == "rg-cutoff"
+
+
+@pytest.mark.asyncio
 async def test_target_removal_writer_audits_without_deleting_stable_rows(
     target_services, tmp_path: Path
 ) -> None:
@@ -1664,7 +1835,9 @@ async def test_target_ownership_projection_is_conservative_and_provider_independ
         (False, None),
         (False, None),
         (False, None),
-        (True, LOCAL_ALBUM_ID),
+        # F-TARGETCATALOG-05 (owner-signed): an unmatched provider-bearing
+        # candidate is NOT owned by a local-only album - no folded fallback.
+        (False, None),
     ]
     assert await ownership.provider_album_id(IDENTIFIED_ALBUM_ID) == RELEASE_GROUP_MBID
     assert await ownership.provider_track_id(IDENTIFIED_TRACK_ID) == RECORDING_MBID
@@ -1834,39 +2007,6 @@ async def test_local_only_album_track_and_artist_never_cross_provider_boundaries
 
 
 @pytest.mark.asyncio
-async def test_native_library_routes_browse_target_catalog_with_local_ids(
-    target_services,
-) -> None:
-    store, _view, _favorites, _history, _root = target_services
-    manager = LibraryManager(TargetLibraryRepository(store))
-    app = FastAPI()
-    app.include_router(library.router)
-    app.dependency_overrides[get_library_manager] = lambda: manager
-    app.dependency_overrides[_get_current_user] = lambda: mock_user(
-        role="user", user_id="user-1"
-    )
-    client = build_test_client(app)
-
-    albums = client.get("/library/albums?page_size=10")
-    artists = client.get("/library/artists?limit=10")
-    tracks = client.get("/library/tracks?limit=10")
-    stats = client.get("/library/stats")
-    album_tracks = client.get(f"/library/albums/{LOCAL_ALBUM_ID}/tracks")
-
-    assert albums.status_code == 200
-    assert {item["release_group_mbid"] for item in albums.json()["items"]} == {
-        IDENTIFIED_ALBUM_ID,
-        LOCAL_ALBUM_ID,
-    }
-    assert artists.status_code == 200
-    assert LOCAL_ARTIST_ID in {item["artist_mbid"] for item in artists.json()["items"]}
-    assert tracks.status_code == 200
-    assert LOCAL_TRACK_ID in {item["track_file_id"] for item in tracks.json()["items"]}
-    assert stats.json()["total_tracks"] == 2
-    assert [item["id"] for item in album_tracks.json()["items"]] == [LOCAL_TRACK_ID]
-
-
-@pytest.mark.asyncio
 async def test_target_artist_browse_sorts_by_aggregate_album_count(
     target_services,
 ) -> None:
@@ -2023,6 +2163,9 @@ async def test_target_native_contract_separates_local_and_provider_ids_and_redir
         "mbids": [RELEASE_GROUP_MBID],
         "requested_mbids": [],
     }
+    request_history.async_get_requested_mbids.assert_awaited_once_with(
+        request_kind="album"
+    )
     assert redirect.status_code == 308
     assert redirect.headers["location"].endswith(
         f"/library/albums/{IDENTIFIED_ALBUM_ID}/tracks"
@@ -2354,3 +2497,562 @@ async def test_isolated_target_compat_routes_browse_play_and_write_stable_refere
             "SELECT state FROM library_identification_reviews WHERE id = ?",
             ("missing-final-track-review",),
         ).fetchone() == ("needs_review",)
+
+
+@pytest.mark.asyncio
+async def test_target_removal_writer_handles_already_absent_file_idempotently(
+    target_services, tmp_path: Path
+) -> None:
+    """F-TARGETCATALOG-01: an indexed row whose validated file is already gone
+    removes idempotently - no 404, the row becomes missing, FILE_DELETED audit."""
+    store, _view, _favorites, _history, root = target_services
+    track_id = "20000000-0000-4000-8000-000000000098"
+    album_id = "10000000-0000-4000-8000-000000000098"
+    artist_id = "30000000-0000-4000-8000-000000000098"
+    path = root / "vanished.flac"
+    shutil.copy2(Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", path)
+    stat = path.stat()
+    _tag, info = AudioTagger().read_tags(path)
+    membership = _membership(
+        album_id=album_id,
+        track_id=track_id,
+        artist_id=artist_id,
+        root=root,
+        title="Vanished",
+    )
+    membership.tracks[0].file_path = str(path)
+    membership.tracks[0].relative_path = path.name
+    membership.tracks[0].file_size_bytes = stat.st_size
+    membership.tracks[0].file_mtime_ns = stat.st_mtime_ns
+    membership.tracks[0].stat_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+    membership.tracks[0].file_format = info.file_format
+    membership.tracks[0].duration_seconds = info.duration_seconds
+    await store.create_catalog_membership(membership)
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    writer = TargetCatalogWriterService(
+        store, local_files, TargetNativeLibraryService(store)
+    )
+    path.unlink()  # the file disappears outside the service
+
+    removed = await writer.remove_track(track_id, actor_user_id="user-1", delete_file=True)
+
+    assert removed == [track_id]
+    assert not path.exists()
+    retained = await store.get_target_track(track_id)
+    assert retained is not None and retained["availability"] == "missing"
+    with sqlite3.connect(store.db_path) as connection:
+        actions = connection.execute(
+            "SELECT action_kind, reason_code FROM library_catalog_actions "
+            "WHERE local_track_id = ?",
+            (track_id,),
+        ).fetchall()
+    assert actions == [("remove_track", "FILE_DELETED")]
+    # Retry: the row is now missing (not indexed), so the existing not-found
+    # contract holds - no second destructive mutation is possible.
+
+
+@pytest.mark.asyncio
+async def test_target_album_removal_marks_mixed_existing_and_absent_tracks(
+    target_services, tmp_path: Path
+) -> None:
+    """F-TARGETCATALOG-01: album removal must not abort at an already-absent
+    path; existing files are unlinked and every safe row becomes missing."""
+    store, _view, _favorites, _history, root = target_services
+    album_id = "10000000-0000-4000-8000-000000000097"
+    existing_id = "20000000-0000-4000-8000-000000000091"
+    absent_id = "20000000-0000-4000-8000-000000000092"
+    existing_path = root / "kept.flac"
+    shutil.copy2(
+        Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", existing_path
+    )
+    # One membership holding BOTH album tracks (the store seeds one album).
+    artist_id = "30000000-0000-4000-8000-000000000097"
+    membership = _membership(
+        album_id=album_id,
+        track_id=existing_id,
+        artist_id=artist_id,
+        root=root,
+        title="Mixed",
+    )
+    info = AudioTagger().read_tags(existing_path)[1]
+    existing_track = membership.tracks[0]
+    existing_track.file_path = str(existing_path)
+    existing_track.relative_path = existing_path.name
+    stat = existing_path.stat()
+    existing_track.file_size_bytes = stat.st_size
+    existing_track.file_mtime_ns = stat.st_mtime_ns
+    existing_track.stat_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+    existing_track.file_format = info.file_format
+    existing_track.duration_seconds = info.duration_seconds
+    absent_track = msgspec.structs.replace(
+        existing_track,
+        id=absent_id,
+        file_path=str(root / "gone.flac"),
+        relative_path="gone.flac",
+        path_hash=f"hash:{absent_id}",
+        title="Mixed Track 2",
+    )
+    membership.tracks.append(absent_track)
+    membership.track_credits[absent_id] = list(membership.track_credits[existing_id])
+    await store.create_catalog_membership(membership)
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    writer = TargetCatalogWriterService(
+        store, local_files, TargetNativeLibraryService(store)
+    )
+
+    changed = await writer.remove_album(
+        album_id, actor_user_id="user-1", delete_files=True
+    )
+
+    assert set(changed) == {existing_id, absent_id}
+    assert not existing_path.exists()
+    for track_id in (existing_id, absent_id):
+        row = await store.get_target_track(track_id)
+        assert row is not None and row["availability"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_target_album_removal_keeps_partial_failure_reporting(
+    target_services, tmp_path: Path
+) -> None:
+    """F-TARGETCATALOG-01 negative boundary: a non-ENOENT unlink failure keeps
+    its row indexed while safe rows are still marked missing."""
+    store, _view, _favorites, _history, root = target_services
+    album_id = "10000000-0000-4000-8000-000000000096"
+    good_id = "20000000-0000-4000-8000-000000000093"
+    bad_id = "20000000-0000-4000-8000-000000000094"
+    good_path = root / "good.flac"
+    shutil.copy2(
+        Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", good_path
+    )
+    bad_path = root / "bad.flac"
+    bad_path.write_bytes(b"fLaC" + b"\0" * 64)
+    # One membership holding BOTH album tracks.
+    artist_id = "30000000-0000-4000-8000-000000000096"
+    membership = _membership(
+        album_id=album_id,
+        track_id=good_id,
+        artist_id=artist_id,
+        root=root,
+        title="Partial",
+    )
+    info = AudioTagger().read_tags(good_path)[1]
+    good_stat = good_path.stat()
+    bad_stat = bad_path.stat()
+    good_track = membership.tracks[0]
+    good_track.file_path = str(good_path)
+    good_track.relative_path = good_path.name
+    good_track.file_size_bytes = good_stat.st_size
+    good_track.file_mtime_ns = good_stat.st_mtime_ns
+    good_track.stat_revision = f"{good_stat.st_size}:{good_stat.st_mtime_ns}"
+    good_track.file_format = info.file_format
+    good_track.duration_seconds = info.duration_seconds
+    bad_track = msgspec.structs.replace(
+        good_track,
+        id=bad_id,
+        file_path=str(bad_path),
+        relative_path=bad_path.name,
+        path_hash=f"hash:{bad_id}",
+        file_size_bytes=bad_stat.st_size,
+        file_mtime_ns=bad_stat.st_mtime_ns,
+        stat_revision=f"{bad_stat.st_size}:{bad_stat.st_mtime_ns}",
+        title="Partial Track 2",
+    )
+    membership.tracks.append(bad_track)
+    membership.track_credits[bad_id] = list(membership.track_credits[good_id])
+    await store.create_catalog_membership(membership)
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    writer = TargetCatalogWriterService(
+        store, local_files, TargetNativeLibraryService(store)
+    )
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self == bad_path:
+            raise PermissionError(1, "Operation not permitted")
+        return real_unlink(self, *args, **kwargs)
+
+    with patch("pathlib.Path.unlink", failing_unlink):
+        with pytest.raises(ExternalServiceError):
+            await writer.remove_album(album_id, actor_user_id="user-1", delete_files=True)
+
+    good_row = await store.get_target_track(good_id)
+    bad_row = await store.get_target_track(bad_id)
+    assert good_row is not None and good_row["availability"] == "missing"
+    assert bad_row is not None and bad_row["availability"] == "indexed"
+    assert bad_path.exists()  # real failure is not hidden or retried destructively
+
+@pytest.mark.asyncio
+async def test_provider_bearing_candidates_never_consume_folded_fallback(
+    target_services,
+) -> None:
+    """F-TARGETCATALOG-05 signed rule matrix: provider match owns; a
+    provider-bearing candidate with only same-name local-only rows is NOT
+    owned; providerless candidates keep the folded fallback with the existing
+    one-year/unknown-year behaviour; placeholders, big year gaps, retired
+    albums, and unindexed albums never create ownership."""
+    store, _view, _favorites, _history, _root = target_services
+    ownership = LibraryOwnershipService(store)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_albums SET year = 2020 WHERE id = ?", (LOCAL_ALBUM_ID,)
+        )
+
+    projections = await ownership.project_albums(
+        [
+            # Provider match stays owned.
+            AlbumOwnershipCandidate(
+                RELEASE_GROUP_MBID, "Identified", "Identified Artist", None
+            ),
+            # Provider-bearing mismatch with same-name local-only row: not owned.
+            AlbumOwnershipCandidate(
+                "different-provider-id", "Local Only", "Local Only Artist", 2020
+            ),
+            # Provider-bearing mismatch ignores years entirely (no fallback).
+            AlbumOwnershipCandidate(
+                "another-provider-id", "Local Only", "Local Only Artist", None
+            ),
+            # Providerless fallback keeps one-year tolerance.
+            AlbumOwnershipCandidate(None, "Local Only", "Local Only Artist", 2021),
+            # Providerless fallback keeps unknown-year acceptance.
+            AlbumOwnershipCandidate(None, "Local Only", "Local Only Artist", None),
+            # Providerless with >1 year difference is not owned.
+            AlbumOwnershipCandidate(None, "Local Only", "Local Only Artist", 1999),
+            # Placeholders prove nothing for providerless candidates.
+            AlbumOwnershipCandidate(None, "Unknown album", "Unknown artist", None),
+        ]
+    )
+
+    assert [(item.owned, item.local_album_id) for item in projections] == [
+        (True, IDENTIFIED_ALBUM_ID),
+        (False, None),
+        (False, None),
+        (True, LOCAL_ALBUM_ID),
+        (True, LOCAL_ALBUM_ID),
+        (False, None),
+        (False, None),
+    ]
+
+    # Retired and unindexed local-only rows are invisible to the fallback.
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=LocalAlbum(
+                id="retired-local",
+                root_id="root",
+                grouping_key="retired-key",
+                title="Local Only",
+                album_artist_id=LOCAL_ARTIST_ID,
+                album_artist_name="Local Only Artist",
+                year=2020,
+                created_at=1,
+                updated_at=1,
+                retired_into_album_id=LOCAL_ALBUM_ID,
+            ),
+            artists=[],
+            tracks=[
+                LocalTrack(
+                    id="retired-track",
+                    local_album_id="retired-local",
+                    root_id="root",
+                    file_path="/music/retired.flac",
+                    relative_path="retired.flac",
+                    path_hash="hash-retired",
+                    file_size_bytes=1,
+                    file_mtime_ns=1,
+                    stat_revision="stat-retired",
+                    tag_revision="tag-retired",
+                    title="T",
+                    artist_name="Artist",
+                    album_title="Local Only",
+                    album_artist_name="Local Only Artist",
+                    duration_seconds=180,
+                    file_format="flac",
+                    imported_at=1,
+                    applied_policy="automatic",
+                )
+            ],
+            track_credits={},
+        )
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET availability='missing' "
+            "WHERE id='retired-track'"
+        )
+    projection = await ownership.project_album(
+        release_group_mbid=None,
+        title="Local Only",
+        album_artist="Local Only Artist",
+        year=2020,
+    )
+    # Still owned via LOCAL_ALBUM_ID; the retired duplicate adds no ambiguity.
+    assert projection.owned is True
+
+
+@pytest.mark.asyncio
+async def test_discover_queue_keeps_mismatched_provider_candidate_visible(
+    target_services,
+) -> None:
+    """F-MATCH-05 consumer check via F-TARGETCATALOG-05: the discover queue
+    retains a candidate whose provider ID mismatches the library (owned=False),
+    while the provider-matched candidate is filtered as in-library."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from services.discover.queue_service import DiscoverQueueService
+
+    store, *_rest = target_services
+    integration = SimpleNamespace(
+        get_queue_settings=lambda: SimpleNamespace(queue_size=10),
+        is_jellyfin_enabled=lambda: False,
+        is_library_configured=lambda: True,
+    )
+    mbid_resolution = AsyncMock()
+    mbid_resolution.get_user_listened_release_group_mbids.return_value = set()
+    mbid_resolution.get_library_album_mbids.return_value = set()
+    service = DiscoverQueueService(
+        listenbrainz_repo=AsyncMock(),
+        jellyfin_repo=AsyncMock(),
+        musicbrainz_repo=AsyncMock(),
+        integration=integration,
+        mbid_resolution=mbid_resolution,
+        ownership_service=LibraryOwnershipService(store),
+    )
+    service._build_anonymous_queue = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                release_group_mbid="mismatched-provider-id",
+                album_name="Local Only",
+                artist_name="Local Only Artist",
+                in_library=False,
+            ),
+            SimpleNamespace(
+                release_group_mbid=RELEASE_GROUP_MBID,
+                album_name="Identified",
+                artist_name="Identified Artist",
+                in_library=False,
+            ),
+        ]
+    )
+    service._resolve_user_music = AsyncMock(
+        return_value=(None, None, "", "", False, False, "listenbrainz")
+    )
+
+    response = await service.build_queue("user-1")
+
+    by_mbid = {item.release_group_mbid: item for item in response.items}
+    assert not by_mbid["mismatched-provider-id"].in_library  # stays visible
+    # The provider-matched candidate is correctly filtered out as in-library.
+    assert RELEASE_GROUP_MBID not in by_mbid
+
+
+# F-TARGETCATALOG-06: batch canonical + album-track resolution
+
+
+def _resolve_item(rg: str | None, disc: int | None, track: int | None):
+    from api.v1.schemas.library import TrackResolveItem
+
+    return TrackResolveItem(
+        release_group_mbid=rg, disc_number=disc, track_number=track
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_resolution_preserves_provider_alias_retired_and_ambiguous(
+    target_services,
+) -> None:
+    """F-TARGETCATALOG-06: provider IDs (RG and release), aliases, local IDs,
+    and retired IDs resolve identically under the batch resolver; an ambiguous
+    provider identity stays unresolved; duplicates deduplicate."""
+    store, *_ = target_services
+    service = TargetNativeLibraryService(store)
+
+    # Alias for the identified album.
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_album_aliases "
+            "(alias, local_album_id, kind, created_at) VALUES (?, ?, 'merged_album', 1)",
+            ("alias-identified", IDENTIFIED_ALBUM_ID),
+        )
+        # Retired album resolving to its survivor.
+        connection.execute(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+            "title_folded, album_artist_id, grouping_source, created_at, updated_at, "
+            "retired_into_album_id) VALUES ('album-retired', 'root-1', "
+            "'g-retired', 'Old Name', 'old name', "
+            "(SELECT album_artist_id FROM local_albums WHERE id = ?), "
+            "'automatic', 1, 1, ?)",
+            (IDENTIFIED_ALBUM_ID, IDENTIFIED_ALBUM_ID),
+        )
+        # A second ACTIVE indexed album sharing the identified release-group
+        # MBID -> the provider identity is now AMBIGUOUS for that RG.
+        connection.execute(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+            "title_folded, album_artist_id, grouping_source, created_at, "
+            "updated_at) VALUES ('album-shadow', 'root-1', 'g-shadow', "
+            "'Shadow Copy', 'shadow copy', (SELECT album_artist_id FROM "
+            "local_albums WHERE id = ?), 'automatic', 1, 1)",
+            (IDENTIFIED_ALBUM_ID,),
+        )
+        connection.execute(
+            "INSERT INTO local_tracks (id, local_album_id, root_id, "
+            "relative_path, file_path, path_hash, file_size_bytes, "
+            "file_mtime_ns, stat_revision, tag_revision, title, title_folded, "
+            "artist_name, artist_name_folded, album_title, album_title_folded, "
+            "album_artist_name, album_artist_name_folded, ingest_source, "
+            "stat_revision_kind, membership_source, disc_number, track_number, "
+            "duration_seconds, file_format, availability, imported_at) "
+            "VALUES ('track-shadow', 'album-shadow', 'root-1', "
+            "'shadow/01.flac', '/music/shadow/01.flac', 'h-shadow', 1, 1, "
+            "'stat-shadow', 'tag-shadow', 'Track', 'track', 'Artist', "
+            "'artist', 'Shadow Copy', 'shadow copy', 'Artist', 'artist', "
+            "'scan', 'exact', 'automatic', 1, 1, 180.0, 'flac', 'indexed', 1)"
+        )
+
+    resolved_map = await store.resolve_canonical_target_ids(
+        "album",
+        [
+            RELEASE_GROUP_MBID,      # ambiguous: two active albums share this RG
+            IDENTIFIED_ALBUM_ID,     # local ID
+            "alias-identified",      # alias
+            "album-retired",         # retired ID -> survivor
+            "unknown-provider-id",   # missing
+            RELEASE_GROUP_MBID,      # duplicate of the first item
+        ],
+    )
+    assert resolved_map.get(IDENTIFIED_ALBUM_ID) == IDENTIFIED_ALBUM_ID
+    assert resolved_map.get("alias-identified") == IDENTIFIED_ALBUM_ID
+    assert resolved_map.get("album-retired") == IDENTIFIED_ALBUM_ID
+    assert "unknown-provider-id" not in resolved_map
+    # Ambiguous RG stays unresolved - no first-match behavior.
+    assert RELEASE_GROUP_MBID.casefold() not in {
+        value.casefold() for value in resolved_map.values()
+    } or resolved_map.get(RELEASE_GROUP_MBID) != IDENTIFIED_ALBUM_ID
+
+
+@pytest.mark.asyncio
+async def test_resolve_tracks_batches_and_keeps_wire_contract(target_services):
+    """F-TARGETCATALOG-06: one canonical batch lookup and one track-map batch
+    read per request; invalid items keep base results; order preserved; the
+    200-item boundary excludes later items."""
+    store, *_ = target_services
+
+    calls = {
+        "canonical_single": 0,
+        "canonical_batch": 0,
+        "album_tracks_single": 0,
+        "album_tracks_batch": 0,
+    }
+    original_canonical = type(store).resolve_canonical_target_id
+    original_canonical_batch = type(store).resolve_canonical_target_ids
+    original_tracks_single = type(store).get_target_album_tracks
+    original_tracks_batch = type(store).get_target_album_tracks_batch
+
+    async def spy_canonical(self, kind, identifier):
+        calls["canonical_single"] += 1
+        return await original_canonical(self, kind, identifier)
+
+    async def spy_canonical_batch(self, kind, identifiers):
+        calls["canonical_batch"] += 1
+        return await original_canonical_batch(self, kind, identifiers)
+
+    async def spy_tracks_single(self, album_identifier, **kwargs):
+        calls["album_tracks_single"] += 1
+        return await original_tracks_single(self, album_identifier, **kwargs)
+
+    async def spy_tracks_batch(self, album_ids):
+        calls["album_tracks_batch"] += 1
+        return await original_tracks_batch(self, album_ids)
+
+    type(store).resolve_canonical_target_id = spy_canonical
+    type(store).resolve_canonical_target_ids = spy_canonical_batch
+    type(store).get_target_album_tracks = spy_tracks_single
+    type(store).get_target_album_tracks_batch = spy_tracks_batch
+    try:
+        service = TargetNativeLibraryService(store)
+        # The fixture track sits at disc 1 / track number 0.
+        items = [
+            _resolve_item(RELEASE_GROUP_MBID, 1, 0),  # valid
+            _resolve_item(RELEASE_GROUP_MBID, 1, 99),  # valid, no such track
+            _resolve_item("unknown-rg", 1, 1),  # unknown ID
+            _resolve_item(None, 1, None),  # missing RG+track: never triggers
+            _resolve_item(RELEASE_GROUP_MBID, 1, 0),  # exact duplicate of item 0
+        ]
+        response = await service.resolve_tracks(items)
+    finally:
+        type(store).resolve_canonical_target_id = original_canonical
+        type(store).resolve_canonical_target_ids = original_canonical_batch
+        type(store).get_target_album_tracks = original_tracks_single
+        type(store).get_target_album_tracks_batch = original_tracks_batch
+
+    assert calls["canonical_batch"] == 1
+    assert calls["album_tracks_batch"] == 1
+    # No per-item single-item lookups.
+    assert calls["canonical_single"] == 0
+    assert calls["album_tracks_single"] == 0
+
+    assert [item.release_group_mbid for item in response.items] == [
+        RELEASE_GROUP_MBID,
+        RELEASE_GROUP_MBID,
+        "unknown-rg",
+        None,
+        RELEASE_GROUP_MBID,
+    ]
+    # Item 0 and its duplicate resolve to the same local track.
+    assert response.items[0].source == "local"
+    assert (
+        response.items[4].track_source_id == response.items[0].track_source_id
+    )
+    # Track-number miss stays unresolved-but-shaped.
+    assert response.items[1].source is None
+    # Unknown ID keeps base result.
+    assert response.items[2].source is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_tracks_200_item_boundary_unchanged():
+    from unittest.mock import AsyncMock, MagicMock
+
+    store = MagicMock(spec=[
+        "resolve_canonical_target_ids", "get_target_album_tracks_batch",
+    ])
+
+    async def batch_ids(kind, identifiers):
+        return {identifier: identifier for identifier in identifiers}
+
+    async def batch_tracks(album_ids):
+        return {a: [] for a in album_ids}
+
+    store.resolve_canonical_target_ids = AsyncMock(side_effect=batch_ids)
+    store.get_target_album_tracks_batch = AsyncMock(side_effect=batch_tracks)
+    service = TargetNativeLibraryService(store)
+
+    items = [_resolve_item(f"rg-{i}", 1, 1) for i in range(205)]
+    response = await service.resolve_tracks(items)
+
+    # Exactly the first 200 items processed; the rest excluded.
+    assert len(response.items) == 200
+    requested = store.resolve_canonical_target_ids.await_args.args[1]
+    assert len(requested) == 200

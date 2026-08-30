@@ -7,9 +7,11 @@ from api.v1.schemas.settings import (
     _OFFICIAL_MB_CONCURRENT_SEARCHES,
 )
 
+OFFICIAL = "https://musicbrainz.org/ws/2"
+MIRROR = "https://mirror.example.com/ws/2"
+
 
 class TestIsOfficialMusicBrainz:
-    """Test the URL detection helper."""
 
     def test_official_https(self):
         assert is_official_musicbrainz("https://musicbrainz.org/ws/2") is True
@@ -46,7 +48,6 @@ class TestIsOfficialMusicBrainz:
 
 
 class TestMusicBrainzSettingsClamping:
-    """Test that rate limits are clamped for official API."""
 
     def test_official_url_clamps_rate_limit(self):
         settings = MusicBrainzConnectionSettings(
@@ -99,7 +100,6 @@ class TestMusicBrainzSettingsClamping:
 
 
 class TestInstanceId:
-    """Test instance ID generation and retrieval."""
 
     def test_ensure_instance_id_generates_on_first_run(self, tmp_path):
         from core.config import Settings
@@ -122,7 +122,6 @@ class TestInstanceId:
         prefs1 = PreferencesService(settings)
         id1 = prefs1.get_instance_id()
 
-        # Create a new instance pointing to the same config
         prefs2 = PreferencesService(settings)
         id2 = prefs2.get_instance_id()
 
@@ -157,3 +156,89 @@ class TestInstanceId:
         settings = Settings(instance_id="", root_app_dir=tmp_path)
         ua = settings.get_user_agent()
         assert "unknown" in ua
+
+
+class TestNonOfficialWidenedBounds:
+    """0.1-500 r/s and 1-64 concurrent off-official; 0 = Unlimited sentinel."""
+
+    @pytest.mark.parametrize("rate", [0.1, 1.0, 50.0, 250.5, 500.0])
+    def test_accepts_widened_rate_bounds(self, rate):
+        settings = MusicBrainzConnectionSettings(
+            api_url=MIRROR, rate_limit=rate, concurrent_searches=6
+        )
+        assert settings.rate_limit == rate
+        assert settings.clamped_to_official_limits is False
+
+    @pytest.mark.parametrize("concurrent", [1, 30, 64])
+    def test_accepts_widened_concurrent_bounds(self, concurrent):
+        settings = MusicBrainzConnectionSettings(
+            api_url=MIRROR, rate_limit=10.0, concurrent_searches=concurrent
+        )
+        assert settings.concurrent_searches == concurrent
+
+    def test_accepts_unlimited_sentinel(self):
+        settings = MusicBrainzConnectionSettings(
+            api_url=MIRROR, rate_limit=0, concurrent_searches=64
+        )
+        assert settings.rate_limit == 0
+        assert settings.clamped_to_official_limits is False
+
+    @pytest.mark.parametrize("rate", [-0.1, 0.05, 500.1, 501.0])
+    def test_rejects_out_of_bounds_rates(self, rate):
+        with pytest.raises(Exception, match="rate_limit"):
+            MusicBrainzConnectionSettings(
+                api_url=MIRROR, rate_limit=rate, concurrent_searches=6
+            )
+
+    @pytest.mark.parametrize("concurrent", [0, 65, 100])
+    def test_rejects_out_of_bounds_concurrency(self, concurrent):
+        with pytest.raises(Exception, match="concurrent_searches"):
+            MusicBrainzConnectionSettings(
+                api_url=MIRROR, rate_limit=10.0, concurrent_searches=concurrent
+            )
+
+
+class TestOfficialClampWarning:
+    """Official ceilings are absolute; raised entries surface
+    clamped_to_official_limits on the save/settings response (applied, never
+    refused). Channel choice: a field on MusicBrainzConnectionSettings itself -
+    the PUT /settings/musicbrainz response already returns the mutated struct."""
+
+    def test_official_raised_values_surface_clamp_warning(self):
+        settings = MusicBrainzConnectionSettings(
+            api_url=OFFICIAL, rate_limit=120.0, concurrent_searches=32
+        )
+        assert settings.rate_limit == _OFFICIAL_MB_RATE_LIMIT
+        assert settings.concurrent_searches == _OFFICIAL_MB_CONCURRENT_SEARCHES
+        assert settings.clamped_to_official_limits is True
+
+    def test_official_sentinel_lifts_to_official_rate_and_warns(self):
+        # the Unlimited sentinel is valid OFF-OFFICIAL ONLY: on the official
+        # host it lifts to the official rate instead of disabling the limiter
+        settings = MusicBrainzConnectionSettings(
+            api_url=OFFICIAL, rate_limit=0, concurrent_searches=64
+        )
+        assert settings.rate_limit == _OFFICIAL_MB_RATE_LIMIT
+        assert settings.concurrent_searches == _OFFICIAL_MB_CONCURRENT_SEARCHES
+        assert settings.clamped_to_official_limits is True
+
+    def test_official_at_limits_never_warns(self):
+        settings = MusicBrainzConnectionSettings(
+            api_url=OFFICIAL, rate_limit=1.0, concurrent_searches=6
+        )
+        assert settings.clamped_to_official_limits is False
+
+    def test_official_below_limits_never_warns(self):
+        settings = MusicBrainzConnectionSettings(
+            api_url=OFFICIAL, rate_limit=0.5, concurrent_searches=3
+        )
+        assert settings.rate_limit == 0.5
+        assert settings.concurrent_searches == 3
+        assert settings.clamped_to_official_limits is False
+
+    @pytest.mark.parametrize("rate,concurrent", [(500.0, 64), (0, 64)])
+    def test_mirror_extremes_never_set_the_warning(self, rate, concurrent):
+        settings = MusicBrainzConnectionSettings(
+            api_url=MIRROR, rate_limit=rate, concurrent_searches=concurrent
+        )
+        assert settings.clamped_to_official_limits is False

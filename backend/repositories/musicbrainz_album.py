@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 import msgspec
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, InvalidExternalPayloadError
 from models.album import AlbumInfo
 from models.search import SearchResult
 from services.preferences_service import PreferencesService
@@ -31,6 +31,7 @@ from infrastructure.cache.cache_keys import (
 )
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
+from repositories.musicbrainz_base import get_mb_api_base
 from models.musicbrainz import recording_release_group_rank
 from repositories.musicbrainz_base import (
     build_recording_search_query,
@@ -73,6 +74,40 @@ def _record_mb_degradation(msg: str) -> None:
     ctx = try_get_degradation_context()
     if ctx:
         ctx.record(IntegrationResult.error(source="musicbrainz", msg=msg))
+
+
+def _record_mb_unmappable_payload(method: str) -> None:
+    """Record a deterministic payload-shape failure for candidate recall.
+
+    Recall methods return empty results on failure; this marker lets the
+    identification service classify the empty recall as
+    ``UNMAPPABLE_PROVIDER_PAYLOAD`` instead of a transient provider outage
+    (F-IDENT-02). The shared breaker stays closed either way.
+    """
+    ctx = try_get_degradation_context()
+    if ctx:
+        ctx.record(
+            IntegrationResult.deterministic_error(
+                source="musicbrainz",
+                msg=f"MusicBrainz {method} returned an unmappable payload.",
+            )
+        )
+
+
+def _raise_unmappable_payload(
+    exc: InvalidExternalPayloadError, method: str
+) -> InvalidExternalPayloadError:
+    """Record a deterministic MusicBrainz payload-shape failure and re-raise it.
+
+    `InvalidExternalPayloadError` is deliberately non-breaking and non-retriable at
+    `mb_api_get`, so this keeps the shared breaker closed and never caches the failed
+    result. It stays a typed error so contribution callers can separate a deterministic
+    payload problem from a genuine provider outage.
+    """
+    _record_mb_degradation(
+        f"MusicBrainz {method} returned an unmappable payload: {exc}"
+    )
+    return exc
 
 
 class _ReleaseGroupSearchPayload(msgspec.Struct):
@@ -465,6 +500,9 @@ class MusicBrainzAlbumMixin:
                 cache_key, results, ttl_seconds=advanced_settings.cache_ttl_search
             )
             return results
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload("release-group search")
+            return []
         except Exception as e:  # noqa: BLE001
             # CircuitOpenError is expected while the breaker is open; the
             # degradation record is the signal, an error log per call is spam.
@@ -571,6 +609,9 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload(f"release-group {mbid} fetch")
+            return None
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"Failed to fetch release group {mbid}: {e}")
@@ -687,6 +728,27 @@ class MusicBrainzAlbumMixin:
         if cached is False:
             return None
 
+        # ST2 P1 read-tier: durable canonical_redirect (identity lane ->
+        # official-source-only gate). Store errors log-and-fall-through.
+        canonical_store = getattr(self, "_mb_canonical_store", None)
+        if canonical_store is not None:
+            try:
+                persisted = await canonical_store.get_canonical_redirect(
+                    "recording",
+                    [recording_mbid],
+                    official_source_only=True,
+                )
+                if recording_mbid.casefold() in persisted:
+                    resolved_id = persisted[recording_mbid.casefold()]
+                    await self._cache.set(cache_key, resolved_id, ttl_seconds=3600)
+                    return resolved_id
+            except Exception:  # noqa: BLE001 - store miss falls to wire
+                logger.warning(
+                    "Canonical-redirect store read failed for %s",
+                    recording_mbid[:8],
+                    exc_info=True,
+                )
+
         async def load() -> str | None:
             try:
                 result = await mb_api_get(
@@ -700,9 +762,33 @@ class MusicBrainzAlbumMixin:
                     "MusicBrainz recording identity is temporarily unavailable."
                 ) from error
             if not result.id:
+                # 600 s miss sentinel STAYS memory-only - do not durably bank
+                # absence (a 404 today may resolve after later edits).
                 await self._cache.set(cache_key, False, ttl_seconds=600)
                 return None
             await self._cache.set(cache_key, result.id, ttl_seconds=3600)
+            # ST2 P1 write-through: bank the redirect durably.
+            if canonical_store is not None:
+                try:
+                    source_host = get_mb_api_base()
+                    await asyncio.shield(
+                        canonical_store.save_canonical_redirect(
+                            [
+                                {
+                                    "entity_kind": "recording",
+                                    "from_mbid": recording_mbid,
+                                    "to_mbid": result.id,
+                                }
+                            ],
+                            source_host,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to persist canonical redirect for %s",
+                        recording_mbid[:8],
+                        exc_info=True,
+                    )
             return result.id
 
         return await mb_deduplicator.dedupe(cache_key, load)
@@ -732,6 +818,8 @@ class MusicBrainzAlbumMixin:
                     priority=priority,
                     decode_type=MbContributionUrl,
                 )
+            except InvalidExternalPayloadError as exc:
+                raise _raise_unmappable_payload(exc, "url resolution") from exc
             except (httpx.HTTPError, CircuitOpenError) as error:
                 raise ExternalServiceError(
                     "MusicBrainz URL resolution is temporarily unavailable."
@@ -797,6 +885,8 @@ class MusicBrainzAlbumMixin:
                     priority=priority,
                     decode_type=MbContributionRelease,
                 )
+            except InvalidExternalPayloadError as exc:
+                raise _raise_unmappable_payload(exc, "release verification") from exc
             except (httpx.HTTPError, CircuitOpenError) as error:
                 raise ExternalServiceError(
                     "MusicBrainz release verification is temporarily unavailable."
@@ -842,6 +932,10 @@ class MusicBrainzAlbumMixin:
                     priority=priority,
                     decode_type=MbContributionReleaseSearch,
                 )
+            except InvalidExternalPayloadError as exc:
+                raise _raise_unmappable_payload(
+                    exc, "duplicate release search"
+                ) from exc
             except (httpx.HTTPError, CircuitOpenError) as error:
                 raise ExternalServiceError(
                     "MusicBrainz release search is temporarily unavailable."
@@ -874,6 +968,9 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload(f"release {release_id} fetch")
+            return None
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"Failed to fetch release {release_id}: {e}")
@@ -883,12 +980,29 @@ class MusicBrainzAlbumMixin:
     async def get_release_group_id_from_release(
         self,
         release_id: str,
+        *,
         priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
     ) -> str | None:
         cache_key = f"{MB_RELEASE_TO_RG_PREFIX}{release_id}"
+
+        # ST2 P1 read-tier: memory -> durable canonical map -> dedupe + wire.
         cached = await self._cache.get(cache_key)
         if cached is not None:
-            return cached if cached != "" else None
+            return cached or None
+        canonical_store = getattr(self, "_mb_canonical_store", None)
+        if canonical_store is not None:
+            try:
+                persisted = await canonical_store.get_release_to_rg_batch([release_id])
+                rg_id = persisted.get(release_id.casefold())
+                if rg_id is not None:
+                    await self._cache.set(cache_key, rg_id, ttl_seconds=86400)
+                    return rg_id or None
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Canonical-map read failed for release %s; falling to wire",
+                    release_id[:8],
+                    exc_info=True,
+                )
 
         dedupe_key = f"{MB_RELEASE_TO_RG_PREFIX}{release_id}"
         return await mb_deduplicator.dedupe(
@@ -897,6 +1011,60 @@ class MusicBrainzAlbumMixin:
                 release_id, cache_key, priority
             ),
         )
+
+    async def get_release_group_ids_batch(
+        self, release_ids: list[str]
+    ) -> dict[str, str | None]:
+        """ST2 P1 optional batch form for fan-out loops: one memory pass +
+        ONE durable-store IN query, then wire-resolve residual misses through
+        the single-id path (which keeps dedup coalescing). Values may be None
+        for ids the tiers could not resolve."""
+        resolved: dict[str, str | None] = {}
+        pending: list[str] = []
+        seen: set[str] = set()
+        for rid in release_ids:
+            rid_normalized = str(rid).strip()
+            if not rid_normalized or rid_normalized in seen:
+                continue
+            seen.add(rid_normalized)
+            cache_key = f"{MB_RELEASE_TO_RG_PREFIX}{rid_normalized}"
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                resolved[rid_normalized] = cached or None
+            else:
+                pending.append(rid_normalized)
+
+        canonical_store = getattr(self, "_mb_canonical_store", None)
+        if pending and canonical_store is not None:
+            try:
+                persisted = await canonical_store.get_release_to_rg_batch(pending)
+                still_pending: list[str] = []
+                for rid in pending:
+                    if rid in persisted:
+                        rg_id = persisted[rid]
+                        await self._cache.set(
+                            f"{MB_RELEASE_TO_RG_PREFIX}{rid}",
+                            rg_id,
+                            ttl_seconds=86400,
+                        )
+                        resolved[rid] = rg_id or None
+                    else:
+                        still_pending.append(rid)
+                pending = still_pending
+            except Exception:  # noqa: BLE001 - store miss falls through to wire
+                logger.warning(
+                    "Canonical-map batch read failed; falling to wire",
+                    exc_info=True,
+                )
+
+        if pending:
+            wire_results = await asyncio.gather(
+                *[self.get_release_group_id_from_release(rid) for rid in pending],
+                return_exceptions=True,
+            )
+            for rid, result in zip(pending, wire_results):
+                resolved[rid] = None if isinstance(result, BaseException) else result
+        return resolved
 
     async def _fetch_release_group_id_from_release(
         self,
@@ -915,6 +1083,26 @@ class MusicBrainzAlbumMixin:
             rg_id = rg.get("id")
             await self._cache.set(cache_key, rg_id or "", ttl_seconds=86400)
 
+            # ST2 P1 write-through: bank the answer durably ('' negative
+            # included - a successfully decoded response that proves "no
+            # release group" is authoritative). Shielded so build
+            # cancellation keeps what was earned.
+            canonical_store = getattr(self, "_mb_canonical_store", None)
+            if canonical_store is not None:
+                source_host = get_mb_api_base()
+                try:
+                    await asyncio.shield(
+                        canonical_store.save_release_to_rg(
+                            {release_id: rg_id or ""}, source_host
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to persist release-to-rg for %s",
+                        release_id[:8],
+                        exc_info=True,
+                    )
+
             positions: dict[str, list[int]] = {}
             for medium in result.media:
                 disc = medium.get("position", 1)
@@ -930,8 +1118,12 @@ class MusicBrainzAlbumMixin:
 
             return rg_id
         except Exception as e:  # noqa: BLE001
+            # F-MATCH-05: a transient provider failure must never become the
+            # definitive empty-string negative cache entry. Only a successfully
+            # decoded response that proves "no release group" may cache that;
+            # here we record degradation and leave the key unset so the next
+            # call can retry once deduplication and the breaker permit it.
             _record_mb_degradation(f"release-to-rg lookup failed: {e}")
-            await self._cache.set(cache_key, "", ttl_seconds=3600)
             return None
 
     async def search_recordings(
@@ -1014,6 +1206,9 @@ class MusicBrainzAlbumMixin:
                 cache_key, matches, ttl_seconds=advanced_settings.cache_ttl_search
             )
             return matches
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload("recording search")
+            return []
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"MusicBrainz recording search failed: {e}")
@@ -1061,12 +1256,15 @@ class MusicBrainzAlbumMixin:
             await self._cache.set(cache_key, rg_id or "", ttl_seconds=86400)
             return rg_id
         except Exception as e:  # noqa: BLE001
+            # F-MATCH-05: same policy as the release-to-rg helper - a transient
+            # failure records degradation and stays uncached; only a decoded
+            # response proving "no selectable group" may cache the definitive
+            # empty sentinel.
             if not isinstance(e, CircuitOpenError):
                 logger.error(
                     f"Failed to resolve recording {recording_mbid} to release group: {e}"
                 )
             _record_mb_degradation(f"recording-to-rg lookup failed: {e}")
-            await self._cache.set(cache_key, "", ttl_seconds=3600)
             return None
 
     async def get_recording_position_on_release(
@@ -1127,6 +1325,9 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload(f"recording {recording_id} fetch")
+            return None
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"Failed to fetch recording {recording_id}: {e}")

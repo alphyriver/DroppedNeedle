@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -8,7 +9,42 @@ import pytest
 from maintenance import feedback_fixes
 
 
-_REPOSITORY_ROOT = Path(__file__).parents[3]
+def _synthetic_repository(tmp_path: Path) -> Path:
+    """Hermetic git worktree: one commit plus one untracked file, so
+    capture_source_identity legitimately reports a dirty tree on any checkout."""
+
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.email=feedback-fixes@example.com",
+                "-c",
+                "user.name=Feedback Fixes Test",
+                *arguments,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    (root / "docker-compose.yml").write_text(
+        "services:\n  droppedneedle:\n    image: droppedneedle:local\n",
+        encoding="utf-8",
+    )
+    git("add", "docker-compose.yml")
+    git("commit", "-q", "--allow-empty", "-m", "synthetic baseline")
+    (root / "app.py").write_text(
+        "APPLICATION_REVISION = 'untracked'\n", encoding="utf-8"
+    )
+    return root
+
+
 _SOURCE_IMAGE = "sha256:" + "1" * 64
 _TARGET_IMAGE = "sha256:" + "2" * 64
 _ENTRYPOINT = ["tini", "--", "/entrypoint.sh"]
@@ -169,7 +205,7 @@ def test_staged_runner_pins_source_captures_migrates_starts_and_rolls_back(
     docker = FakeDocker()
     prepared = feedback_fixes.prepare(
         state_path=state_path,
-        repository_root=_REPOSITORY_ROOT,
+        repository_root=_synthetic_repository(tmp_path),
         data_root=data_root,
         manifest_root=manifest_root,
         runner=docker,
@@ -270,19 +306,24 @@ def test_staged_runner_pins_source_captures_migrates_starts_and_rolls_back(
 
 
 def test_prepare_refuses_active_work(tmp_path: Path) -> None:
+    """F-NL-03: the retired scan_state table is no longer an active-work
+    source; a processing drop-import job must still block prepare."""
     data_root = _data_root(tmp_path)
     with sqlite3.connect(data_root / "cache" / "library.db") as connection:
         connection.execute(
-            "CREATE TABLE scan_state(id INTEGER PRIMARY KEY, status TEXT NOT NULL)"
+            "CREATE TABLE drop_import_jobs("
+            "id TEXT PRIMARY KEY, status TEXT NOT NULL)"
         )
-        connection.execute("INSERT INTO scan_state VALUES (1, 'scanning')")
+        connection.execute(
+            "INSERT INTO drop_import_jobs VALUES ('job-1', 'processing')"
+        )
 
     with pytest.raises(
         feedback_fixes.MaintenanceStageError, match="workload is active"
     ):
         feedback_fixes.prepare(
             state_path=tmp_path / "state.json",
-            repository_root=_REPOSITORY_ROOT,
+            repository_root=_synthetic_repository(tmp_path),
             data_root=data_root,
             manifest_root=tmp_path / "manifest",
             runner=FakeDocker(),
@@ -308,7 +349,7 @@ def test_prepare_requires_recovery_files_outside_data_root(
     with pytest.raises(feedback_fixes.MaintenanceStageError, match="must be outside"):
         feedback_fixes.prepare(
             state_path=state_path,
-            repository_root=_REPOSITORY_ROOT,
+            repository_root=_synthetic_repository(tmp_path),
             data_root=data_root,
             manifest_root=manifest_root,
             runner=FakeDocker(),
@@ -324,7 +365,7 @@ def _prepare_and_build(
     monkeypatch.setattr(feedback_fixes, "_wait_for_health", lambda _url: 200)
     prepared = feedback_fixes.prepare(
         state_path=state_path,
-        repository_root=_REPOSITORY_ROOT,
+        repository_root=_synthetic_repository(tmp_path),
         data_root=data_root,
         manifest_root=tmp_path / "manifest",
         runner=docker,
@@ -491,7 +532,7 @@ def test_build_refuses_when_source_changes_during_image_build(
     docker = FakeDocker()
     prepared = feedback_fixes.prepare(
         state_path=state_path,
-        repository_root=_REPOSITORY_ROOT,
+        repository_root=_synthetic_repository(tmp_path),
         data_root=data_root,
         manifest_root=tmp_path / "manifest",
         runner=docker,

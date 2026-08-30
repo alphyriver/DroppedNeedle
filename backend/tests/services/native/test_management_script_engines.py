@@ -1,3 +1,4 @@
+import unicodedata
 from pathlib import Path
 
 import msgspec
@@ -37,6 +38,26 @@ def _tagging(source: str, *, name: str = "Test tags", script_id: str = "script-1
     return TaggingScriptSettings(id=script_id, name=name, source=source)
 
 
+def _document_with_artists(*, artist: str, album_artist: str | None):
+    document = _document()
+    replacements = {
+        "artist": (artist,),
+        "album_artist": () if album_artist is None else (album_artist,),
+    }
+    metadata = msgspec.structs.replace(
+        document.metadata,
+        fields=tuple(
+            msgspec.structs.replace(field, value=replacements[field.name])
+            if field.name in replacements
+            else field
+            for field in document.metadata.fields
+        ),
+        artist_display=None,
+        album_artist_display=None,
+    )
+    return msgspec.structs.replace(document, metadata=metadata)
+
+
 def test_management_naming_supports_full_variables_and_safe_functions() -> None:
     source = (
         '{if(equals(compilation, true), "Various Artists", albumartist)}/'
@@ -58,6 +79,135 @@ def test_management_naming_supports_full_variables_and_safe_functions() -> None:
     )
     assert result.collision_key == result.relative_path.casefold()
     assert result.rendered_characters == len(result.relative_path)
+
+
+@pytest.mark.parametrize(
+    ("album_artist", "artist", "expected"),
+    [
+        ("Alpha", "Fallback", "A"),
+        (" The National ", "Fallback", "N"),
+        ("\t tHe\u2003National\u00a0", "Fallback", "N"),
+        ("The\tNational", "Fallback", "N"),
+        ("The  Doors", "Fallback", "D"),
+        ("the xx", "Fallback", "X"),
+        ("t0ni", "Fallback", "T"),
+        ("2 Chainz", "Fallback", "#"),
+        ("_m0lly", "Fallback", "#"),
+        ("Öxxö Xööx", "Fallback", "Ö"),
+        ("高橋洋子", "Fallback", "高"),
+        ("The", "Fallback", "T"),
+        ("\u0301Radiohead", "Fallback", "#"),
+        ("ßeta", "Fallback", "S"),
+        ("ﬃn", "Fallback", "F"),
+        (None, "The National", "N"),
+        ("", "Radiohead", "R"),
+        ("  ", "Radiohead", "#"),
+        (None, "", "#"),
+    ],
+)
+def test_management_initial_uses_exact_effective_albumartist_bucket(
+    album_artist, artist, expected
+):
+    result = NamingTemplateEngine().format_management_path(
+        "{initial}",
+        _document_with_artists(artist=artist, album_artist=album_artist),
+        PathCompatibilitySettings(),
+    )
+
+    assert result.relative_path == expected
+    assert len(result.relative_path) == 1
+
+
+def test_management_initial_composes_nfd_artist_before_selecting_the_bucket():
+    composed = "Éclair"
+    decomposed = unicodedata.normalize("NFD", composed)
+    engine = NamingTemplateEngine()
+    compatibility = PathCompatibilitySettings()
+
+    composed_result = engine.format_management_path(
+        "{initial}",
+        _document_with_artists(artist=composed, album_artist=None),
+        compatibility,
+    )
+    decomposed_result = engine.format_management_path(
+        "{initial}",
+        _document_with_artists(artist=decomposed, album_artist=None),
+        compatibility,
+    )
+
+    assert composed_result.relative_path == decomposed_result.relative_path == "É"
+    assert composed_result.collision_key == decomposed_result.collision_key
+
+
+@pytest.mark.parametrize(
+    ("normalization", "expected"),
+    [
+        ("NFC", "Ｔ"),
+        ("NFKC", "A"),
+    ],
+)
+def test_management_initial_honors_normalization_before_article_removal(
+    normalization, expected
+):
+    result = NamingTemplateEngine().format_management_path(
+        "{initial}",
+        _document_with_artists(
+            artist="Fallback",
+            album_artist="Ｔｈｅ\u3000Ａ",
+        ),
+        PathCompatibilitySettings(unicode_normalization=normalization),
+    )
+
+    assert result.relative_path == expected
+    assert len(result.relative_path) == 1
+
+
+@pytest.mark.parametrize("source", ("{initial}", "{upper(initial)}"))
+def test_management_initial_is_valid_in_plain_and_expression_scripts(source):
+    engine = NamingTemplateEngine()
+    engine.validate_management_script(source, script_name="Initial script")
+
+    result = engine.format_management_path(
+        source,
+        _document_with_artists(artist="Fallback", album_artist="The National"),
+        PathCompatibilitySettings(),
+        script_name="Initial script",
+    )
+
+    assert result.relative_path == "N"
+
+
+def test_management_initial_preserves_traversal_blocking_and_collision_keys():
+    engine = NamingTemplateEngine()
+    compatibility = PathCompatibilitySettings()
+    malicious = _document_with_artists(artist="../escape", album_artist=None)
+
+    result = engine.format_management_path(
+        "safe/{initial}/{albumartist}.{ext}",
+        malicious,
+        compatibility,
+    )
+
+    assert result.relative_path == "safe/#/_escape.flac"
+    assert not result.as_path().is_absolute()
+    assert ".." not in result.as_path().parts
+
+    composed = engine.format_management_path(
+        "{initial}/{albumartist}.{ext}",
+        _document_with_artists(artist="Éclair", album_artist=None),
+        compatibility,
+    )
+    decomposed = engine.format_management_path(
+        "{initial}/{albumartist}.{ext}",
+        _document_with_artists(
+            artist=unicodedata.normalize("NFD", "Éclair"),
+            album_artist=None,
+        ),
+        compatibility,
+    )
+
+    assert composed.relative_path == decomposed.relative_path == "É/Éclair.flac"
+    assert composed.collision_key == decomposed.collision_key
 
 
 def test_external_artwork_naming_has_explicit_artwork_context() -> None:
@@ -501,3 +651,52 @@ def test_settings_round_trip_new_path_compatibility_controls() -> None:
         normalized.profiles[0].organization.compatibility.windows_legacy_path_limit
         is True
     )
+
+
+def test_format_management_literal_path_never_parses_template_bodies() -> None:
+    """F-075/F-083: the literal-path entry point applies only output-side
+    normalization - brace-bearing directory names round-trip untouched and a
+    body like {title} stays literal instead of resolving as a variable."""
+    compatibility = PathCompatibilitySettings()
+    result = NamingTemplateEngine().format_management_literal_path(
+        "Live {2020}/Live {Deluxe}/{title} $special cover.jpg",
+        compatibility,
+        script_name="Default external artwork naming",
+        root=Path("/music"),
+    )
+
+    assert result.relative_path == (
+        "Live {2020}/Live {Deluxe}/{title} $special cover.jpg"
+    )
+    assert result.collision_key == (
+        unicodedata.normalize("NFC", result.relative_path).casefold()
+    )
+    assert result.rendered_characters == len(result.relative_path)
+
+
+def test_format_management_literal_path_normalizes_and_enforces_limits() -> None:
+    """F-075: literal paths get the same NFC/cleaning/length pipeline as
+    rendered templates, including CJK components and limit enforcement."""
+    engine = NamingTemplateEngine()
+    cjk_name = "宇宙のアルバム"
+    result = engine.format_management_literal_path(
+        f"{cjk_name}/cover.jpg",
+        PathCompatibilitySettings(),
+        script_name="Default external artwork naming",
+        root=Path("/music"),
+    )
+    assert result.relative_path == f"{cjk_name}/cover.jpg"
+    assert result.collision_key == f"{cjk_name.casefold()}/cover.jpg"
+
+    with pytest.raises(ScriptValidationError, match="traversing"):
+        engine.format_management_literal_path(
+            "../escape.jpg",
+            PathCompatibilitySettings(),
+            script_name="Default external artwork naming",
+        )
+    with pytest.raises(PathLimitExceededError):
+        engine.format_management_literal_path(
+            "x" * 300 + ".jpg",
+            PathCompatibilitySettings(maximum_path_length=180),
+            script_name="Default external artwork naming",
+        )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import http.client
 import json
@@ -63,8 +64,12 @@ class _WorkingMigrationError(AutomaticUpgradeError):
 
 
 class _UpgradeHealthHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args: Any, health_path: str, **kwargs: Any) -> None:
+        self.health_path = health_path
+        super().__init__(*args, **kwargs)
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path == "/health":
+        if self.path == self.health_path:
             body = b'{"status":"upgrading"}'
             self.send_response(200)
         else:
@@ -80,8 +85,11 @@ class _UpgradeHealthHandler(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def _upgrade_health_server(port: int):
-    server = ThreadingHTTPServer(("0.0.0.0", port), _UpgradeHealthHandler)
+def _upgrade_health_server(port: int, base_path: str):
+    handler = functools.partial(
+        _UpgradeHealthHandler, health_path=f"{base_path}/health"
+    )
+    server = ThreadingHTTPServer(("0.0.0.0", port), handler)
     thread = Thread(target=server.serve_forever, name="upgrade-health", daemon=True)
     thread.start()
     try:
@@ -140,6 +148,20 @@ def _database_has_marker(database: Path) -> bool:
             )
     except sqlite3.Error:
         return False
+
+
+def _quick_check_failure(database: Path) -> str | None:
+    """F2/H2: physical integrity gate for the working copy, read-only so the
+    probe itself can never dirty a database it is about to vouch for."""
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            rows = connection.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as error:
+        return f"the integrity probe failed: {error}"
+    problems = [str(row[0]) for row in rows if str(row[0]) != "ok"]
+    if not problems:
+        return None
+    return problems[0]
 
 
 def _sqlite_backup(source: Path, destination: Path) -> None:
@@ -394,8 +416,11 @@ def _replace_database(source: Path, destination: Path) -> None:
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         expected = _sha256(temporary)
-        for suffix in ("-wal", "-shm"):
-            Path(f"{destination}{suffix}").unlink(missing_ok=True)
+        # From stage `promoting` onward the manifest-verified backup is
+        # authoritative: these sidecars are quarantined rather than destroyed
+        # so a crash in this window leaves the previous WAL recoverable by
+        # hand, while every restart path restores from the backup wholesale.
+        quarantined = _quarantine_database_sidecars(destination)
         try:
             os.replace(temporary, destination)
         except OSError:
@@ -422,8 +447,42 @@ def _replace_database(source: Path, destination: Path) -> None:
                     "The upgraded library database could not be verified "
                     "after installation."
                 )
+        for sibling in quarantined:
+            sibling.unlink(missing_ok=True)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _quarantine_database_sidecars(destination: Path) -> list[Path]:
+    """Rename live -wal/-shm sidecars to sibling quarantine names instead of
+    destroying them, so a crash before the swap preserves the previous WAL.
+    Filesystems without atomic rename keep the legacy unlink behavior."""
+    quarantined: list[Path] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{destination}{suffix}")
+        if not sidecar.exists():
+            continue
+        sibling = destination.with_name(
+            f".{destination.name}{suffix}.upgrade-{uuid.uuid4().hex}.quarantine"
+        )
+        try:
+            os.replace(sidecar, sibling)
+        except OSError:
+            logger.warning("automatic_upgrade.database_sidecar_quarantine_unavailable")
+            sidecar.unlink(missing_ok=True)
+        else:
+            quarantined.append(sibling)
+    return quarantined
+
+
+def _discard_quarantined_sidecars(destination: Path) -> None:
+    """Sweep superseded quarantine siblings once a replacement or restored
+    database is verified in place; leftovers from crashed windows die here."""
+    for suffix in ("-wal", "-shm"):
+        for sibling in destination.parent.glob(
+            f".{destination.name}{suffix}.upgrade-*.quarantine"
+        ):
+            sibling.unlink(missing_ok=True)
 
 
 def restore_upgrade_backup(settings: Settings, backup: UpgradeBackup) -> None:
@@ -443,6 +502,7 @@ def restore_upgrade_backup(settings: Settings, backup: UpgradeBackup) -> None:
         _replace_file(backup.config, config)
     else:
         config.unlink(missing_ok=True)
+    _discard_quarantined_sidecars(database)
 
 
 def prepare_working_copy(settings: Settings, backup: UpgradeBackup) -> Path:
@@ -477,10 +537,15 @@ def promote_working_copy(settings: Settings, working: Path) -> None:
         raise AutomaticUpgradeError(
             "The checked library upgrade is missing its completion marker."
         )
+    quick_check = _quick_check_failure(working_database)
+    if quick_check is not None:
+        raise AutomaticUpgradeError(
+            "The upgraded library database failed its PRAGMA quick_check "
+            f"integrity gate: {quick_check}"
+        )
     if working_config.is_file():
         _replace_file(working_config, settings.config_file_path)
     _replace_database(working_database, settings.library_db_path)
-
 
 def _restore_interrupted_upgrade(settings: Settings, state_path: Path) -> None:
     state = _read_state(state_path)
@@ -568,6 +633,33 @@ def _run_working_migration(working: Path) -> dict[str, Any]:
     return evidence
 
 
+
+def _write_unexpected_child_failure(
+    error_type: str,
+    reconciliation: Any,
+    migrator: Any,
+) -> None:
+    """F3/F4: unexpected child failures leave sanitized evidence carrying the
+    last batch cursor and the reconciliation outcome."""
+    failure: dict[str, Any] = {
+        "reason": "migration_failed",
+        "error_type": error_type,
+    }
+    snapshot_source = getattr(migrator, "progress_snapshot", None)
+    snapshot = snapshot_source() if callable(snapshot_source) else None
+    if snapshot is not None:
+        failure["batch_progress"] = snapshot
+    if reconciliation is not None:
+        reconciliation_evidence = reconciliation.evidence()
+        if reconciliation_evidence is not None:
+            failure["path_reconciliation"] = reconciliation_evidence
+    try:
+        _write_state(get_settings().cache_dir / _FAILURE_EVIDENCE_FILE, failure)
+    except OSError:
+        logger.error("automatic_upgrade.failure_state_write_failed")
+
+
+
 async def _perform_target_migration() -> dict[str, Any]:
     from core.dependencies.cache_providers import (
         get_native_library_store,
@@ -587,116 +679,162 @@ async def _perform_target_migration() -> dict[str, Any]:
     preferences = get_preferences_service()
     typed_settings = preferences.get_typed_library_settings()
     store = get_native_library_store()
-    reconciliation = await LegacyPathReconciler(store, typed_settings).reconcile()
-    if reconciliation.mode == "exact":
-        preferences.retarget_library_roots_for_upgrade(
-            dict(reconciliation.root_retargets)
+    reconciliation: Any = None
+    migrator: BoundedLegacyCatalogMigrator | None = None
+    try:
+        reconciler = LegacyPathReconciler(store, typed_settings)
+        try:
+            reconciliation = await reconciler.reconcile(
+                emit_progress=lambda message: print(f"[upgrade] {message}", flush=True)
+            )
+        finally:
+            await reconciler.aclose()
+        if reconciliation.mode == "exact":
+            preferences.retarget_library_roots_for_upgrade(
+                dict(reconciliation.root_retargets)
+            )
+            get_library_policy_resolver.cache_clear()
+        resolver = get_library_policy_resolver()
+        if reconciliation.mode in {"exact", "remapped"}:
+            print(
+                "[upgrade] Reconciled legacy library paths "
+                f"for {reconciliation.library_file_count:,} catalog files and "
+                f"{reconciliation.review_row_count:,} review rows.",
+                flush=True,
+            )
+        migrator = BoundedLegacyCatalogMigrator(
+            store,
+            resolver,
+            emit_progress=lambda message: print(message, flush=True),
+            path_projector=(
+                reconciliation.project if reconciliation.mode == "remapped" else None
+            ),
+            skip_unmappable_paths=True,
         )
-        get_library_policy_resolver.cache_clear()
-    resolver = get_library_policy_resolver()
-    if reconciliation.mode in {"exact", "remapped"}:
-        print(
-            "[upgrade] Reconciled legacy library paths "
-            f"for {reconciliation.library_file_count:,} catalog files and "
-            f"{reconciliation.review_row_count:,} review rows.",
-            flush=True,
-        )
-    outcome = await BoundedLegacyCatalogMigrator(
-        store,
-        resolver,
-        emit_progress=lambda message: print(message, flush=True),
-        path_projector=(
-            reconciliation.project if reconciliation.mode == "remapped" else None
-        ),
-        skip_unmappable_paths=True,
-    ).migrate(MIGRATION_ID)
-    report = outcome.report
-    if outcome.skipped_counts:
-        skipped = ", ".join(
-            f"{kind}={count:,}"
-            for kind, count in sorted(outcome.skipped_counts.items())
-        )
-        print(
-            f"[upgrade] Left {sum(outcome.skipped_counts.values()):,} legacy records "
-            f"pending ({skipped}). Re-add their library roots and they will be "
-            "imported automatically.",
-            flush=True,
-        )
-    if outcome.blocker_count:
-        blocker_reason_counts = {
-            key: value for key, value in outcome.blocker_reason_counts.items() if value
-        }
-        failure_evidence: dict[str, Any] = {
-            "reason": "unresolved_references",
-            "blocker_count": outcome.blocker_count,
-            "unresolved_reference_counts": {
-                count.kind: count.unresolved
+        outcome = await migrator.migrate(MIGRATION_ID)
+        report = outcome.report
+        if outcome.skipped_counts:
+            skipped = ", ".join(
+                f"{kind}={count:,}"
+                for kind, count in sorted(outcome.skipped_counts.items())
+            )
+            print(
+                f"[upgrade] Left {sum(outcome.skipped_counts.values()):,} legacy records "
+                f"pending ({skipped}). Re-add their library roots and they will be "
+                "imported automatically.",
+                flush=True,
+            )
+        if outcome.blocker_count:
+            blocker_reason_counts = {
+                key: value
+                for key, value in outcome.blocker_reason_counts.items()
+                if value
+            }
+            failure_evidence: dict[str, Any] = {
+                "reason": "unresolved_references",
+                "blocker_count": outcome.blocker_count,
+                "unresolved_reference_counts": {
+                    count.kind: count.unresolved
+                    for count in report.reference_counts
+                    if count.user_id is None and count.unresolved
+                },
+                "blocker_reason_counts": blocker_reason_counts,
+            }
+            if outcome.blocker_details:
+                failure_evidence["details"] = outcome.blocker_details
+            reconciliation_evidence = reconciliation.evidence()
+            if reconciliation_evidence is not None:
+                failure_evidence["path_reconciliation"] = reconciliation_evidence
+            _write_state(
+                get_settings().cache_dir / _FAILURE_EVIDENCE_FILE,
+                failure_evidence,
+            )
+            reference_summary = ", ".join(
+                f"{count.kind}={count.unresolved:,}"
                 for count in report.reference_counts
                 if count.user_id is None and count.unresolved
-            },
-            "blocker_reason_counts": blocker_reason_counts,
-        }
-        if outcome.blocker_details:
-            failure_evidence["details"] = outcome.blocker_details
-        reconciliation_evidence = reconciliation.evidence()
-        if reconciliation_evidence is not None:
-            failure_evidence["path_reconciliation"] = reconciliation_evidence
-        _write_state(
-            get_settings().cache_dir / _FAILURE_EVIDENCE_FILE,
-            failure_evidence,
-        )
-        reference_summary = ", ".join(
-            f"{count.kind}={count.unresolved:,}"
-            for count in report.reference_counts
-            if count.user_id is None and count.unresolved
-        )
-        reason_summary = ", ".join(
-            f"{key}={value:,}" for key, value in sorted(blocker_reason_counts.items())
-        )
-        details = "; ".join(
-            part
-            for part in (
-                f"references: {reference_summary}" if reference_summary else "",
-                f"reasons: {reason_summary}" if reason_summary else "",
             )
-            if part
-        )
-        noun = "record" if outcome.blocker_count == 1 else "records"
-        detail_suffix = f": {details}" if details else ""
-        print(
-            f"[upgrade] Migration checks found {outcome.blocker_count:,} unresolved "
-            f"{noun}{detail_suffix}.",
-            flush=True,
-        )
-        raise AutomaticUpgradeError(
-            "The existing library contains references that cannot be upgraded safely."
-        )
-    if (
-        report.embedded_art_reads
-        or report.network_calls
-        or report.tag_reads
-        or report.fingerprints
-    ):
-        raise AutomaticUpgradeError(
-            "The library upgrade attempted work that is not allowed during startup."
-        )
-    print("[upgrade] Running independent target startup validation.", flush=True)
-    validation = await TargetStartupValidator(
-        get_native_library_store(),
-        lambda: {root.id for root in resolver.settings.library_roots},
-        emit_progress=lambda message: print(f"[upgrade] {message}", flush=True),
-    ).validate("cutover")
+            reason_summary = ", ".join(
+                f"{key}={value:,}"
+                for key, value in sorted(blocker_reason_counts.items())
+            )
+            details = "; ".join(
+                part
+                for part in (
+                    f"references: {reference_summary}" if reference_summary else "",
+                    f"reasons: {reason_summary}" if reason_summary else "",
+                )
+                if part
+            )
+            noun = "record" if outcome.blocker_count == 1 else "records"
+            detail_suffix = f": {details}" if details else ""
+            print(
+                f"[upgrade] Migration checks found {outcome.blocker_count:,} unresolved "
+                f"{noun}{detail_suffix}.",
+                flush=True,
+            )
+            blocked_error = AutomaticUpgradeError(
+                "The existing library contains references that cannot be upgraded safely."
+            )
+            blocked_error.evidence = failure_evidence
+            raise blocked_error
+        if (
+            report.embedded_art_reads
+            or report.network_calls
+            or report.tag_reads
+            or report.fingerprints
+        ):
+            # F3/H3a: this abort previously raised bare, leaving no record of
+            # which forbidden-work counter tripped.
+            forbidden_failure: dict[str, Any] = {
+                "reason": "forbidden_work",
+                "network_calls": report.network_calls,
+                "tag_reads": report.tag_reads,
+                "fingerprints": report.fingerprints,
+                "embedded_art_reads": report.embedded_art_reads,
+            }
+            reconciliation_evidence = reconciliation.evidence()
+            if reconciliation_evidence is not None:
+                forbidden_failure["path_reconciliation"] = reconciliation_evidence
+            _write_state(
+                get_settings().cache_dir / _FAILURE_EVIDENCE_FILE,
+                forbidden_failure,
+            )
+            forbidden_error = AutomaticUpgradeError(
+                "The library upgrade attempted work that is not allowed during startup."
+            )
+            forbidden_error.evidence = forbidden_failure
+            raise forbidden_error
+        print("[upgrade] Running independent target startup validation.", flush=True)
+        validation = await TargetStartupValidator(
+            get_native_library_store(),
+            lambda: {root.id for root in resolver.settings.library_roots},
+            emit_progress=lambda message: print(f"[upgrade] {message}", flush=True),
+        ).validate("cutover")
+    except Exception as error:  # noqa: BLE001 - every child failure leaves evidence
+        if not isinstance(getattr(error, "evidence", None), dict):
+            _write_unexpected_child_failure(
+                type(error).__name__, reconciliation, migrator
+            )
+        raise
     print("[upgrade] Working-copy migration checks passed.", flush=True)
+    settings = get_settings()
+    provenance_counts = await store.get_migration_provenance_counts(MIGRATION_ID)
     evidence = {
         "source_revision": report.source_revision,
         "root_revision": report.root_revision,
-        "reference_counts": len(report.reference_counts),
+        "reference_counts": dict(sorted(provenance_counts.items())),
         "invariants": validation["invariants"],
         "network_calls": report.network_calls,
         "tag_reads": report.tag_reads,
         "fingerprints": report.fingerprints,
         "embedded_art_reads": report.embedded_art_reads,
+        "source_sha256": _sha256(settings.library_db_path),
+        "config_sha256": _sha256(settings.config_file_path),
+        "image_version": _image_version(),
     }
+    if outcome.phase_timings_ms:
+        evidence["phase_timings_ms"] = outcome.phase_timings_ms
     reconciliation_evidence = reconciliation.evidence()
     if reconciliation_evidence is not None:
         evidence["path_reconciliation"] = reconciliation_evidence
@@ -829,6 +967,23 @@ def run_automatic_copy_upgrade(
                     "automatic_upgrade.restore_failed",
                     extra={"error_type": type(restore_error).__name__},
                 )
+                # F3/H3c: never leave a bare `promoting` record behind - the
+                # next boot must see that this install could not be restored.
+                try:
+                    _write_state(
+                        state_path,
+                        {
+                            "format_version": 1,
+                            "upgrade_id": UPGRADE_ID,
+                            "stage": "promoting",
+                            "image_version": image_version,
+                            "backup_directory": str(backup.directory),
+                            "restore_failed": True,
+                            "restore_error_type": type(restore_error).__name__,
+                        },
+                    )
+                except OSError:
+                    logger.error("automatic_upgrade.failure_state_write_failed")
                 raise AutomaticUpgradeError(
                     "The library upgrade failed and its backup could not be restored. "
                     "Do not start an older image against this database."
@@ -844,8 +999,13 @@ def run_automatic_copy_upgrade(
             "restored_signature": _current_signature(database, config),
         }
         failure_evidence = getattr(error, "evidence", None)
-        if isinstance(failure_evidence, dict):
-            failure["failure_evidence"] = failure_evidence
+        if not isinstance(failure_evidence, dict):
+            # F3/H3b: failures without their own evidence still record why.
+            failure_evidence = {
+                "reason": "unhandled_exception",
+                "error_type": type(error).__name__,
+            }
+        failure["failure_evidence"] = failure_evidence
         _remove_working_copy(backup)
         try:
             _write_state(state_path, failure)
@@ -884,10 +1044,10 @@ def _config_path_before_settings() -> Path:
     return root / "config" / "config.json"
 
 
-def _target_ready(port: int) -> bool:
+def _target_ready(port: int, base_path: str) -> bool:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
     try:
-        connection.request("GET", "/health")
+        connection.request("GET", f"{base_path}/health")
         response = connection.getresponse()
         payload = json.loads(response.read())
         return response.status == 200 and payload.get("status") == "ok"
@@ -1092,6 +1252,15 @@ def _record_post_admission_startup_failure(
     startup_started: float,
     returncode: int | None,
 ) -> None:
+    """F8/H8 ops semantics: a post-admission target startup failure
+    deliberately keeps ``stage="completed"`` - the upgraded database is KEPT,
+    not rolled back - and appends a ``target_startup_failure`` evidence
+    object to the state record instead of flipping the stage to ``failed``.
+    Operators must inspect the full state record (or grep for
+    ``target_startup_failure``): grepping for ``failed`` misses this failure
+    class entirely. A later healthy boot clears the flag via
+    ``_clear_post_admission_startup_failure``, returning the record to a
+    plain completed state."""
     state_path = settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json"
     state = _read_state(state_path)
     if state is None or state.get("stage") != "completed":
@@ -1291,7 +1460,7 @@ def run_target_supervisor(
             target_became_ready = False
             while process.poll() is None:
                 readiness_idle_deadline = observe_progress(readiness_idle_deadline)
-                if _target_ready(port):
+                if _target_ready(port, settings.base_path):
                     target_became_ready = True
                     _clear_post_admission_startup_failure(settings)
                     if progress_path is not None:
@@ -1442,7 +1611,9 @@ def main() -> int:
             in {"running", "migrating", "promoting", "promoted_pending_startup"}
         )
         if needs_upgrade:
-            with _upgrade_health_server(_container_port(settings)):
+            with _upgrade_health_server(
+                _container_port(settings), settings.base_path
+            ):
                 run_automatic_copy_upgrade(
                     settings, require_target_admission=start_target
                 )

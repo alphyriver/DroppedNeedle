@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import (
+    ExternalServiceError,
+    InvalidExternalPayloadError,
+)
 from infrastructure.cache.memory_cache import InMemoryCache
 from models.library_contribution import (
     MusicBrainzVerifiedRelease,
@@ -13,6 +16,7 @@ from models.library_contribution import (
 )
 from services.native.library_contribution_service import LibraryContributionService
 from services.native.library_contribution_verification_worker import (
+    UNMAPPABLE_PROVIDER_PAYLOAD,
     LibraryContributionVerificationWorker,
 )
 from tests.services.native.test_library_contribution_service import _service
@@ -268,6 +272,41 @@ async def test_musicbrainz_outage_returns_job_to_durable_retry(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_deterministic_payload_routes_to_review_with_unmappable_code(
+    tmp_path,
+) -> None:
+    service, musicbrainz, path, contribution_id = await _returned_contribution(tmp_path)
+    musicbrainz.get_release_for_verification.side_effect = InvalidExternalPayloadError(
+        "unexpected payload shape"
+    )
+    worker = LibraryContributionVerificationWorker(service._store, service, musicbrainz)
+
+    assert await worker.run_once("worker-1", now=time.time() + 1) == "needs_review"
+
+    review = await service.get(contribution_id)
+    assert review.state == "needs_review"
+    assert review.result_release_mbid == _RELEASE_MBID
+    assert review.next_actions == ["retry_verification", "cancel"]
+    with sqlite3.connect(path) as connection:
+        job = connection.execute(
+            "SELECT state, last_failure_code FROM "
+            "library_contribution_verification_jobs"
+        ).fetchone()
+        assert job == ("needs_review", UNMAPPABLE_PROVIDER_PAYLOAD)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM local_album_external_identities"
+            ).fetchone()[0]
+            == 0
+        )
+        attempt = connection.execute(
+            "SELECT terminal_reason_code FROM library_identification_attempts "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        assert attempt[0] == UNMAPPABLE_PROVIDER_PAYLOAD
+
+
+@pytest.mark.asyncio
 async def test_bounded_propagation_failure_preserves_mbid_for_manual_retry(
     tmp_path,
 ) -> None:
@@ -342,3 +381,46 @@ async def test_recovery_runs_bounded_retention_cleanup_hourly() -> None:
     assert store.recover_library_contribution_verification_leases.await_count == 3
     assert contributions.purge_expired_provider_data.await_count == 2
     assert store.clean_library_contribution_records.await_count == 2
+
+@pytest.mark.asyncio
+async def test_circuit_open_defers_with_retry_after_and_no_early_claim(tmp_path) -> None:
+    from infrastructure.resilience.retry import CircuitOpenError
+
+    service, musicbrainz, path, _ = await _returned_contribution(tmp_path)
+    worker = LibraryContributionVerificationWorker(service._store, service, musicbrainz)
+    delays: list[float] = []
+    orig = service._store.work_wakeups.notify_after
+
+    def spy(kind: str, delay: float) -> None:
+        if kind == "contribution":
+            delays.append(delay)
+        return orig(kind, delay)
+
+    service._store.work_wakeups.notify_after = spy  # type: ignore[assignment]
+    musicbrainz.get_release_for_verification = AsyncMock(side_effect=CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=100))
+    now = time.time() + 10
+    result = await worker.run_once("worker-1", now=now)
+    assert result == "retry_scheduled"
+    assert len(delays) == 1
+    assert 99.9 <= delays[0] <= 101.0
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before, state FROM library_contribution_verification_jobs").fetchone()
+        assert row is not None
+        assert row["state"] == "queued"
+        assert row["not_before"] >= now + 100 - 0.5
+    early = await service._store.claim_library_contribution_verification(worker_id="worker-2", now=now + 50, lease_seconds=90)
+    assert early is None
+    later = await service._store.claim_library_contribution_verification(worker_id="worker-2", now=now + 101, lease_seconds=90)
+    assert later is not None
+    service._store.work_wakeups.notify_after = orig  # type: ignore[assignment]
+    delays.clear()
+    service._store.work_wakeups.notify_after = spy  # type: ignore[assignment]
+    musicbrainz.get_release_for_verification = AsyncMock(side_effect=CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=1))
+    result2 = await worker.run_claimed(later, "worker-2", now=now + 101)
+    assert result2 == "retry_scheduled"
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before FROM library_contribution_verification_jobs WHERE id = ?", (later["id"],)).fetchone()
+        assert row["not_before"] >= now + 101 + 30 - 0.5
+    assert delays[0] >= 29.9

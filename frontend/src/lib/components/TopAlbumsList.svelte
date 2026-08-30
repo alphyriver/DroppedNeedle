@@ -5,7 +5,8 @@
 	import type { TopAlbum } from '$lib/types';
 	import { colors } from '$lib/colors';
 	import { libraryStore } from '$lib/stores/library';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import AlbumImage from './AlbumImage.svelte';
 	import LibraryBadge from './LibraryBadge.svelte';
 	import LastFmPlaceholder from './LastFmPlaceholder.svelte';
@@ -21,6 +22,8 @@
 	let { albums, loading = false, configured = true, source = '' }: Props = $props();
 
 	let requestingIds = new SvelteSet<string>();
+
+	const topAlbumRequest = requestAlbum();
 
 	let libraryMbids = new SvelteSet<string>();
 	let requestedMbids = new SvelteSet<string>();
@@ -59,11 +62,14 @@
 		requestingIds.add(id);
 
 		try {
-			await requestAlbum(id, {
-				artist: album.artist_name ?? undefined,
-				album: album.title ?? undefined,
-				year: album.year ?? undefined
-			});
+			await topAlbumRequest
+				.mutateAsync({
+					release_group_mbid: id,
+					artist_name: album.artist_name ?? undefined,
+					album_title: album.title ?? undefined,
+					year: album.year ?? undefined
+				})
+				.catch(() => null);
 		} finally {
 			requestingIds.delete(id);
 		}
@@ -89,7 +95,9 @@
 		<div class="bg-base-200 rounded-lg p-4 text-center flex-1 flex items-center justify-center">
 			<div>
 				<p class="text-base-content/70 text-sm">Connect a music service to see popular albums</p>
-				<a href="/profile#scrobbling" class="btn btn-primary btn-xs mt-2">Configure</a>
+				<a href={withBasePath('/profile#scrobbling')} class="btn btn-primary btn-xs mt-2"
+					>Configure</a
+				>
 			</div>
 		</div>
 	{:else if albums.length === 0}

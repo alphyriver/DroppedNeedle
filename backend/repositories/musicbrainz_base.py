@@ -9,6 +9,11 @@ from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.queue.priority_queue import RequestPriority, get_priority_queue
 from infrastructure.http.deduplication import RequestDeduplicator
 from infrastructure.service_health import report_breaker_health
+from infrastructure.observability.provider_counters import (
+    record_provider_call,
+    record_rate_limit_headers,
+)
+from repositories.edition_policy import recall_key
 
 _mb_api_base: str = "https://musicbrainz.org/ws/2"
 
@@ -39,6 +44,25 @@ mb_circuit_breaker = CircuitBreaker(
 # https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting
 # A larger bucket preserves the average refill rate but still permits a cold-start burst.
 mb_rate_limiter = TokenBucketRateLimiter(rate=1.0, capacity=1)
+
+# P2 full-mirror tier (owner decision 2026-08-24): rate_limit=0 on a
+# NON-official host means "Unlimited" - the client-side limiter is bypassed
+# entirely for that host. Priority lanes, mb_deduplicator, and the circuit
+# breaker below are NEVER relaxed; only this token bucket is skipped. The
+# official-host defaults above stay pinned; appliers
+# (musicbrainz_repository._apply_settings / settings_service.
+# on_musicbrainz_settings_changed) flip this flag from saved settings.
+_mb_limiter_bypassed = False
+
+
+def set_mb_rate_limiter_bypass(bypass: bool) -> None:
+    global _mb_limiter_bypassed
+    _mb_limiter_bypassed = bypass
+
+
+def mb_rate_limiter_bypassed() -> bool:
+    return _mb_limiter_bypassed
+
 
 mb_deduplicator = RequestDeduplicator()
 
@@ -76,7 +100,12 @@ def get_mb_http_client() -> httpx.AsyncClient:
     circuit_breaker=mb_circuit_breaker,
     retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
     non_breaking_exceptions=(InvalidExternalPayloadError,),
-    non_retriable_exceptions=(InvalidExternalPayloadError,),
+    non_retriable_exceptions=(
+        InvalidExternalPayloadError,
+        httpx.ConnectError,
+        httpx.ProtocolError,
+    ),
+    retry_budget_seconds=2.5,
 )
 async def mb_api_get(
     path: str,
@@ -87,12 +116,23 @@ async def mb_api_get(
     priority_mgr = get_priority_queue()
     semaphore = await priority_mgr.acquire_slot(priority)
     async with semaphore:
-        await mb_rate_limiter.acquire()
+        if not _mb_limiter_bypassed:
+            await mb_rate_limiter.acquire(priority=int(priority))
         client = get_mb_http_client()
         url = f"{get_mb_api_base()}{path}"
         request_params = dict(params) if params else {}
         request_params["fmt"] = "json"
-        response = await client.get(url, params=request_params)
+        try:
+            response = await client.get(url, params=request_params)
+        except httpx.HTTPError:
+            # transport-level failure (e.g. h2 stream reset): never produced a
+            # response, so record http_error with no status and re-raise
+            record_provider_call("musicbrainz", priority, None)
+            raise
+        record_provider_call("musicbrainz", priority, response.status_code)
+        # QW11 Part 2: free early-warning telemetry from the same response.
+        # Separate gauge - this cannot perturb the call counters above.
+        record_rate_limit_headers("musicbrainz", response.headers)
         if response.status_code == 404:
             if decode_type is not None:
                 return decode_type()
@@ -115,8 +155,12 @@ async def mb_api_get(
                 f"MusicBrainz returned an unexpected payload shape for {path}: {exc}"
             ) from exc
         except (msgspec.DecodeError, TypeError) as exc:
-            raise ExternalServiceError(
-                f"MusicBrainz returned invalid JSON payload for {path}: {exc}"
+            # F-056: a malformed-but-deterministic payload says nothing about
+            # service health - it must not count toward the breaker and must
+            # not be retriable, or poison payloads churn forever as
+            # PROVIDER_TEMPORARILY_UNAVAILABLE.
+            raise InvalidExternalPayloadError(
+                f"MusicBrainz returned an unparseable payload for {path}: {exc}"
             ) from exc
 
 
@@ -178,6 +222,37 @@ def get_score(item: dict[str, Any]) -> int:
         return int(score) if score else 0
     except (ValueError, TypeError):
         return 0
+
+
+def select_edition(
+    releases: list[dict[str, Any]], target_track_count: int
+) -> str | None:
+    """Single source of truth for best-edition selection inside one release
+    group (F-062): every identification lane must resolve the SAME group to
+    the SAME edition MBID.
+
+    Ranking follows the approved NEW-DECISION-02 order
+    (.dev-notes/LibraryAudit/DECISIONS-LIVE.md): evidence score ->
+    Official status -> parsed date with explicit precision -> XW country
+    preference -> release MBID. The evidence-score term is absent here BY
+    CONSTRUCTION: this runs at recall time on release-group metadata,
+    before any candidate release has been fetched and scored, so the
+    shared key (repositories.edition_policy.recall_key) is the signed
+    order minus that term.
+
+    Editions with zero track-count are skipped CONSISTENTLY - they carry
+    no medium data to match against and previously drifted the
+    scanner/drop-import lane away from the native pipeline. Returns None
+    only when no release carries a usable id or any track data at all.
+    """
+    scored: list[tuple] = []
+    for release in releases:
+        key = recall_key(release, target_track_count)
+        if key is not None:
+            scored.append(key)
+    if not scored:
+        return None
+    return min(scored)[4]
 
 
 def dedupe_by_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -4,8 +4,9 @@ and (username, filenames) status/cancel correlation."""
 
 import asyncio
 import threading
+import unicodedata
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import httpx
 import pytest
@@ -349,6 +350,83 @@ async def test_get_status_correlates_by_filename(mock_repo):
     assert status.status == "completed"
 
 
+@pytest.mark.asyncio
+async def test_status_keeps_nfc_equivalent_requested_files_separate():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfc", nfc, "Completed, Succeeded"),
+        _attempt("nfd", nfd, "Completed, Succeeded"),
+    ]
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+
+    status = await repo.get_status(_h("alice", [nfc, nfd]))
+
+    assert status.status == "completed"
+    assert status.files_total == 2
+    assert status.files_completed == 2
+    assert status.files_failed == 0
+    assert status.matched_transfers == 2
+
+
+@pytest.mark.asyncio
+async def test_status_and_abort_prefer_exact_unicode_spelling():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfd", nfd, "Completed, Errored"),
+        _attempt("nfc", nfc, "Completed, Succeeded"),
+    ]
+    client.cancel_transfer.return_value = True
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+    handle = _h("alice", [nfc])
+
+    status = await repo.get_status(handle)
+    assert status.status == "completed"
+    assert status.files_completed == 1
+    assert status.matched_transfers == 1
+
+    assert await repo.abort(handle) is True
+    assert client.cancel_transfer.await_args_list == [call("alice", "nfc")]
+
+
+@pytest.mark.asyncio
+async def test_status_falls_back_to_lone_alternate_unicode_spelling():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfd", nfd, "Completed, Succeeded"),
+    ]
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+
+    status = await repo.get_status(_h("alice", [nfc]))
+
+    assert status.status == "completed"
+    assert status.files_completed == 1
+    assert status.matched_transfers == 1
+
+
 def test_status_aggregates_live_queue_position_range():
     repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
     handle = _h("alice", ["dir/1.flac", "dir/2.flac", "dir/3.flac"])
@@ -381,6 +459,188 @@ def test_status_aggregates_live_queue_position_range():
     assert status.status == "queued"
     assert status.queue_position_start == 91
     assert status.queue_position_end == 100
+
+
+def _attempt(id_, filename, state, requested_at=None, started_at=None):
+    """One slskd transfer record. slskd appends ONE RECORD PER RETRY ATTEMPT per
+    file (#131/#253), so these tests stack several records per filename."""
+    return SlskdTransfer(
+        id=id_,
+        username="alice",
+        filename=filename,
+        state=state,
+        requested_at=requested_at,
+        started_at=started_at,
+    )
+
+
+def test_status_judges_latest_attempt_not_stale_success():
+    # Bug #131/#253 headline case: slskd keeps one record PER RETRY ATTEMPT, so a
+    # stale "Completed, Succeeded" row must NOT shadow a newer TimedOut one - the
+    # file counts failed by its latest attempt and never lands in succeeded_filenames.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("old", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="2026-08-01T10:00:00Z"),
+        _attempt("new", "dir/1.flac", "Completed, TimedOut",
+                 requested_at="2026-08-01T12:00:00Z"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 0
+    assert status.files_failed == 1
+    assert status.succeeded_filenames == []
+    assert status.status == "failed"
+    assert status.matched_transfers == 2  # raw record count stays observable
+
+
+def test_status_recovered_success_after_error_counts_succeeded():
+    # Mirror image: a newer successful attempt overrides an older Errored one
+    # (exercises the StartedAt fallback - only StartedAt carries timestamps here).
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("old", "dir/1.flac", "Completed, Errored",
+                 started_at="2026-08-01T10:00:00Z"),
+        _attempt("new", "dir/1.flac", "Completed, Succeeded",
+                 started_at="2026-08-01T11:00:00Z"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.files_failed == 0
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.status == "completed"
+
+
+def test_status_timestamped_attempt_beats_absent_or_garbage_timestamps():
+    # PR #222: requestedAt is absent/unparseable on some slskd versions. Any
+    # parseable timestamp outranks an absent or garbage one; among records with no
+    # usable timestamp the later list position wins (list-order tie-break).
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="2026-08-01T10:00:00Z"),
+        _attempt("b", "dir/1.flac", "Completed, Errored"),  # later, but no timestamps
+    ]
+    status = repo._aggregate_status(handle, transfers)
+    assert status.files_completed == 1
+    assert status.succeeded_filenames == ["dir/1.flac"]
+
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Errored"),
+        _attempt("b", "dir/1.flac", "Completed, Succeeded"),
+    ]
+    status = repo._aggregate_status(handle, transfers)
+    assert status.files_completed == 1  # untimestamped tie -> later record wins
+    assert status.succeeded_filenames == ["dir/1.flac"]
+
+
+def test_status_completed_errored_is_terminal_failed_not_uncounted():
+    """#292: slskd writes mid-transfer failures as 'Completed, Errored' - the file
+    must count FAILED (terminal) under the dedup, never fall through every branch
+    and stall the task until the watchdogs fire."""
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac", "dir/2.flac"])
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="2026-08-01T10:00:00Z"),
+        _attempt("b", "dir/2.flac", "Completed, Errored",
+                 requested_at="2026-08-01T10:01:00Z"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.files_failed == 1
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.status == "partial"
+
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="not-a-timestamp"),
+        _attempt("b", "dir/1.flac", "Completed, TimedOut"),
+    ]
+    status = repo._aggregate_status(handle, transfers)
+    assert status.files_failed == 1  # garbage timestamp ranks oldest -> b wins
+    assert status.succeeded_filenames == []
+
+
+def test_status_identical_duplicate_records_collapse_to_one_file():
+    # The same attempt surfaced twice must not double the completed count or
+    # duplicate the entry in succeeded_filenames.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded"),
+        _attempt("b", "dir/1.flac", "Completed, Succeeded"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.files_failed == 0
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.matched_transfers == 2
+
+
+def test_status_dedupe_keys_normalise_path_separators():
+    # The same file reported once with backslashes and once with forward slashes is
+    # ONE file: separator-normalised keys, like every filename comparison here.
+    # Without normalisation the stale-success shadow would yield "partial".
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("a", "dir\\1.flac", "Completed, Succeeded"),
+        _attempt("b", "dir/1.flac", "Completed, TimedOut"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 0
+    assert status.files_failed == 1
+    assert status.status == "failed"
+    assert status.matched_transfers == 2
+
+
+def test_status_single_record_per_file_behaviour_unchanged():
+    # The plain case - one record per file - aggregates exactly as before dedup:
+    # terminal mix, active flag, queue positions and byte math are untouched.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac", "dir/2.flac"])
+    transfers = [
+        SlskdTransfer(
+            id="1",
+            username="alice",
+            filename="dir/1.flac",
+            state="Completed, Succeeded",
+            size=100,
+            bytes_transferred=100,
+        ),
+        SlskdTransfer(
+            id="2",
+            username="alice",
+            filename="dir/2.flac",
+            state="Queued",
+            place_in_queue=7,
+        ),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.status == "downloading"
+    assert status.files_total == 2
+    assert status.files_completed == 1
+    assert status.files_failed == 0
+    assert status.has_active_transfer is False
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.queue_position_start == 7
+    assert status.queue_position_end == 7
+    assert status.bytes_total == 100
 
 
 @pytest.mark.asyncio
@@ -515,6 +775,118 @@ async def test_get_file_path_deep_nested_non_username_folder(tmp_path):
         _h("peer1"), "@@p\\Music\\Abbey Road (1969)\\01 - Come Together.flac", size=10
     )
     assert path == f.resolve()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_form", "disk_form"),
+    [("NFC", "NFD"), ("NFD", "NFC")],
+)
+async def test_get_file_path_normalised_nested_alias_returns_real_path(
+    tmp_path, remote_form, disk_form
+):
+    visible_name = "05 - Héroes Del Sábado.flac"
+    remote_name = unicodedata.normalize(remote_form, visible_name)
+    disk_name = unicodedata.normalize(disk_form, visible_name)
+    folder = tmp_path / "Artist" / "Album"
+    folder.mkdir(parents=True)
+    file_path = folder / disk_name
+    file_path.write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"@@peer\\Music\\Album\\{remote_name}", size=10
+    )
+
+    assert path == file_path.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_ambiguity_fails_closed(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    remote_name = unicodedata.normalize("NFC", visible_name)
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    for folder_name in ("Artist A", "Artist B"):
+        folder = tmp_path / folder_name
+        folder.mkdir()
+        (folder / disk_name).write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(_h("peer1"), f"Music/{remote_name}", size=10) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_prefers_peer_scope(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    peer_file = tmp_path / "peer1" / "Album" / disk_name
+    peer_file.parent.mkdir(parents=True)
+    peer_file.write_bytes(b"abcdefghij")
+    other_file = tmp_path / "Other Artist" / disk_name
+    other_file.parent.mkdir()
+    other_file.write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"Music/Album/{unicodedata.normalize('NFC', visible_name)}", size=10
+    )
+
+    assert path == peer_file.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_skips_outside_symlink(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / disk_name).write_bytes(b"abcdefghij")
+    (tmp_path / "peer1").mkdir()
+    (tmp_path / "peer1" / "escaped").symlink_to(outside, target_is_directory=True)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"),
+            f"Music/Album/{unicodedata.normalize('NFC', visible_name)}",
+            size=10,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_fallback_shares_entry_bound(
+    tmp_path, monkeypatch
+):
+    import repositories.slskd.slskd_repository as slskd_repository
+
+    monkeypatch.setattr(slskd_repository, "_MAX_WALK_ENTRIES", 1)
+    folder = tmp_path / "peer1"
+    folder.mkdir()
+    (folder / "noise.txt").write_bytes(b"x")
+    alias = unicodedata.normalize("NFD", "01 - Héroes.flac")
+    (folder / alias).write_bytes(b"abcdefghij")
+
+    original_iterdir = Path.iterdir
+
+    def _iterdir_in_test_order(path):
+        entries = list(original_iterdir(path))
+        if path == folder:
+            entries.sort(key=lambda entry: entry.name != "noise.txt")
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir_in_test_order)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"),
+            "peer1/01 - Héroes.flac",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

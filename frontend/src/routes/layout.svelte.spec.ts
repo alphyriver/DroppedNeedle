@@ -102,7 +102,7 @@ const { followingEventsMock } = vi.hoisted(() => ({
 vi.mock('$lib/queries/following/FollowingEvents', () => ({
 	createFollowingEvents: vi.fn(() => followingEventsMock)
 }));
-vi.mock('$lib/stores/cacheTtl', () => ({ initCacheTTLs: vi.fn() }));
+vi.mock('$lib/stores/cacheTtl.svelte', () => ({ initCacheTTLs: vi.fn() }));
 const { syncStatusMock } = vi.hoisted(() => ({
 	syncStatusMock: { connect: vi.fn(), disconnect: vi.fn() }
 }));
@@ -142,9 +142,9 @@ vi.mock('$lib/utils/requestsApi', () => ({
 	fetchActiveRequests: vi.fn().mockResolvedValue({ items: [] }),
 	fetchRequestHistory: vi.fn().mockResolvedValue({ items: [], total: 0 })
 }));
-vi.mock('$lib/utils/albumRequest', async (importOriginal) => ({
-	...(await importOriginal<typeof import('$lib/utils/albumRequest')>()),
-	requestBatch: batchRequestMock
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/downloads/DownloadMutations.svelte')>()),
+	requestBatch: () => ({ mutateAsync: batchRequestMock })
 }));
 vi.mock('$lib/utils/navigationProgress', () => ({
 	createNavigationProgressController: vi.fn(() => ({
@@ -208,7 +208,7 @@ import { integrationStore } from '$lib/stores/integration';
 import { nowPlayingStore } from '$lib/stores/nowPlayingSessions.svelte';
 import { nowPlayingReporter } from '$lib/stores/nowPlayingReporter.svelte';
 import { authStore, type AuthUser } from '$lib/stores/authStore.svelte';
-import { initCacheTTLs } from '$lib/stores/cacheTtl';
+import { initCacheTTLs } from '$lib/stores/cacheTtl.svelte';
 import { playbackToast } from '$lib/stores/playbackToast.svelte';
 import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
 import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';

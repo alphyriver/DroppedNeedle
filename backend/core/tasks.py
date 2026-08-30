@@ -12,19 +12,18 @@ from infrastructure.validators import is_unknown_mbid, is_valid_mbid
 from services.library_service import LibraryService
 from services.preferences_service import PreferencesService
 from core.task_registry import TaskRegistry
+from repositories.listenbrainz_repository import listenbrainz_rate_limit_cooldown_active
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from services.album_service import AlbumService
-    from services.native.library_scanner import LibraryScanner
     from services.native.download_orchestrator import DownloadOrchestrator
-    from infrastructure.persistence.scan_state_store import ScanStateStore
     from services.audiodb_image_service import AudioDBImageService
     from services.library_precache_service import LibraryPrecacheService
     from infrastructure.persistence import LibraryDB
     from infrastructure.persistence.request_history import RequestHistoryStore
     from infrastructure.persistence.mbid_store import MBIDStore
     from infrastructure.persistence.youtube_store import YouTubeStore
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
     from infrastructure.persistence.wanted_store import WantedStore
     from services.requests_page_service import RequestsPageService
     from services.native.new_release_service import NewReleaseService
@@ -139,166 +138,6 @@ def start_disk_cache_cleanup_task(
     return task
 
 
-_SCAN_FREQ_TO_SECONDS = {
-    "5min": 300,
-    "10min": 600,
-    "30min": 1800,
-    "1hr": 3600,
-    "6hr": 21600,
-    "12hr": 43200,
-    "24hr": 86400,
-    "3d": 259200,
-    "7d": 604800,
-}
-
-# Longest the scheduler sleeps in one go. Long waits are chopped into ticks so a
-# changed schedule (or a finished in-progress scan) is noticed within this window;
-# the final sub-tick sleep still lands exactly on the due moment.
-_SCHEDULER_TICK = 300
-
-
-def _parse_daily_time(value: str) -> tuple[int, int]:
-    """(hour, minute) from an "HH:MM" string, defaulting to 03:00 on anything odd."""
-    try:
-        hh, mm = value.split(":")
-        hour, minute = int(hh), int(mm)
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return hour, minute
-    except (ValueError, AttributeError):
-        pass
-    return 3, 0
-
-
-def _seconds_until_next_scan(
-    freq: str,
-    daily_scan_time: str,
-    last_scan_ts: float | None,
-    now: datetime,
-) -> float:
-    """Seconds to wait before the next scan is due. 0 means "overdue, run now" - which
-    is what lets a restart catch up an overdue scan instead of resetting the clock.
-
-    "daily" fires once at daily_scan_time each day (catching up if that moment already
-    passed today without a scan); the interval values fire on a rolling gap measured
-    from the last actual scan."""
-    if freq == "daily":
-        hour, minute = _parse_daily_time(daily_scan_time)
-        today_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if now < today_at:
-            return (today_at - now).total_seconds()
-        already_scanned_today = (
-            last_scan_ts is not None and last_scan_ts >= today_at.timestamp()
-        )
-        if already_scanned_today:
-            return (today_at + timedelta(days=1) - now).total_seconds()
-        return 0.0
-
-    interval = _SCAN_FREQ_TO_SECONDS.get(freq, 86400)
-    if last_scan_ts is None:
-        return 0.0
-    return max(0.0, (last_scan_ts + interval) - now.timestamp())
-
-
-async def auto_scan_library_periodically(
-    scanner: "LibraryScanner",
-    scan_state: "ScanStateStore",
-    preferences_service: PreferencesService,
-) -> None:
-    """Incremental native scan on the configured schedule. The next run is computed
-    from the last actual scan (so a restart catches up an overdue scan instead of
-    restarting the interval); a tick is skipped while a scan is already running, and a
-    failure never kills the loop."""
-    from pathlib import Path as _Path
-
-    logger.info("Auto-scan scheduler started")
-    while True:
-        try:
-            schedule = preferences_service.get_library_scan_schedule()
-            freq = schedule.scan_frequency
-            if freq == "manual":
-                await asyncio.sleep(_SCHEDULER_TICK)
-                continue
-
-            state = await scan_state.get_state()
-            if state.get("status") == "scanning":
-                await asyncio.sleep(_SCHEDULER_TICK)
-                continue
-
-            delay = _seconds_until_next_scan(
-                freq, schedule.daily_scan_time, state.get("started_at"), datetime.now()
-            )
-            if delay > 0:
-                await asyncio.sleep(min(delay, _SCHEDULER_TICK))
-                continue
-
-            paths = [
-                _Path(p)
-                for root in preferences_service.get_typed_library_settings_raw().library_roots
-                for p in [root.path]
-            ]
-            if not paths:
-                await asyncio.sleep(_SCHEDULER_TICK)
-                continue
-
-            logger.info("Auto-scan starting (schedule=%s)", freq)
-            success = True
-            try:
-                await scanner.scan(paths)
-                final = await scan_state.get_state()
-                success = final.get("status") != "error"
-            except Exception as e:
-                logger.error("Auto-scan failed: %s", e, exc_info=True)
-                success = False
-
-            schedule = preferences_service.get_library_scan_schedule()
-            preferences_service.save_library_scan_schedule(
-                clone_with_updates(
-                    schedule, {"last_scan": int(time()), "last_scan_success": success}
-                )
-            )
-            logger.info("Auto-scan finished (success=%s)", success)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error("Auto-scan task failed: %s", e, exc_info=True)
-            await asyncio.sleep(60)
-
-
-def start_library_auto_scan_task(
-    scanner: "LibraryScanner",
-    scan_state: "ScanStateStore",
-    preferences_service: PreferencesService,
-) -> asyncio.Task:
-    task = asyncio.create_task(
-        auto_scan_library_periodically(scanner, scan_state, preferences_service)
-    )
-    TaskRegistry.get_instance().register("library-auto-scan", task)
-    return task
-
-
-def start_library_scan_resume_task(
-    scanner: "LibraryScanner",
-    library_paths: "list[Path]",
-) -> asyncio.Task:
-    """(AUD-3) Resume an interrupted native library scan on startup. Registered so
-    it is cancelled at shutdown like every other long-lived task."""
-
-    async def _resume() -> None:
-        try:
-            await scanner.startup_check(library_paths)
-        except Exception as e:  # noqa: BLE001
-            logger.error("Library scan resume failed: %s", e, exc_info=True)
-
-    task = asyncio.create_task(_resume())
-    TaskRegistry.get_instance().register("library-scan-resume", task)
-    task.add_done_callback(
-        lambda t: logger.error("Library scan resume task error: %s", t.exception())
-        if not t.cancelled() and t.exception()
-        else None
-    )
-    return task
-
-
 def start_download_resume_task(orchestrator: "DownloadOrchestrator") -> asyncio.Task:
     """(AUD-3) Resume in-progress / queued downloads on startup without blocking it;
     the orchestrator dispatches each resumed task in the background."""
@@ -348,6 +187,52 @@ def start_acquisition_cleanup_task(get_cleanup_service) -> asyncio.Task:
     task.add_done_callback(
         lambda value: logger.error(
             "Acquisition cleanup task error: %s", value.exception()
+        )
+        if not value.cancelled() and value.exception()
+        else None
+    )
+    return task
+
+
+_ACQUISITION_ORPHAN_RECONCILE_INTERVAL = 3600.0
+_ACQUISITION_ORPHAN_RECONCILE_INITIAL_DELAY = 600.0
+
+
+async def run_acquisition_orphan_reconcile_periodically(
+    get_cleanup_service,
+    interval: float = _ACQUISITION_ORPHAN_RECONCILE_INTERVAL,
+    delay: float = _ACQUISITION_ORPHAN_RECONCILE_INITIAL_DELAY,
+) -> None:
+    """Close the pre-journal crash gap (#131): sweep complete-dir folders named for
+    DroppedNeedle jobs that no attempt journal owns. Sleep-first so startup
+    recovery journals legacy workspaces before the first destructive pass."""
+    await asyncio.sleep(delay)
+    while True:
+        try:
+            service = get_cleanup_service()
+            removed = await service.reconcile_orphan_folders()
+            if removed:
+                logger.info(
+                    "Acquisition orphan reconcile removed %d folder(s)", removed
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable worker survives one failed sweep
+            logger.exception("Acquisition orphan reconcile sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_acquisition_orphan_reconcile_task(get_cleanup_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        run_acquisition_orphan_reconcile_periodically(get_cleanup_service)
+    )
+    TaskRegistry.get_instance().register("acquisition-orphan-reconcile", task)
+    task.add_done_callback(
+        lambda value: logger.error(
+            "Acquisition orphan reconcile task error: %s", value.exception()
         )
         if not value.cancelled() and value.exception()
         else None
@@ -625,15 +510,21 @@ async def _warm_one_user(
     # _run_registered_warmer_build hard-caps it at DISCOVER_WARMER_HARD_CAP.
     if workload_gate is not None:
         await workload_gate.wait_until_available()
+        if listenbrainz_rate_limit_cooldown_active():
+            return
     await _run_registered_warmer_build(
         f"discover-homepage-warm-{uid}", discover.warm_cache_thorough(uid)
     )
     if workload_gate is not None:
         await workload_gate.wait_until_available()
+        if listenbrainz_rate_limit_cooldown_active():
+            return
     await _run_registered_warmer_build(f"home-warm-{uid}", home.warm_cache(uid))
     if queue_manager is not None:
         if workload_gate is not None:
             await workload_gate.wait_until_available()
+            if listenbrainz_rate_limit_cooldown_active():
+                return
         await queue_manager.start_build(uid)
         try:
             await asyncio.wait_for(
@@ -693,20 +584,11 @@ async def warm_discover_home_periodically(
                 uid = await _pick_due_warmer_user(
                     eligible, last_warmed, attempts, now, get_discover_service()
                 )
-                if uid is not None:
-                    if workload_gate is not None:
-                        await workload_gate.run_warmer_unit(
-                            lambda: _warm_one_user(
-                                uid,
-                                get_discover_service(),
-                                get_home_service(),
-                                last_warmed,
-                                attempts,
-                                get_queue_manager() if get_queue_manager else None,
-                                workload_gate,
-                            )
-                        )
-                    else:
+                if uid is not None and not listenbrainz_rate_limit_cooldown_active():
+
+                    async def warm_if_not_cooling_down() -> None:
+                        if listenbrainz_rate_limit_cooldown_active():
+                            return
                         await _warm_one_user(
                             uid,
                             get_discover_service(),
@@ -716,6 +598,11 @@ async def warm_discover_home_periodically(
                             get_queue_manager() if get_queue_manager else None,
                             workload_gate,
                         )
+
+                    if workload_gate is not None:
+                        await workload_gate.run_warmer_unit(warm_if_not_cooling_down)
+                    else:
+                        await warm_if_not_cooling_down()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1303,6 +1190,7 @@ async def prune_stores_periodically(
     ignored_retention_days: int = 365,
     interval: int = 21600,
     wanted_store: "WantedStore | None" = None,
+    native_store: "NativeLibraryStore | None" = None,
 ) -> None:
     await asyncio.sleep(600)
     while True:
@@ -1314,6 +1202,13 @@ async def prune_stores_periodically(
                 # terminal (stopped/fulfilled) watches age out on the same window
                 # as requests; orphaned seen-candidate rows go with them (§5.1)
                 await wanted_store.prune(request_retention_days)
+            if native_store is not None:
+                # F-PERF-04: bounded 30-day retention for terminal automatic
+                # identification jobs (signed LibraryAudit decision); one batch
+                # per pass, continuation handled by the next interval.
+                await native_store.prune_old_terminal_identification_jobs(
+                    now=time()
+                )
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1330,6 +1225,7 @@ def start_store_prune_task(
     ignored_retention_days: int = 365,
     interval: int = 21600,
     wanted_store: "WantedStore | None" = None,
+    native_store: "NativeLibraryStore | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         prune_stores_periodically(
@@ -1340,6 +1236,7 @@ def start_store_prune_task(
             ignored_retention_days=ignored_retention_days,
             interval=interval,
             wanted_store=wanted_store,
+            native_store=native_store,
         )
     )
     TaskRegistry.get_instance().register("store-prune", task)

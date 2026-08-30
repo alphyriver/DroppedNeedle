@@ -246,10 +246,15 @@ async def start_target_operational_runtime(
         get_youtube_store,
     )
     from core.dependencies.auth_providers import get_auth_store
-    from core.dependencies.repo_providers import get_download_store
+    from core.dependencies.cache_providers import get_native_library_store
+    from core.dependencies.repo_providers import (
+        get_download_store,
+        get_free_music_store,
+    )
     from core.dependencies.service_providers import get_plugin_host
     from core.tasks import (
         start_acquisition_cleanup_task,
+        start_acquisition_orphan_reconcile_task,
         start_artist_discovery_cache_warming_task,
         start_audiodb_sweep_task,
         start_background_upgrade_scan_task,
@@ -280,6 +285,7 @@ async def start_target_operational_runtime(
     except Exception:  # noqa: BLE001 - durable worker continues recovery after startup
         logger.exception("Acquisition cleanup startup recovery failed")
     start_acquisition_cleanup_task(get_acquisition_cleanup_service)
+    start_acquisition_orphan_reconcile_task(get_acquisition_cleanup_service)
     start_download_resume_task(get_target_download_orchestrator())
     start_download_watchdog_task(get_target_download_orchestrator)
     start_download_auto_retry_task(get_target_download_orchestrator)
@@ -320,6 +326,20 @@ async def start_target_operational_runtime(
         await get_download_store().delete_expired_search_jobs()
     except Exception as error:  # noqa: BLE001 - cleanup cannot block startup
         logger.warning("Download search-job cleanup skipped: %s", error)
+    try:
+        from services.native.acquisition.backfill import (
+            run_acquisition_snapshot_backfill,
+        )
+
+        await run_acquisition_snapshot_backfill(
+            get_download_store(),
+            get_free_music_store(),
+            lambda: preferences.get_download_policy(),
+        )
+    except Exception as error:  # noqa: BLE001 - backfill cannot block startup
+        logger.warning(
+            "startup.acquisition_snapshot_backfill_failed", extra={"error": str(error)}
+        )
     try:
         client = get_download_client_repository()
         if client.is_configured():
@@ -390,6 +410,8 @@ async def start_target_operational_runtime(
         ignored_retention_days=advanced.ignored_releases_retention_days,
         interval=advanced.store_prune_interval_hours * 3600,
         wanted_store=get_wanted_store(),
+        # F-PERF-04: the singleton native store joins the six-hour prune pass.
+        native_store=get_native_library_store(),
     )
     start_recycle_bin_prune_task(preferences)
     start_background_upgrade_scan_task(
