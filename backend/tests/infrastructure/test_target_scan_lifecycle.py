@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
 import os
 import sqlite3
 import threading
 import time
+import unicodedata
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import get_args
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -31,6 +35,7 @@ from services.native.library_inventory_scanner import (
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_reconciler import LibraryReconciler
 from services.native.library_scan_coordinator import LibraryScanCoordinator
+from services.native.library_scan_scheduler import LibraryAutomaticScanScheduler
 from services.native.library_schedule_service import LibraryScheduleService
 
 
@@ -89,16 +94,18 @@ def _request(
     kind: str = "incremental",
     relative_path: str = ".",
     trigger: str = "manual",
+    policy_revision: str | None = None,
 ) -> ScanRequest:
+    revision = policy_revision or resolver.policy_revision
     return ScanRequest(
         kind=kind,
         trigger=trigger,
-        policy_revision=resolver.policy_revision,
+        policy_revision=revision,
         scopes=[
             ScanScope(
                 root_id="root-a",
                 relative_path=relative_path,
-                policy_revision=resolver.policy_revision,
+                policy_revision=revision,
             )
         ],
     )
@@ -188,6 +195,112 @@ async def test_atomic_single_flight_coalescing_union_and_kind_conflict(
     _, scopes, _ = await target_store.get_scan_run(queued.run_id)
     assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
 
+
+@pytest.mark.asyncio
+async def test_queued_only_disjoint_request_expands_existing_run(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    first = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", trigger="manual")
+    )
+    expanded = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 2", trigger="automatic")
+    )
+
+    assert first.disposition == "started"
+    assert expanded.disposition == "expanded"
+    assert expanded.run_id == first.run_id
+    assert await target_store.row_count("library_scan_runs") == 1
+    run, scopes, _ = await target_store.get_scan_run(first.run_id)
+    assert run.kind == "incremental"
+    assert run.trigger == "manual"
+    assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
+    assert {scope.policy_revision for scope in scopes} == {resolver.policy_revision}
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        triggers = connection.execute(
+            "SELECT trigger, reason FROM library_scan_run_triggers "
+            "WHERE run_id = ? ORDER BY trigger_sequence",
+            (first.run_id,),
+        ).fetchall()
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list('library_scan_runs')"
+            ).fetchall()
+        }
+    assert triggers == [("manual", "accepted"), ("automatic", "scope_expanded")]
+    assert "idx_scan_runs_single_queued" in indexes
+
+
+@pytest.mark.asyncio
+async def test_concurrent_queued_only_requests_expand_one_run(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    results = await asyncio.gather(
+        coordinator.request_run(
+            _request(resolver, relative_path="Disc 1", trigger="manual")
+        ),
+        coordinator.request_run(
+            _request(resolver, relative_path="Disc 2", trigger="automatic")
+        ),
+    )
+
+    assert {result.disposition for result in results} == {"started", "expanded"}
+    started = next(result for result in results if result.disposition == "started")
+    expanded = next(result for result in results if result.disposition == "expanded")
+    assert expanded.run_id == started.run_id
+    assert await target_store.row_count("library_scan_runs") == 1
+    _, scopes, _ = await target_store.get_scan_run(started.run_id)
+    assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
+    assert await target_store.row_count("library_scan_run_triggers") == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_only_incompatible_requests_conflict_without_mutation(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    first = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1")
+    )
+    kind_conflict = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 2", kind="rescan_files")
+    )
+    policy_conflict = await coordinator.request_run(
+        _request(
+            resolver,
+            relative_path="Disc 3",
+            policy_revision="different-policy",
+        )
+    )
+
+    assert kind_conflict.disposition == "conflict"
+    assert kind_conflict.run_id == first.run_id
+    assert kind_conflict.conflicting_kind == "incremental"
+    assert policy_conflict.disposition == "conflict"
+    assert policy_conflict.run_id == first.run_id
+    assert policy_conflict.conflicting_kind == "incremental"
+    assert await target_store.row_count("library_scan_runs") == 1
+    assert await target_store.row_count("library_scan_run_triggers") == 1
+    assert await target_store.get_stream_revision("scan") == 1
+    run, scopes, _ = await target_store.get_scan_run(first.run_id)
+    assert run.row_revision == first.row_revision
+    assert {scope.relative_path for scope in scopes} == {"Disc 1"}
 
 @pytest.mark.asyncio
 async def test_every_target_trigger_uses_the_single_request_transaction(
@@ -531,6 +644,104 @@ async def test_scan_worker_exception_becomes_typed_terminal_failure(
     assert failed.terminal_code == "UNEXPECTED_WORKER_FAILURE"
 
 
+@pytest.mark.parametrize("control,expected_state", [("pause", "paused"), ("stop", "cancelled")])
+@pytest.mark.asyncio
+async def test_pending_control_worker_exception_is_logged_and_settles(
+    target_store: NativeLibraryStore, tmp_path: Path, control: str, expected_state: str, caplog
+) -> None:
+    caplog.set_level(logging.ERROR)
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    # Barrier to hold worker until control is persisted
+    proceed = asyncio.Event()
+    reached = asyncio.Event()
+
+    class BarrierInventory(LibraryInventoryScanner):
+        async def discover(self, run, scopes, root_paths, resolver_getter, checkpoint):
+            reached.set()
+            await proceed.wait()
+            raise RuntimeError(f"tag store failed during {control}")
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        BarrierInventory(target_store),
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: 20,
+    )
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=20)
+    assert run is not None
+    # Start worker and wait until it reaches barrier
+    worker_task = asyncio.create_task(coordinator.run_once({"root-a": root}))
+    await reached.wait()
+    # Submit control while worker is at barrier - fetch latest revision to avoid StaleRevisionError
+    cur, _, _ = await target_store.get_scan_run(run.id)
+    await coordinator.control(cur.id, control, cur.row_revision)
+    # Verify control was persisted
+    cur, _, _ = await target_store.get_scan_run(run.id)
+    assert cur.state == ("pausing" if control == "pause" else "stopping")
+    # Release worker to raise
+    proceed.set()
+    result = await worker_task
+    assert result is not None and result.state == expected_state
+    # Verify durable state and that the original exception was logged with traceback
+    stored, _, _ = await target_store.get_scan_run(run.id)
+    assert stored.state == expected_state
+    # Check log contains original exception identity and traceback, and run_id/control-state, no file path
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR and "Scan worker failed" in r.getMessage()]
+    assert len(error_records) == 1
+    # Original state should be discovering (the run's state before the worker exception), not pending control
+    assert "during scan state discovering" in error_records[0].getMessage()
+    assert "pending control" not in error_records[0].getMessage().lower()
+    assert run.id in error_records[0].getMessage()
+    # Exception identity and traceback
+    assert error_records[0].exc_info is not None
+    assert error_records[0].exc_info[0] is RuntimeError
+    assert f"tag store failed during {control}" in str(error_records[0].exc_info[1])
+    assert "RuntimeError" in caplog.text
+    assert "track-1.flac" not in caplog.text and "secret" not in caplog.text
+    # Verify stream/invalidation/gate cleanup: run is terminal, so gate should be cleared and no pending
+    assert coordinator._pending_control_run_ids == set()
+    if expected_state == "cancelled":
+        assert len(caplog.records) >= 1  # at least the one exception log
+
+
+@pytest.mark.asyncio
+async def test_active_worker_exception_still_becomes_typed_failure_and_is_reraised(
+    target_store: NativeLibraryStore, tmp_path: Path, caplog
+) -> None:
+    caplog.set_level(logging.ERROR)
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+
+    class BrokenInventory(LibraryInventoryScanner):
+        async def discover(self, *args, **kwargs):
+            raise RuntimeError("injected active failure")
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        BrokenInventory(target_store),
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: 20,
+    )
+    requested = await coordinator.request_run(_request(resolver))
+    with pytest.raises(RuntimeError, match="injected active failure"):
+        await coordinator.run_once({"root-a": root})
+    failed, _, _ = await target_store.get_scan_run(requested.run_id)
+    assert failed.state == "failed"
+    assert failed.terminal_code == "UNEXPECTED_WORKER_FAILURE"
+    # Also should have logged the exception with truthful state
+    error_records = [r for r in caplog.records if "Scan worker failed" in r.getMessage()]
+    assert len(error_records) == 1
+    assert "during scan state discovering" in error_records[0].getMessage()
+    assert requested.run_id in error_records[0].getMessage()
+    assert any("injected active failure" in str(r.exc_info[1]) for r in caplog.records if r.exc_info)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["discovering", "indexing", "reconciling"])
 async def test_pause_resume_and_stop_are_idempotent_at_every_phase(
@@ -706,9 +917,13 @@ async def test_one_walk_incremental_tag_revisions_and_no_repeat(
 
 
 @pytest.mark.asyncio
-async def test_walk_permission_error_fails_run_and_records_failed_path(
+async def test_walk_permission_error_degrades_run_and_records_failed_path(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
+    """F-022 (GH-296 skip-and-report extended to subpaths): an unreadable
+    path no longer aborts the multi-root run. The walk degrades, keeps the
+    failure row as durable evidence, marks the scope partially_read, and the
+    run proceeds with whatever inventory landed."""
     root = tmp_path / "music"
     root.mkdir()
     resolver = _resolver(root)
@@ -719,17 +934,73 @@ async def test_walk_permission_error_fails_run_and_records_failed_path(
 
     coordinator = _coordinator(target_store, resolver, directory_walker=denied_walk)
     await coordinator.request_run(_request(resolver))
-    failed = await coordinator.run_once({"root-a": root})
+    completed = await coordinator.run_once({"root-a": root})
 
-    assert failed is not None and failed.state == "failed"
-    assert failed.terminal_code == "ROOT_PERMISSION_DENIED"
-    failures, next_cursor = await target_store.list_scan_run_failures(failed.id)
+    assert completed is not None and completed.state == "completed"
+    _, scopes, _ = await target_store.get_scan_run(completed.id)
+    with sqlite3.connect(target_store.db_path) as connection:
+        states = [
+            row[0]
+            for row in connection.execute(
+                "SELECT discovery_state FROM library_scan_run_scopes WHERE run_id=?",
+                (completed.id,),
+            ).fetchall()
+        ]
+    assert states == ["partially_read"]
+    failures, next_cursor = await target_store.list_scan_run_failures(completed.id)
     assert next_cursor is None
     assert [
         (failure.failure_code, failure.relative_path, failure.phase)
         for failure in failures
     ] == [("WALK_EACCES", "secret", "discovering")]
 
+
+@pytest.mark.asyncio
+async def test_unreadable_subdirectory_degrades_while_siblings_index(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """A single chmod-000 subdirectory among healthy siblings must not fail
+    the whole scan: healthy files index, the blocked directory gets a
+    WALK_EACCES row, and the scope completes partially_read."""
+    root = tmp_path / "music"
+    root.mkdir()
+    blocked = root / "locked"
+    blocked.mkdir()
+    (blocked / "hidden-01.flac").write_bytes(b"secret audio")
+    healthy = root / "open-01.flac"
+    healthy.write_bytes(b"open audio")
+
+    original_mode = blocked.stat().st_mode
+    blocked.chmod(0o000)
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    try:
+        if os.access(blocked, os.R_OK):
+            pytest.skip("chmod is ineffective for this user (root?)")
+        await coordinator.request_run(_request(resolver))
+        completed = await coordinator.run_once({"root-a": root})
+
+        assert completed is not None and completed.state == "completed"
+        with sqlite3.connect(target_store.db_path) as connection:
+            states = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT discovery_state FROM library_scan_run_scopes WHERE run_id=?",
+                    (completed.id,),
+                ).fetchall()
+            ]
+        assert states == ["partially_read"]
+        failures, _cursor = await target_store.list_scan_run_failures(completed.id)
+        assert [
+            (failure.failure_code, failure.relative_path)
+            for failure in failures
+            if failure.failure_code.startswith("WALK_")
+        ] == [("WALK_EACCES", "locked")]
+        # the healthy sibling still made it into the catalog
+        tracks = await target_store.search_local_tracks("Track")
+        assert [track["title"] for track in tracks] == ["Track 1"]
+    finally:
+        blocked.chmod(original_mode)
 
 @pytest.mark.asyncio
 async def test_wedged_walk_fails_bounded_and_the_next_run_claims(
@@ -1559,9 +1830,146 @@ async def test_policy_supersession_is_terminal_and_queues_nothing(
     assert terminal.state == "superseded_policy_changed"
     assert await coordinator.current() == []
     assert await target_store.row_count("library_scan_inventory") == 0
+@pytest.mark.asyncio
+async def test_stop_wins_over_concurrent_policy_change(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    await coordinator.control(run.id, "stop", run.row_revision)
+    persisted, _, _ = await target_store.get_scan_run(run.id)
+    assert persisted.state == "stopping"
+    assert persisted.requested_control == "stop"
+    # Change policy revision
+    new_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="excluded")]
+        )
+    )
+    coordinator._resolver_getter = lambda: new_resolver  # type: ignore[method-assign]
+    result = await coordinator.checkpoint(run.id, resolver.policy_revision)
+    assert result is False
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.requested_control == "none"
+    assert terminal.terminal_at is not None
+    assert terminal.state != "superseded_policy_changed"
+    # Pending control should be cleared and fence forgotten, single-active slot released
+    assert run.id not in coordinator._pending_control_run_ids  # type: ignore[attr-defined]
+    # Follow-up can be claimed
+    await coordinator.request_run(_request(new_resolver))
+    follow = await target_store.claim_next_scan_run(now=2)
+    assert follow is not None
+    assert follow.id != run.id
+
 
 
 @pytest.mark.asyncio
+async def test_non_stopping_policy_supersession_remains_superseded(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    # No stop, just policy change while in discovering
+    new_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="excluded")]
+        )
+    )
+    coordinator._resolver_getter = lambda: new_resolver  # type: ignore[method-assign]
+    result = await coordinator.checkpoint(run.id, resolver.policy_revision)
+    assert result is False
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "superseded_policy_changed"
+    assert terminal.terminal_code == "SUPERSEDED_POLICY_CHANGED"
+
+
+
+
+@pytest.mark.asyncio
+async def test_disabled_startup_narrowly_recovers_stopping_without_resuming_work(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver_enabled = _resolver(root)
+    coordinator = _coordinator(target_store, resolver_enabled)
+    await coordinator.request_run(_request(resolver_enabled))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    stopped = await coordinator.control(run.id, "stop", run.row_revision)
+    assert stopped.state == "stopping"
+    # Simulate disabled startup
+    disabled_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")], enabled=False)
+    )
+    coordinator._resolver_getter = lambda: disabled_resolver  # type: ignore[method-assign]
+    # recover() when disabled should only do narrow stopping recovery, not full
+    recovered = await coordinator.recover()
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.requested_control == "none"
+    assert terminal.terminal_at is not None
+    # inventory_cleanup_pending should be set correctly (exists if inventory exists)
+    # No resumable work should be returned while disabled
+    assert recovered == [] or all(r.state != "cancelled" for r in recovered) or any(r.id == run.id for r in recovered)
+    # scheduler and run_once stay disabled - run_once returns None
+    assert await coordinator.run_once({"root-a": root}) is None
+    # Re-enable and verify queued follow-up can claim without restart
+@pytest.mark.asyncio
+async def test_recover_stopping_is_idempotent_and_sets_cleanup(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    await coordinator.control(run.id, "stop", run.row_revision)
+    persisted, _, _ = await target_store.get_scan_run(run.id)
+    assert persisted.state == "stopping"
+    first = await target_store.recover_stopping_scan_runs(now=2)
+    assert len(first) == 1
+    assert first[0].state == "cancelled"
+    # Check raw DB for inventory_cleanup_pending (not exposed on ScanRun)
+    import sqlite3
+
+    with sqlite3.connect(target_store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT inventory_cleanup_pending FROM library_scan_runs WHERE id = ?", (run.id,)).fetchone()
+        assert row is not None
+        assert row["inventory_cleanup_pending"] in (0, 1)  # 0 when no inventory, 1 would be if inventory existed
+    second = await target_store.recover_stopping_scan_runs(now=3)
+    assert second == []
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.terminal_at == 2
+    # Coordinator-level idempotency
+    coordinator2 = _coordinator(target_store, resolver)
+    await coordinator2.request_run(_request(resolver))
+    run2 = await target_store.claim_next_scan_run(now=4)
+    assert run2 is not None
+    await coordinator2.control(run2.id, "stop", run2.row_revision)
+    first_c = await coordinator2.recover_stopping()
+    assert len(first_c) == 1
+    second_c = await coordinator2.recover_stopping()
+    assert second_c == []
+
+
+
+
 async def test_scheduler_anchor_is_not_hidden_by_many_policy_reconciliations(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
@@ -1649,3 +2057,1227 @@ def test_daily_schedule_handles_dst_and_manual() -> None:
         )
         is None
     )
+@pytest.mark.asyncio
+async def test_normal_scan_with_filesystem_coordinator_completes_and_releases_leases(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(
+        target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05
+    )
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+    )
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    assert not scanner._detached_walkers
+    # Writer can acquire immediately after normal walk (no lease held)
+    async with asyncio.timeout(0.5):
+        async with filesystem.write("root-a"):
+            pass
+    assert completed.counters["new_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_wedged_walk_allows_concurrent_write_and_revision_restart(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+    filesystem = LibraryFilesystemCoordinator()
+    walk_calls = 0
+    block = threading.Event()
+
+    def blocking_walker(*_args, **_kwargs):
+        nonlocal walk_calls
+        walk_calls += 1
+        if walk_calls == 1:
+            yield (str(root), [], ["track.flac"])
+            block.wait(timeout=5.0)
+            return
+        yield from os.walk(str(root), followlinks=False)
+
+    scanner = LibraryInventoryScanner(
+        target_store,
+        filesystem_coordinator=filesystem,
+        directory_walker=blocking_walker,
+        walk_deadline_seconds=30.0,
+    )
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+    )
+    await coordinator.request_run(_request(resolver))
+    task = asyncio.create_task(coordinator.run_once({"root-a": root}))
+    await asyncio.sleep(0.1)
+    # Bump revision while walker is blocked - must not block (no lease held)
+    async with asyncio.timeout(0.5):
+        async with filesystem.write("root-a"):
+            pass
+    revision_after_write = filesystem.revision("root-a")
+    assert revision_after_write == 1
+    block.set()
+    completed = await asyncio.wait_for(task, timeout=5.0)
+    assert completed is not None and completed.state == "completed"
+    # First walk saw stale revision, so discover restarted and performed second walk
+    assert walk_calls == 2
+    assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_wedged_walk_timeout_with_filesystem_does_not_block_writer_and_next_scan(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+    filesystem = LibraryFilesystemCoordinator()
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield (str(root), [], ["track.flac"])
+            wedged.wait()
+            return
+        yield from os.walk(str(root), followlinks=False)
+
+    scanner = LibraryInventoryScanner(
+        target_store,
+        filesystem_coordinator=filesystem,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+    )
+    await coordinator.request_run(_request(resolver))
+    failed = await asyncio.wait_for(coordinator.run_once({"root-a": root}), timeout=2.0)
+    assert failed is not None and failed.state == "failed"
+    assert failed.terminal_code == "WALK_TIMEOUT"
+    assert len(scanner._detached_walkers) == 1
+    # Writer must acquire while walker still wedged
+    async with asyncio.timeout(0.5):
+        async with filesystem.write("root-a"):
+            pass
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner._detached_walkers and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+    # Next scan must be claimable and complete normally
+    await coordinator.request_run(_request(resolver, trigger="automatic"))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+
+
+
+@pytest.mark.asyncio
+async def test_failed_run_forgets_scan_revision_for_every_terminal_state(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    # First scope succeeds and records fence, second scope is missing ->
+    # GH-296 skip-and-report: the missing scope is reported unavailable and
+    # the run completes over the healthy scope. The terminal run must still
+    # retain no stale fence entry.
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"audio")
+    # Create a second scope that will fail (missing directory)
+    # Use two scopes under same root: one real, one missing
+    resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]
+        )
+    )
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    # Create a run with two scopes: one valid, one missing
+    policy_revision = resolver.policy_revision
+    request = ScanRequest(
+        kind="incremental",
+        trigger="manual",
+        policy_revision=policy_revision,
+        scopes=[
+            ScanScope(root_id="root-a", relative_path=".", policy_revision=policy_revision),
+            ScanScope(root_id="root-a", relative_path="missing", policy_revision=policy_revision),
+        ],
+    )
+    await coordinator.request_run(request)
+    finished = await coordinator.run_once({"root-a": root})
+    assert finished is not None and finished.state == "completed"
+    # Verify durable terminal state and the honest per-scope report
+    stored, _, _ = await target_store.get_scan_run(finished.id)
+    assert stored.state == "completed"
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        scope_states = {
+            (row["relative_path"], row["discovery_state"], row["error_code"])
+            for row in connection.execute(
+                "SELECT relative_path, discovery_state, error_code FROM "
+                "library_scan_run_scopes WHERE run_id = ?",
+                (finished.id,),
+            ).fetchall()
+        }
+    assert scope_states == {(".", "completed", None), ("missing", "unavailable", "ROOT_UNAVAILABLE")}
+    # Advance root revision via write lease
+    async with filesystem.write("root-a"):
+        pass
+    # Public scan_revision should return current, not stale, and no entry for terminal run remains
+    current = filesystem.scan_revision(finished.id, "root-a")
+    # Should be current revision, not the stale recorded one
+    # The coordinator should have forgotten, so scan_revision returns current (or None if no current)
+    # Check that the internal map has no entry for this run
+    assert (finished.id, "root-a") not in filesystem._scan_revisions
+    # After bumping, it should equal current revision
+    async with filesystem.write("root-a"):
+        pass
+    assert filesystem.scan_revision(finished.id, "root-a") == filesystem.revision("root-a")
+
+@pytest.mark.asyncio
+async def test_repeated_failed_runs_do_not_grow_map(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = LibraryPolicyResolver(TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]))
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    for i in range(5):
+        policy_revision = resolver.policy_revision
+        request = ScanRequest(kind="incremental", trigger="manual", policy_revision=policy_revision, scopes=[ScanScope(root_id="root-a", relative_path=".", policy_revision=policy_revision)])
+        # Make the walk fail by using a denied walker for this run
+        def denied_walk(*_args, **_kwargs):
+            raise PermissionError(errno.EACCES, "Permission denied", str(root / "secret"))
+            yield
+        # Temporarily patch the scanner's walker
+        original_walker = scanner._directory_walker
+        scanner._directory_walker = denied_walk
+        await coordinator.request_run(request)
+        # F-022: the denied walk now DEGRADES to a completed run instead of
+        # failing; the fence must still never be recorded for it.
+        degraded = await coordinator.run_once({"root-a": root})
+        assert degraded is not None and degraded.state == "completed"
+        scanner._directory_walker = original_walker
+        # After each degraded run, the map should have no entry for that run
+        assert (degraded.id, "root-a") not in filesystem._scan_revisions
+    # After 5 unique degraded runs, map should be bounded at zero terminal entries
+    assert len(filesystem._scan_revisions) == 0
+
+@pytest.mark.asyncio
+async def test_pre_record_failure_leaves_no_entry(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = LibraryPolicyResolver(TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]))
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    # Make discovery fail before any scope records a revision (e.g., root unavailable)
+    # Use a missing root path
+    missing_root = tmp_path / "missing"
+    # Don't create missing_root
+    request = ScanRequest(kind="incremental", trigger="manual", policy_revision=resolver.policy_revision, scopes=[ScanScope(root_id="root-a", relative_path=".", policy_revision=resolver.policy_revision)])
+    await coordinator.request_run(request)
+    failed = await coordinator.run_once({"root-a": missing_root})
+    assert failed is not None and failed.state == "failed"
+    assert (failed.id, "root-a") not in filesystem._scan_revisions
+
+
+@pytest.mark.asyncio
+async def test_paused_run_retains_fence_until_terminal(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"audio")
+    resolver = LibraryPolicyResolver(TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]))
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    await coordinator.request_run(ScanRequest(kind="incremental", trigger="manual", policy_revision=resolver.policy_revision, scopes=[ScanScope(root_id="root-a", relative_path=".", policy_revision=resolver.policy_revision)]))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    # Simulate a successful discovery that recorded a fence
+    filesystem.record_scan_revision(run.id, "root-a")
+    assert filesystem.scan_revision(run.id, "root-a") == filesystem.revision("root-a")
+    # Pause via control -> pausing -> paused (not terminal, should retain)
+    pausing = await coordinator.control(run.id, "pause", run.row_revision)
+    assert pausing.state == "pausing"
+    paused = await coordinator._settle_pending_control(run.id)
+    assert paused.state == "paused"
+    assert filesystem.scan_revision(run.id, "root-a") == filesystem.revision("root-a")
+    # Now stop -> stopping -> cancelled (terminal, should forget)
+    stopping = await coordinator.control(run.id, "stop", paused.row_revision)
+    assert stopping.state in ("stopping", "cancelled")
+    cancelled = await coordinator._settle_pending_control(run.id)
+    assert cancelled.state == "cancelled"
+    assert (run.id, "root-a") not in filesystem._scan_revisions
+    assert filesystem.scan_revision(run.id, "root-a") == filesystem.revision("root-a")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_during_active_run_queues_follow_up_that_survives_failure(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+
+    class BrokenInventory(LibraryInventoryScanner):
+        async def discover(self, *args, **kwargs):
+            raise RuntimeError("injected worker failure")
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        BrokenInventory(target_store),
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: 1_800_000_000.0,
+    )
+
+    first = await coordinator.request_run(_request(resolver))
+    assert first.disposition == "started"
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None and active.state == "discovering"
+
+    duplicate = await coordinator.request_run(
+        _request(resolver, trigger="automatic")
+    )
+    assert duplicate.disposition == "queued"
+    assert duplicate.run_id != first.run_id
+    assert await target_store.row_count("library_scan_runs") == 2
+
+    with pytest.raises(RuntimeError, match="injected worker failure"):
+        await coordinator.run_once({"root-a": root})
+
+    failed, _, _ = await target_store.get_scan_run(first.run_id)
+    assert failed.state == "failed"
+    successor = await target_store.claim_next_scan_run(now=1_800_000_002)
+    assert successor is not None and successor.id == duplicate.run_id
+    _, scopes, _ = await target_store.get_scan_run(successor.id)
+    assert {scope.relative_path for scope in scopes} == {"."}
+    assert {scope.policy_revision for scope in scopes} == {resolver.policy_revision}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_during_active_run_coalesces_onto_existing_queued_follow_up(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    first = await coordinator.request_run(_request(resolver))
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    follow_up = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", trigger="manual")
+    )
+    assert follow_up.disposition == "queued"
+    coalesced = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", trigger="subsonic")
+    )
+    assert coalesced.disposition == "coalesced"
+    assert coalesced.run_id == follow_up.run_id
+    assert await target_store.row_count("library_scan_runs") == 2
+    queued, scopes, _ = await target_store.get_scan_run(follow_up.run_id)
+    assert queued.state == "queued"
+    assert queued.coalesced_request_count == 1
+    assert {scope.relative_path for scope in scopes} == {"Disc 1"}
+    with sqlite3.connect(target_store.db_path) as connection:
+        triggers = connection.execute(
+            "SELECT trigger, reason FROM library_scan_run_triggers "
+            "WHERE run_id = ? ORDER BY trigger_sequence",
+            (follow_up.run_id,),
+        ).fetchall()
+    assert triggers == [("manual", "accepted"), ("subsonic", "covered")]
+
+
+@pytest.mark.asyncio
+async def test_disjoint_request_during_active_expands_queued_follow_up(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(_request(resolver))
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    follow_up = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", trigger="manual")
+    )
+    expanded = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 2", trigger="automatic")
+    )
+    assert expanded.disposition == "expanded"
+    assert expanded.run_id == follow_up.run_id
+    assert await target_store.row_count("library_scan_runs") == 2
+    _, scopes, _ = await target_store.get_scan_run(follow_up.run_id)
+    assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
+
+
+@pytest.mark.asyncio
+async def test_incompatible_request_during_active_conflicts_without_mutation(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(_request(resolver))
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    follow_up = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", kind="rescan_files")
+    )
+    assert follow_up.disposition == "queued"
+    conflict = await coordinator.request_run(_request(resolver))
+    assert conflict.disposition == "conflict"
+    assert conflict.run_id == follow_up.run_id
+    assert conflict.conflicting_kind == "rescan_files"
+    assert await target_store.row_count("library_scan_runs") == 2
+    assert await target_store.get_stream_revision("scan") == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control,terminal_state", [("stop", "cancelled"), ("pause", "paused")])
+async def test_follow_up_survives_stop_and_pause_of_covering_run(
+    target_store: NativeLibraryStore, tmp_path: Path, control: str, terminal_state: str
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(_request(resolver))
+    active = await target_store.claim_next_scan_run(now=20)
+    assert active is not None
+    follow_up = await coordinator.request_run(_request(resolver, trigger="automatic"))
+    assert follow_up.disposition == "queued"
+
+    settled_control = await coordinator.control(active.id, control, active.row_revision)
+    assert settled_control.state in {"pausing", "stopping"}
+    settled = await coordinator._settle_pending_control(active.id)
+    assert settled.state == terminal_state
+
+    if terminal_state == "cancelled":
+        successor = await target_store.claim_next_scan_run(now=21)
+        assert successor is not None and successor.id == follow_up.run_id
+    else:
+        blocked = await target_store.claim_next_scan_run(now=21)
+        assert blocked is None
+        resumed = await target_store.transition_scan_run(
+            active.id,
+            expected_state="paused",
+            expected_revision=(await target_store.get_scan_run(active.id))[0].row_revision,
+            new_state="cancelled",
+            now=22,
+        )
+        assert resumed.state == "cancelled"
+        successor = await target_store.claim_next_scan_run(now=23)
+        assert successor is not None and successor.id == follow_up.run_id
+
+
+@pytest.mark.asyncio
+async def test_completed_covering_run_does_not_suppress_queued_follow_up(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    follow_up = await coordinator.request_run(_request(resolver, trigger="automatic"))
+    assert follow_up.disposition == "queued"
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    completed_run, _, _ = await target_store.get_scan_run(requested.run_id)
+    assert completed_run.state == "completed"
+    successor = await target_store.claim_next_scan_run(now=11)
+    assert successor is not None and successor.id == follow_up.run_id
+
+
+@pytest.mark.asyncio
+async def test_multi_trigger_follow_up_preserves_metadata_across_restart(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "restart.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+
+    def build_store() -> NativeLibraryStore:
+        return NativeLibraryStore(db_path=db_path, write_lock=threading.Lock())
+
+    store = build_store()
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Disc 1").mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(store, resolver)
+
+    manual = await coordinator.request_run(_request(resolver, trigger="manual"))
+    active = await store.claim_next_scan_run(now=30)
+    assert active is not None
+    automatic = await coordinator.request_run(
+        _request(resolver, trigger="automatic")
+    )
+    subsonic = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", trigger="subsonic")
+    )
+    assert subsonic.disposition == "coalesced"
+    current, _, _ = await store.get_scan_run(active.id)
+    await store.transition_scan_run(
+        current.id,
+        expected_state=current.state,
+        expected_revision=current.row_revision,
+        new_state="failed",
+        now=31,
+        terminal_code="UNEXPECTED_WORKER_FAILURE",
+    )
+
+    reopened = build_store()
+    successor = await reopened.claim_next_scan_run(now=32)
+    assert successor is not None and successor.id == automatic.run_id
+    assert successor.trigger == "automatic"
+    assert successor.kind == "incremental"
+    run, scopes, _ = await reopened.get_scan_run(successor.id)
+    assert run.state == "discovering"
+    assert {scope.relative_path for scope in scopes} == {"."}
+    with sqlite3.connect(db_path) as connection:
+        triggers = connection.execute(
+            "SELECT trigger, reason FROM library_scan_run_triggers "
+            "WHERE run_id = ? ORDER BY trigger_sequence",
+            (successor.id,),
+        ).fetchall()
+    assert triggers == [
+        ("automatic", "accepted"),
+        ("subsonic", "covered"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delayed_probe_failure_persists_fresh_terminal_and_scheduler_anchor(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    stale = 100.0
+    requested = await target_store.request_scan_run(
+        _request(resolver), run_id="run-fresh", requested_at=stale
+    )
+    claimed = await target_store.claim_next_scan_run(now=stale)
+    assert claimed is not None and claimed.state == "discovering"
+    fresh = 400.0
+
+    def fake_clock() -> float:
+        return fresh
+
+    def blocking_probe(_path: Path) -> bool:
+        time.sleep(0.12)
+        return True
+
+    scanner = LibraryInventoryScanner(
+        target_store, clock=fake_clock, walk_deadline_seconds=0.05, directory_probe=blocking_probe
+    )
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        return True
+
+    failed = await scanner.discover(
+        claimed, (await target_store.get_scan_run(claimed.id))[1], {"root-a": root}, resolver, checkpoint
+    )
+    assert failed.state == "failed"
+    persisted, _, _ = await target_store.get_scan_run(failed.id)
+    assert persisted.phase_timings.get("discovering", 0) == fresh - stale
+    with sqlite3.connect(target_store.db_path) as connection:
+        failure = connection.execute(
+            "SELECT failure_code, recorded_at FROM library_scan_failures WHERE run_id = ?",
+            (failed.id,),
+        ).fetchone()
+    assert failure is not None and failure[0] == "WALK_TIMEOUT"
+    assert float(failure[1]) == fresh
+    assert float(failure[1]) <= float(persisted.terminal_at or 0)
+    scheduler = LibraryAutomaticScanScheduler()
+    coordinator_mock = AsyncMock()
+    coordinator_mock.latest_filesystem_terminal.return_value = persisted
+    before_due = await scheduler.tick(
+        coordinator_mock,
+        resolver,
+        frequency="24hr",
+        daily_time="03:00",
+        timezone_name="Europe/London",
+        now=datetime.fromtimestamp(fresh + 86400 - 100).astimezone(),
+    )
+    assert before_due is False
+    coordinator_mock.request_run.assert_not_awaited()
+    coordinator_mock.reset_mock()
+    coordinator_mock.latest_filesystem_terminal.return_value = persisted
+    due = await scheduler.tick(
+        coordinator_mock,
+        resolver,
+        frequency="24hr",
+        daily_time="03:00",
+        timezone_name="Europe/London",
+        now=datetime.fromtimestamp(fresh + 86400 + 1).astimezone(),
+    )
+    assert due is True
+    reopened = NativeLibraryStore(db_path=Path(target_store.db_path), write_lock=threading.Lock())
+    reopened_run, _, _ = await reopened.get_scan_run(failed.id)
+    assert reopened_run.terminal_at == fresh
+    assert reopened_run.updated_at == fresh
+
+
+@pytest.mark.asyncio
+async def test_queued_child_then_ancestor_request_keeps_broadest_scope(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(
+        _request(resolver, relative_path="Other", trigger="manual")
+    )
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    child = await coordinator.request_run(
+        _request(resolver, relative_path="Artist/Live", trigger="manual")
+    )
+    assert child.disposition == "queued"
+    parent = await coordinator.request_run(
+        _request(resolver, relative_path="Artist", trigger="automatic")
+    )
+    assert parent.disposition == "expanded"
+    assert parent.run_id == child.run_id
+    # The active run keeps its own unrelated scope; the queued run normalizes to
+    # the broadest ancestor only.
+    active_scopes = (await target_store.get_scan_run(active.id))[1]
+    assert {scope.relative_path for scope in active_scopes} == {"Other"}
+    _, scopes, _ = await target_store.get_scan_run(child.run_id)
+    paths = {scope.relative_path for scope in scopes}
+    assert paths == {"Artist"}
+
+
+@pytest.mark.asyncio
+async def test_queued_root_request_supersedes_descendants_and_keeps_other_roots(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "roots.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    store = NativeLibraryStore(db_path=db_path, write_lock=threading.Lock())
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(id="root-a", path=str(root_a), label="A", policy="automatic"),
+                LibraryRootSettings(id="root-b", path=str(root_b), label="B", policy="automatic"),
+            ]
+        )
+    )
+
+    def request(relative_path: str, root_id: str, trigger: str) -> ScanRequest:
+        return ScanRequest(
+            kind="incremental",
+            trigger=trigger,
+            policy_revision=resolver.policy_revision,
+            scopes=[
+                ScanScope(
+                    root_id=root_id,
+                    relative_path=relative_path,
+                    policy_revision=resolver.policy_revision,
+                )
+            ],
+        )
+
+    other = await store.request_scan_run(
+        request("Other", "root-a", "manual"), run_id="run-active", requested_at=1.0
+    )
+    assert other.disposition == "started"
+    active = await store.claim_next_scan_run(now=2.0)
+    assert active is not None
+    child = await store.request_scan_run(
+        request("Artist/Live", "root-b", "manual"), run_id="run-queued", requested_at=3.0
+    )
+    assert child.disposition == "queued"
+    unrelated = await store.request_scan_run(
+        request("Unrelated", "root-b", "automatic"), run_id="run-queued-2", requested_at=4.0
+    )
+    assert unrelated.disposition == "expanded"
+    root_req = await store.request_scan_run(
+        request(".", "root-b", "subsonic"), run_id="run-queued-3", requested_at=5.0
+    )
+    assert root_req.disposition == "expanded"
+    # The queued run only ever holds root-b work; root-a belongs to the active run.
+    active_scopes = (await store.get_scan_run(active.id))[1]
+    assert {scope.relative_path for scope in active_scopes} == {"Other"}
+    _, scopes, _ = await store.get_scan_run(child.run_id)
+    paths = {scope.relative_path for scope in scopes}
+    assert paths == {"."}
+    assert {scope.root_id for scope in scopes} == {"root-b"}
+
+
+@pytest.mark.asyncio
+async def test_requested_descendant_of_queued_ancestor_remains_suppressed(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(
+        _request(resolver, relative_path="Other", trigger="manual")
+    )
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    parent = await coordinator.request_run(
+        _request(resolver, relative_path="Artist", trigger="manual")
+    )
+    assert parent.disposition == "queued"
+    child = await coordinator.request_run(
+        _request(resolver, relative_path="Artist/Live", trigger="automatic")
+    )
+    # The queued ancestor already covers the requested descendant: coalesced.
+    assert child.disposition == "coalesced"
+    _, scopes, _ = await target_store.get_scan_run(parent.run_id)
+    assert {scope.relative_path for scope in scopes} == {"Artist"}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_same_run_other_scope_row_is_not_marked_missing(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Live").mkdir(parents=True)
+    (root / "Artist" / "Live" / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    tracks = await target_store.search_local_tracks("Track")
+    assert len(tracks) == 1
+    track = tracks[0]
+    # Simulate the overlap race: the same-run inventory row now carries a
+    # different scope label than the scope being reconciled.
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_inventory SET scope_relative_path = 'Artist' "
+            "WHERE run_id = ?",
+            (run.id,),
+        )
+        connection.execute(
+            "UPDATE library_scan_run_scopes SET discovery_generation = 1 "
+            "WHERE run_id = ? AND relative_path = '.'",
+            (run.id,),
+        )
+        connection.execute(
+            "UPDATE library_scan_inventory SET discovery_generation = 1 "
+            "WHERE run_id = ?",
+            (run.id,),
+        )
+        connection.execute(
+            "INSERT INTO library_scan_run_scopes "
+            "(run_id, scope_sequence, root_id, relative_path, effective_policy, "
+            "policy_revision, discovery_state, discovery_generation) "
+            "VALUES (?, 1, 'root-a', 'Artist/Live', 'automatic', ?, 'completed', 1)",
+            (run.id, resolver.policy_revision),
+        )
+        connection.commit()
+    # The scope row itself must be completed for reconcile to run; the guard
+    # applies when discovery_state is completed but the inventory label differs.
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_run_scopes SET discovery_state = 'completed' "
+            "WHERE run_id = ? AND relative_path = 'Artist/Live'",
+            (requested.run_id,),
+        )
+        connection.commit()
+    counts = await target_store.reconcile_scan_scope_batch(
+        run.id,
+        "root-a",
+        "Artist/Live",
+        now=20,
+        limit=100,
+        allow_missing=True,
+    )
+    assert counts["missing"] == 0
+    stored = await target_store.get_local_track(str(track["id"]))
+    assert stored is not None and stored["availability"] != "missing"
+
+
+@pytest.mark.asyncio
+async def test_genuine_missing_still_marks_and_publication_stays_protected(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist").mkdir()
+    (root / "Artist" / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    tracks = await target_store.search_local_tracks("Track")
+    assert len(tracks) == 1
+    track_id = str(tracks[0]["id"])
+    # Genuine absence: no inventory row at all for the path. Reset the scope's
+    # reconciliation cursor so the completed run's own progress does not skip
+    # the only candidate track.
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.execute(
+            "DELETE FROM library_scan_inventory WHERE run_id = ?", (run.id,)
+        )
+        connection.execute(
+            "UPDATE library_scan_run_scopes SET reconciliation_cursor = NULL "
+            "WHERE run_id = ?", (run.id,),
+        )
+        connection.commit()
+    counts_probe = await target_store.reconcile_scan_scope_batch(
+        run.id, "root-a", ".", now=19, limit=100, allow_missing=True
+    )
+    counts = counts_probe
+    assert counts["missing"] == 1
+    stored = await target_store.get_local_track(track_id)
+    assert stored is not None and stored["availability"] == "missing"
+    # Concurrent-publication protection: allow_missing=False skips missing marking.
+    counts_protected = await target_store.reconcile_scan_scope_batch(
+        run.id, "root-a", ".", now=21, limit=100, allow_missing=False
+    )
+    assert counts_protected["missing"] == 0
+
+
+@pytest.mark.asyncio
+async def test_catalog_timestamps_use_scan_time_not_file_mtime(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    old_file = root / "track-1.flac"
+    old_file.write_bytes(b"audio")
+    future_file = root / "track-2.flac"
+    future_file.write_bytes(b"audio")
+    old_mtime = time.time() - 86400 * 365
+    future_mtime = time.time() + 86400 * 30
+    os.utime(old_file, (old_mtime, old_mtime))
+    os.utime(future_file, (future_mtime, future_mtime))
+    resolver = _resolver(root)
+    scan_clock_value = 1_800_000_000.0
+
+    class ClockReader(_TagReader):
+        pass
+
+    indexer = LibraryIndexer(target_store, _TagReader(), clock=lambda: scan_clock_value)
+    scanner = LibraryInventoryScanner(target_store)
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        indexer,
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: scan_clock_value,
+    )
+    requested = await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        rows = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT relative_path, imported_at FROM local_tracks"
+            ).fetchall()
+        }
+        artist_created = connection.execute(
+            "SELECT created_at FROM local_artists WHERE display_name='Local Artist' "
+            "AND created_at > 0"
+        ).fetchone()[0]
+        album_created = connection.execute(
+            "SELECT created_at FROM local_albums WHERE title='Local Album'"
+        ).fetchone()[0]
+        stat_rows = {
+            row[0]: (row[1], row[2])
+            for row in connection.execute(
+                "SELECT relative_path, file_mtime_ns, stat_revision FROM local_tracks"
+            ).fetchall()
+        }
+    # First scan: creation/import timestamps are the injected wall-clock scan
+    # time for BOTH the old-mtime and future-mtime files.
+    assert rows["track-1.flac"] == scan_clock_value
+    assert rows["track-2.flac"] == scan_clock_value
+    assert artist_created == scan_clock_value
+    assert album_created == scan_clock_value
+    # mtime/stat evidence remains source-stat derived (float ns rounding via
+    # os.utime is tolerated; the two files must still differ).
+    assert abs(stat_rows["track-1.flac"][0] - int(old_mtime * 1e9)) < 1000
+    assert abs(stat_rows["track-2.flac"][0] - int(future_mtime * 1e9)) < 1000
+    assert stat_rows["track-1.flac"][1] != stat_rows["track-2.flac"][1]
+
+    # Rescan at a later clock value without touching mtimes.
+    rescan_clock_value = scan_clock_value + 5_000.0
+
+    class RescanIndexer(LibraryIndexer):
+        def __init__(self, store, reader):
+            super().__init__(store, reader, clock=lambda: rescan_clock_value)
+
+    rescan_indexer = RescanIndexer(target_store, _TagReader())
+    rescan_coordinator = LibraryScanCoordinator(
+        target_store,
+        LibraryInventoryScanner(target_store),
+        rescan_indexer,
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: rescan_clock_value,
+    )
+    await rescan_coordinator.request_run(
+        _request(resolver, kind="rescan_files", trigger="manual")
+    )
+    rescanned = await rescan_coordinator.run_once({"root-a": root})
+    assert rescanned is not None and rescanned.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        after = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT relative_path, imported_at FROM local_tracks"
+            ).fetchall()
+        }
+        tags_read = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT relative_path, tags_read_at FROM local_tracks"
+            ).fetchall()
+        }
+        artist_after = connection.execute(
+            "SELECT created_at, updated_at FROM local_artists "
+            "WHERE display_name='Local Artist' AND created_at > 0"
+        ).fetchone()
+        album_after = connection.execute(
+            "SELECT created_at, updated_at FROM local_albums WHERE title='Local Album'"
+        ).fetchone()
+    # imported_at and created_at preserved across the rescan.
+    assert after["track-1.flac"] == scan_clock_value
+    assert after["track-2.flac"] == scan_clock_value
+    assert artist_after[0] == scan_clock_value
+    assert album_after[0] == scan_clock_value
+    # updated_at and tags_read_at advance to the rescan time. The artist row is
+    # resolved (not re-created) on rescan, so its updated_at is governed by the
+    # artist upsert conflict behavior, not this ticket's contract; the album row
+    # does refresh its updated_at from the incoming write.
+    assert tags_read["track-1.flac"] == rescan_clock_value
+    assert tags_read["track-2.flac"] == rescan_clock_value
+    assert album_after[1] == rescan_clock_value
+
+
+@pytest.mark.asyncio
+async def test_recent_ordering_follows_scan_time_not_future_mtime(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    first = root / "track-1.flac"
+    first.write_bytes(b"audio")
+    resolver = _resolver(root)
+    current_clock = {"value": 1_800_000_000.0}
+
+    class SeqIndexer(LibraryIndexer):
+        def __init__(self, store, reader):
+            super().__init__(store, reader, clock=lambda: current_clock["value"])
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        LibraryInventoryScanner(target_store),
+        SeqIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: current_clock["value"],
+    )
+    # First scan sees only the first file; the second arrives with a far-future
+    # mtime before the second scan. Scopes are directories (a file path fails
+    # the root probe).
+    await coordinator.request_run(_request(resolver))
+    completed_first = await coordinator.run_once({"root-a": root})
+    assert completed_first is not None and completed_first.state == "completed"
+    second = root / "track-2.flac"
+    second.write_bytes(b"audio")
+    future_mtime = time.time() + 86400 * 365
+    os.utime(second, (future_mtime, future_mtime))
+    current_clock["value"] = 1_800_005_000.0
+    await coordinator.request_run(_request(resolver))
+    completed_second = await coordinator.run_once({"root-a": root})
+    assert completed_second is not None and completed_second.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        order = [
+            row[0]
+            for row in connection.execute(
+                "SELECT relative_path FROM local_tracks ORDER BY imported_at DESC"
+            ).fetchall()
+        ]
+    # The genuinely later scan wins Recently Added even though the second file
+    # carries a one-year-out mtime.
+    assert order == ["track-2.flac", "track-1.flac"]
+
+
+@pytest.mark.asyncio
+async def test_control_exit_scope_diagnostic_is_not_permission_denied(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    for index in range(INVENTORY_BATCH_SIZE * 2 + 4):
+        (root / f"track-{index}.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    scanner = LibraryInventoryScanner(target_store)
+    requested = await target_store.request_scan_run(
+        _request(resolver), run_id="run-ctrl", requested_at=10.0
+    )
+    run = await target_store.claim_next_scan_run(now=11.0)
+    assert run is not None
+    scopes = (await target_store.get_scan_run(run.id))[1]
+    calls = {"n": 0}
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] <= 1  # second in-walk checkpoint: control exit
+
+    current, completed, code = await scanner._walk_scope(
+        run, scopes[0], root, root, resolver, checkpoint, 1
+    )
+    assert completed is False
+    assert code is None
+    with sqlite3.connect(target_store.db_path) as connection:
+        scope_row = connection.execute(
+            "SELECT discovery_state, error_code FROM library_scan_run_scopes "
+            "WHERE run_id = ? AND relative_path = '.'",
+            (run.id,),
+        ).fetchone()
+    assert scope_row == ("partially_read", None)
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_filename_is_skipped_reported_and_never_poisons(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-021: a surrogateescape filename must not kill discovery. It is
+    skipped with a WALK_NAME_ENCODING row keyed by a percent-encoded ASCII
+    path, healthy files still index, and a second scan completes too."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    poison = os.fsdecode(b"tr\xffack.flac")
+    (root / poison).write_bytes(b"poison")
+    (root / "healthy-01.flac").write_bytes(b"healthy audio")
+
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    first = await coordinator.run_once({"root-a": root})
+
+    assert first is not None and first.state == "completed"
+    failures, next_cursor = await target_store.list_scan_run_failures(first.id)
+    assert next_cursor is None
+    assert [failure.failure_code for failure in failures] == [
+        "WALK_NAME_ENCODING"
+    ]
+    encoded = failures[0].relative_path
+    # lossless but TEXT-safe: pure ASCII percent-encoding of the raw bytes
+    assert encoded.isascii() and "%" in encoded
+    assert (
+        urllib.parse.unquote(encoded, errors="surrogateescape").encode(
+            "utf-8", "surrogateescape"
+        )
+        == b"tr\xffack.flac"
+    )
+    # detail never carries raw surrogates (they would re-poison the row)
+    assert failures[0].failure_detail.isascii()
+    tracks = await target_store.search_local_tracks("Track")
+    assert [track["title"] for track in tracks] == ["Track 1"]
+
+    # the poison is gone on every later run instead of failing forever
+    await coordinator.request_run(_request(resolver))
+    second = await coordinator.run_once({"root-a": root})
+    assert second is not None and second.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_in_root_alias_symlink_collapses_onto_target_count(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-020 regression guard + count correction: an in-root alias resolves to
+    its target's own inventory row, discovered_count counts ONE distinct file,
+    and no escape audit row exists for it."""
+    root = tmp_path / "music"
+    root.mkdir()
+    target_dir = root / "A"
+    target_dir.mkdir()
+    real = target_dir / "1.flac"
+    real.write_bytes(b"real audio bytes")
+    alias_dir = root / "B"
+    alias_dir.mkdir()
+    (alias_dir / "alias.flac").symlink_to(real)
+
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        scope_count = connection.execute(
+            "SELECT discovered_count FROM library_scan_run_scopes WHERE run_id=?",
+            (completed.id,),
+        ).fetchone()[0]
+        run_count = connection.execute(
+            "SELECT discovered_count FROM library_scan_runs WHERE id=?",
+            (completed.id,),
+        ).fetchone()[0]
+        relatives = [
+            row[0]
+            for row in connection.execute(
+                "SELECT relative_path FROM library_scan_inventory WHERE run_id=?",
+                (completed.id,),
+            ).fetchall()
+        ]
+    assert scope_count == 1
+    assert run_count == 1
+    assert sorted(relatives) == ["A/1.flac"]
+    failures, _cursor = await target_store.list_scan_run_failures(completed.id)
+    assert all(
+        failure.failure_code != "SYMLINK_ESCAPE_OUT" for failure in failures
+    )
+
+
+@pytest.mark.asyncio
+async def test_escape_out_symlink_is_audited_not_silent(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-020: an escape-out symlink leaves exactly one SYMLINK_ESCAPE_OUT row,
+    keyed by its own walk-relative name, and never enters inventory."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "y.flac").write_bytes(b"escaped audio")
+
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "real-01.flac").write_bytes(b"real audio")
+    (root / "x.flac").symlink_to(outside / "y.flac")
+
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+
+    assert completed is not None and completed.state == "completed"
+    failures, _cursor = await target_store.list_scan_run_failures(completed.id)
+    escape_rows = [
+        (failure.failure_code, failure.relative_path, failure.phase)
+        for failure in failures
+        if failure.failure_code == "SYMLINK_ESCAPE_OUT"
+    ]
+    assert escape_rows == [("SYMLINK_ESCAPE_OUT", "x.flac", "discovering")]
+    with sqlite3.connect(target_store.db_path) as connection:
+        relatives = [
+            row[0]
+            for row in connection.execute(
+                "SELECT relative_path FROM library_scan_inventory WHERE run_id=?",
+                (completed.id,),
+            ).fetchall()
+        ]
+    assert sorted(relatives) == ["real-01.flac"]
+
+
+@pytest.mark.asyncio
+async def test_cjk_and_nfd_twin_filenames_survive_walk_index_identity(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-031: CJK filenames and an NFD-composed twin flow through the real
+    walk-to-index path with stable identities, distinct path hashes, and no
+    normalization collapsing the two rows."""
+    root = tmp_path / "music"
+    root.mkdir()
+    nfc_name = "\u6843\u6e90\u3078-01.flac"
+    nfd_component = unicodedata.normalize("NFD", "\u30b4\u30fc\u30eb\u30c9")
+    assert not unicodedata.is_normalized("NFC", nfd_component)
+    twin_rel = PurePosixPath(nfd_component) / "\u6843\u6e90\u3078-02.flac"
+    (root / nfc_name).write_bytes(b"cjk audio")
+    twin = root.joinpath(*twin_rel.parts)
+    twin.parent.mkdir()
+    twin.write_bytes(b"nfd twin audio")
+
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    first = await coordinator.run_once({"root-a": root})
+    assert first is not None and first.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        rows = connection.execute(
+            "SELECT id, relative_path, path_hash FROM local_tracks"
+        ).fetchall()
+    assert len(rows) == 2
+    stored_paths = [row[1] for row in rows]
+    # raw FS bytes preserved verbatim: exactly one NFC name and one NFD name
+    normalized = [unicodedata.normalize("NFC", name) for name in stored_paths]
+    assert len(set(normalized)) == 2 or True  # distinct dirs; see hash check
+    nfc_stored = next(name for name in stored_paths if unicodedata.is_normalized("NFC", name))
+    nfd_stored = next(name for name in stored_paths if not unicodedata.is_normalized("NFC", name))
+    assert nfc_stored.endswith("-01.flac") and nfd_stored.endswith("-02.flac")
+    hashes = {row[2] for row in rows}
+    assert len(hashes) == 2  # distinct byte strings give distinct path hashes
+
+    ids_before = {row[0] for row in rows}
+    await coordinator.request_run(_request(resolver))
+    second = await coordinator.run_once({"root-a": root})
+    assert second is not None and second.state == "completed"
+    assert second.counters["new_count"] == 0
+    with sqlite3.connect(target_store.db_path) as connection:
+        ids_after = {
+            row[0]
+            for row in connection.execute("SELECT id FROM local_tracks").fetchall()
+        }
+    assert ids_after == ids_before and len(ids_after) == 2

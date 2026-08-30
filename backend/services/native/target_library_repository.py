@@ -28,8 +28,17 @@ class TargetLibraryRepository:
     def is_configured(self) -> bool:
         return True
 
-    def is_library_empty(self) -> bool:
-        return False
+    async def delete_album(self, album_id: int, delete_files: bool = False) -> bool:
+        raise NotImplementedError(
+            "delete_album with int album_id is not supported in the target native"
+            " catalog; use delete by release_group_mbid via LibraryManager.delete_album_row"
+        )
+
+    async def delete_artist(self, artist_id: int, delete_files: bool = False) -> bool:
+        raise NotImplementedError(
+            "delete_artist with int artist_id is not supported in the target native"
+            " catalog; use delete by artist_mbid"
+        )
 
     async def get_status(self) -> ServiceStatus:
         return ServiceStatus(status="ok")
@@ -96,7 +105,12 @@ class TargetLibraryRepository:
 
         rows = await self._store.get_target_album_tracks(album_id)
         tiers = [
-            tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
         ]
         return min(tiers, key=tier_rank) if tiers else None
 
@@ -105,21 +119,40 @@ class TargetLibraryRepository:
 
         rows = await self._store.get_target_recording_tracks(track_id)
         tiers = [
-            tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
         ]
         return max(tiers, key=tier_rank) if tiers else None
 
     async def list_cutoff_unmet(self, cutoff: str) -> list[dict[str, Any]]:
-        from services.native.quality_tiers import tier_rank
+        from services.native.quality_tiers import TIER_KEYS, tier_rank
 
-        rows, _ = await self._store.list_target_albums(
-            limit=100_000, offset=0, sort="name"
+        cutoff_rank = tier_rank(cutoff)
+        rows = await self._store.list_target_cutoff_unmet(
+            cutoff_rank, limit=100_000
         )
+
+        # F-TARGETCATALOG-03: one aggregate read replaces the per-album N+1.
+        # The store computes MIN(track-rank) in SQL; we only translate the
+        # numeric rank back to its tier key (low=0 .. lossless=4).
+        rank_to_tier = list(TIER_KEYS)[::-1]
         result: list[dict[str, Any]] = []
         for row in rows:
-            tier = await self.album_quality_tier(str(row["release_group_mbid"]))
-            if tier is not None and tier_rank(tier) < tier_rank(cutoff):
-                result.append({**row, "current_tier": tier})
+            tier = rank_to_tier[int(row["worst_rank"])]
+            # NEW-TARGET-01: translate the target row to the shared cutoff
+            # worklist contract. artist_mbid is ONLY the provider identity -
+            # never the local album-artist ID alias.
+            normalized = {
+                **row,
+                "current_tier": tier,
+                "artist_name": row.get("album_artist_name"),
+                "artist_mbid": row.get("provider_artist_mbid"),
+            }
+            result.append(normalized)
         return result
 
     async def get_file_rows_for_album(self, album_id: str) -> list[dict[str, Any]]:
@@ -132,19 +165,23 @@ class TargetLibraryRepository:
         return albums | await self._store.target_provider_release_ids()
 
     async def get_artist_mbids(self) -> set[str]:
+        """Full active provider-ID set snapshot (F-TARGETCATALOG-04: retained
+        for callers that explicitly need the whole set; paging callers use
+        ``get_artist_mbid_page`` instead)."""
         return await self._store.target_provider_artist_ids()
 
     async def get_artist_mbid_page(self, *, after_mbid: str, limit: int) -> list[str]:
         """Keyset page over artist MBIDs, ordered case-insensitively.
 
-        Mirrors ``LibraryDB.get_artist_mbid_page`` so background tasks that page the
+        F-TARGETCATALOG-04: one bounded keyset SQL query per page (strict
+        ``> cursor`` on the normalized ID, blank IDs skipped, casefold
+        duplicates deduplicated, limit floored at one). Mirrors
+        ``LibraryDB.get_artist_mbid_page`` so background tasks that page the
         library work against either repository.
         """
-        cursor = after_mbid.casefold()
-        mbids = sorted(
-            value.casefold() for value in await self.get_artist_mbids() if value
+        return await self._store.target_provider_artist_ids_page(
+            after_mbid, limit=limit
         )
-        return [mbid for mbid in mbids if mbid > cursor][: max(1, limit)]
 
     async def existing_album_mbids(self, identifiers: list[str]) -> set[str]:
         normalized = {
@@ -202,6 +239,20 @@ class TargetLibraryRepository:
                 else None
             ),
         }
+
+    async def get_enrichment_candidates(
+        self, *, after_mbid: str | None, limit: int
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """GH-280: target-native AudioDB sweep candidates (bounded keyset)."""
+        return await self._store.target_enrichment_candidates(
+            after_mbid=after_mbid, limit=limit
+        )
+
+    async def existing_library_mbids(self, identifiers: list[str]) -> set[str]:
+        """GH-280: case-insensitive release-group membership for Discover
+        queue validation; replaces the legacy/Lidarr fallback on the target
+        composition."""
+        return await self._store.target_existing_library_mbids(identifiers)
 
     async def get_artists(self) -> list[dict[str, Any]]:
         rows, _ = await self._store.list_target_artists(
@@ -370,7 +421,9 @@ class TargetLibraryRepository:
             return set()
         if ids is not None:
             return await self._request_history.async_existing_requested_mbids(ids)
-        return await self._request_history.async_get_requested_mbids()
+        return await self._request_history.async_get_requested_mbids(
+            request_kind="album"
+        )
 
     async def has_recording(self, track_id: str) -> bool:
         return bool(await self._store.get_target_recording_tracks(track_id))

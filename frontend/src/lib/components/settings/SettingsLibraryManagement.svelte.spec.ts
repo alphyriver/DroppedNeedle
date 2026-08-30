@@ -224,7 +224,8 @@ function baseSettings(): LibraryManagementSettingsResponse {
 					},
 					replaygain: { enabled: false, mode: 'preserve', album_aware: true, required: false }
 				},
-				notification: { refresh_external_servers: false }
+				notification: { refresh_external_servers: false },
+				identity: { automatic_edition_acceptance_enabled: false }
 			}
 		],
 		default_profile_id: profileId,
@@ -481,6 +482,21 @@ describe('SettingsLibraryManagement', () => {
 		await expect
 			.element(profileDialog.getByText(baseSettings().naming_scripts[1].source, { exact: true }))
 			.toBeVisible();
+		await expect.element(valuesHelp).toHaveTextContent('initial');
+		await expect.element(profileDialog.getByText(/\{initial\}/)).toBeVisible();
+		const initialHelp = profileDialog.getByText(/effective album artist/i);
+		await expect.element(initialHelp).toBeVisible();
+		await expect.element(initialHelp).toHaveTextContent(/leading.*The/i);
+		await expect.element(initialHelp).toHaveTextContent(/Unicode whitespace/i);
+		await expect.element(initialHelp).toHaveTextContent(/case-insensitive/i);
+		await expect.element(initialHelp).toHaveTextContent(/one uppercase letter/i);
+		await expect
+			.element(initialHelp)
+			.toHaveTextContent(/empty.*(?:nonletter|non[- ]?alphabetic).*#/i);
+		await expect
+			.element(profileDialog.getByText(/Run a dry preview for real file results/))
+			.toBeVisible();
+
 		await profileDialog.getByRole('button', { name: 'Save profile' }).click();
 		expect(h.update).toHaveBeenCalledWith(
 			expect.objectContaining({

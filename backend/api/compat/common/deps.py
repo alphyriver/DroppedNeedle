@@ -1,8 +1,7 @@
 """Shared DI bundle for the compat shims.
 
-Resolve services through FastAPI Depends so tests can override individual
-providers via app.dependency_overrides; bundling keeps route signatures short
-while each inner Depends stays independently overridable.
+Each service resolves through Depends so tests can override it via
+app.dependency_overrides; bundling keeps route signatures short.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ from core.dependencies import (
     get_native_lyrics_service,
     get_compat_avatar_service,
     get_playback_report_service,
-    get_compat_scan_service,
+    get_target_compat_scan_service,
     get_advanced_transcode_service,
     get_compat_scrobble_adapter,
     get_coverart_repository,
@@ -48,7 +47,7 @@ if TYPE_CHECKING:
     from services.compat.native_lyrics_service import NativeLyricsService
     from services.compat.avatar_service import CompatAvatarService
     from services.compat.playback_report_service import PlaybackReportService
-    from services.compat.scan_service import CompatScanService
+    from services.compat.target_scan_service import TargetCompatScanService
     from services.compat.advanced_transcode_service import AdvancedTranscodeService
     from services.compat.library_view_service import LibraryViewService
     from services.compat.stream_concurrency import StreamConcurrencyService
@@ -81,7 +80,7 @@ class CompatServices:
     lyrics: "NativeLyricsService"
     avatars: "CompatAvatarService"
     playback_report: "PlaybackReportService"
-    scan: "CompatScanService"
+    scan: "TargetCompatScanService"
     advanced_transcode: "AdvancedTranscodeService"
 
 
@@ -105,7 +104,7 @@ def get_compat_services(
     lyrics=Depends(get_native_lyrics_service),
     avatars=Depends(get_compat_avatar_service),
     playback_report=Depends(get_playback_report_service),
-    scan=Depends(get_compat_scan_service),
+    scan=Depends(get_target_compat_scan_service),
     advanced_transcode=Depends(get_advanced_transcode_service),
 ) -> CompatServices:
     return CompatServices(

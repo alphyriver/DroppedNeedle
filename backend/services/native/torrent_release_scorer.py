@@ -40,7 +40,12 @@ from services.native.newznab_release_scorer import (
     _TIER_NOMINAL_KBPS,
     _hires_rank,
 )
-from services.native.quality_tiers import DEFAULT_QUALITY_MAX, DEFAULT_QUALITY_MIN
+from models.acquisition_quality import (
+    AcquisitionQualitySnapshot,
+    EvidenceCertainty,
+)
+from services.native.acquisition import quality as acq_quality
+from services.native.newznab_release_scorer import _release_evidence
 from services.native.title_match import fold
 
 logger = logging.getLogger(__name__)
@@ -51,31 +56,41 @@ _SEEDERS_SATURATION = 20.0
 
 
 class TorrentReleaseScorer:
-    def __init__(
-        self,
-        download_store: DownloadStore,
-        *,
-        quality_min: str = DEFAULT_QUALITY_MIN,
-        quality_max: str = DEFAULT_QUALITY_MAX,
-        flac_mp3_only: bool = True,
-        policy: SpecPolicy | None = None,
-    ) -> None:
+    """Quality flows exclusively through the per-call ``AcquisitionQualitySnapshot``,
+    matching ``NewznabReleaseScorer``; the torrent-specific seeder health weighting
+    and dead-release drop are unchanged."""
+
+    def __init__(self, download_store: DownloadStore) -> None:
         self._store = download_store
-        self._flac_mp3_only = flac_mp3_only
-        self._policy = policy or SpecPolicy(quality_min=quality_min, quality_max=quality_max)
 
     async def rank(
         self,
         target: TargetAlbum,
         releases: list[TorrentRelease],
         *,
+        snapshot: AcquisitionQualitySnapshot,
+        spec_extras: "SpecPolicy | None" = None,
         auto_accept_threshold: float = 0.70,
         manual_threshold: float = 0.50,
         track_count: int | None = None,
         held_tier: str | None = None,
     ) -> list[ScoredCandidate]:
         context = await build_context(self._store, held_tier=held_tier)
-        policy = self._policy
+        import msgspec as _ms
+
+        order = snapshot.quality_preference_order
+        policy = SpecPolicy(
+            quality_min=order[-1] if order else "low",
+            quality_max=order[0] if order else "lossless",
+        )
+        if spec_extras is not None:
+            policy = _ms.structs.replace(
+                policy,
+                max_size_mb=spec_extras.max_size_mb,
+                ignored_terms=tuple(spec_extras.ignored_terms),
+                required_terms=tuple(spec_extras.required_terms),
+                usenet_retention_days=spec_extras.usenet_retention_days,
+            )
         tracks = track_count if track_count is not None else target.track_count
         scored: list[ScoredCandidate] = []
         dropped_video = dropped_size = dropped_dead = 0
@@ -109,6 +124,13 @@ class TorrentReleaseScorer:
             if isinstance(decision, Reject):
                 pipeline_drops[decision.code] += 1
                 continue
+            # Same sanctioned rule as the Usenet arm: a literal 'unknown' tier obeys
+            # the snapshot's family-unknown behaviour instead of passing outright.
+            if tier == "unknown":
+                rule = snapshot.unknown_quality_behavior
+                if rule == "reject":
+                    pipeline_drops[RejectCode.QUALITY_REJECTED] += 1
+                    continue
             if self._size_implausible(release, declared, tracks, target.duration_seconds):
                 dropped_size += 1
                 continue
@@ -124,6 +146,8 @@ class TorrentReleaseScorer:
             )
             if release.seeders is None and band == "auto":
                 band = "manual"
+            decision_ev = _release_evidence(release, tier)
+            release_decision = acq_quality.evaluate(snapshot, decision_ev)
             scored.append(
                 ScoredCandidate(
                     source="torrent",
@@ -132,16 +156,30 @@ class TorrentReleaseScorer:
                     file_confidence=quality,
                     final_score=round(final, 4),
                     tier=band,
+                    quality_evidence=decision_ev,
+                    quality_decision=release_decision,
                 )
             )
 
-        scored.sort(
-            key=lambda c: (
-                c.final_score,
-                _hires_rank(c.torrent_release.title if c.torrent_release else ""),
-            ),
-            reverse=True,
-        )
+        band_rank = {"auto": 2, "manual": 1, "rejected": 0}
+        worst_step = len(order) + 2
+
+        def _sort_key(cand):
+            decision_ = cand.quality_decision
+            evidence_ = cand.quality_evidence
+            step = decision_.preference_step if decision_ else None
+            certainty = acq_quality.CERTAINTY_RANK[
+                evidence_.certainty if evidence_ else EvidenceCertainty.PARTIAL
+            ]
+            return (
+                band_rank.get(cand.tier, 0),
+                -(step if step is not None else worst_step),
+                -certainty,
+                cand.final_score,
+                _hires_rank(cand.torrent_release.title if cand.torrent_release else ""),
+            )
+
+        scored.sort(key=_sort_key, reverse=True)
         if dropped_video or dropped_size or dropped_dead or pipeline_drops:
             logger.info(
                 "torrent.scored",

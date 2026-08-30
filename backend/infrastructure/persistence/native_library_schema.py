@@ -636,6 +636,8 @@ CREATE TABLE IF NOT EXISTS library_operation_jobs (
     lease_expires_at REAL,
     heartbeat_at REAL,
     next_attempt_at REAL,
+    reidentification_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(reidentification_attempt_count >= 0),
     created_at REAL NOT NULL,
     started_at REAL,
     phase_started_at REAL,
@@ -1140,6 +1142,27 @@ CREATE TABLE IF NOT EXISTS library_repair_snapshots (
     created_at REAL NOT NULL
 );
 
+-- (GH-293) Durable keyset materialization state for catalog-wide repair jobs.
+-- The job header is created first; work rows are then materialized in pages of
+-- at most 500 subjects per transaction, each page atomically advancing the
+-- keyset cursor, the staged ordinal/count, and the sealed marker. A crash before
+-- or after a page commit resumes from the cursor without omission or
+-- duplication. Sealing fixes the materialized subject set: catalog changes after
+-- the pinned boundary require a new or versioned job.
+CREATE TABLE IF NOT EXISTS library_repair_materialization (
+    job_id TEXT PRIMARY KEY REFERENCES library_operation_jobs(id) ON DELETE CASCADE,
+    pinned_catalog_revision INTEGER NOT NULL
+        CHECK(pinned_catalog_revision BETWEEN 0 AND 9223372036854775807),
+    eligibility_version TEXT NOT NULL CHECK(length(trim(eligibility_version)) > 0),
+    purpose TEXT NOT NULL CHECK(length(trim(purpose)) > 0),
+    staging_cursor TEXT,
+    staged_ordinal INTEGER NOT NULL DEFAULT -1 CHECK(staged_ordinal >= -1),
+    staged_count INTEGER NOT NULL DEFAULT 0 CHECK(staged_count >= 0),
+    sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0,1)),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS library_identity_repair_findings (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES library_operation_jobs(id) ON DELETE CASCADE,
@@ -1173,6 +1196,23 @@ CREATE TABLE IF NOT EXISTS library_catalog_actions (
     reason_code TEXT,
     created_at REAL NOT NULL,
     CHECK(local_artist_id IS NOT NULL OR local_album_id IS NOT NULL OR local_track_id IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS library_automatic_edition_undo (
+    id TEXT PRIMARY KEY,
+    local_album_id TEXT NOT NULL UNIQUE REFERENCES local_albums(id) ON DELETE CASCADE,
+    job_id TEXT REFERENCES library_operation_jobs(id) ON DELETE SET NULL,
+    evidence_id TEXT,
+    prior_identity_json TEXT,
+    prior_track_identities_json TEXT NOT NULL DEFAULT '[]',
+    expected_post_album_revision INTEGER NOT NULL
+        CHECK(expected_post_album_revision BETWEEN 1 AND 9223372036854775807),
+    expected_post_identity_revision INTEGER NOT NULL
+        CHECK(expected_post_identity_revision BETWEEN 1 AND 9223372036854775807),
+    reason_code TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    consumed_at REAL,
+    consumed_action_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS library_policy_state (
@@ -1647,6 +1687,9 @@ CREATE INDEX IF NOT EXISTS idx_local_tracks_availability ON local_tracks(availab
 CREATE INDEX IF NOT EXISTS idx_local_tracks_policy ON local_tracks(root_id, applied_policy, desired_policy_revision, relative_path);
 CREATE INDEX IF NOT EXISTS idx_local_tracks_search ON local_tracks(title_folded, artist_name_folded, album_title_folded);
 CREATE INDEX IF NOT EXISTS idx_local_tracks_path_hash ON local_tracks(path_hash);
+CREATE INDEX IF NOT EXISTS idx_local_tracks_recent ON local_tracks(availability, imported_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_local_album_artists_reverse ON local_album_artists(local_artist_id, local_album_id);
+CREATE INDEX IF NOT EXISTS idx_local_track_artists_reverse ON local_track_artists(local_artist_id, local_track_id);
 CREATE INDEX IF NOT EXISTS idx_local_album_identity_rg ON local_album_external_identities(release_group_mbid);
 CREATE INDEX IF NOT EXISTS idx_local_album_identity_rg_lower ON local_album_external_identities(lower(release_group_mbid));
 CREATE INDEX IF NOT EXISTS idx_local_album_identity_release_lower ON local_album_external_identities(lower(release_mbid));
@@ -1701,6 +1744,8 @@ CREATE INDEX IF NOT EXISTS idx_identification_attempt_subject_track ON library_i
 CREATE INDEX IF NOT EXISTS idx_identification_evidence_attempt ON library_identification_evidence(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_claim ON library_identification_jobs(state, not_before, priority, enqueue_sequence);
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_lease ON library_identification_jobs(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_identification_jobs_terminal
+ON library_identification_jobs(state, terminal_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_album_active ON library_identification_jobs(local_album_id, kind, state, enqueue_sequence) WHERE local_album_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_track_active ON library_identification_jobs(local_track_id, kind, state, enqueue_sequence) WHERE local_track_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_library_reviews_cursor ON library_identification_reviews(updated_at DESC, id DESC);

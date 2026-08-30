@@ -7,13 +7,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from api.v1.schemas.settings import DownloadPolicySettings
 from models.download import ScoredCandidate
 from models.download_identity import usenet_identity
 from models.download_manifest import DownloadManifest
 from repositories.protocols.download_client import TaskHandle
 from repositories.protocols.indexer import IndexerResult, TorrentRelease
+from services.native.acquisition.quality import build_snapshot
 from services.native.acquisition.strategy import TorrentStrategy
 from services.native.file_processor import ProcessResult
+
+
+def _policy_snapshot():
+    return build_snapshot(DownloadPolicySettings())
 
 
 def _release(**kw) -> TorrentRelease:
@@ -105,7 +111,9 @@ async def test_search_and_score_filters_torrent_arm(tmp_path):
     task.artist_name, task.album_title = "Artist", "Album"
     task.year, task.track_count = 2007, 10
 
-    await strategy.search_and_score(task, timeout=5.0, auto=0.7, manual=0.5)
+    await strategy.search_and_score(
+        task, timeout=5.0, auto=0.7, manual=0.5, snapshot=_policy_snapshot()
+    )
 
     releases = strategy._scorer.rank.await_args.args[1]
     assert releases == [torrent]

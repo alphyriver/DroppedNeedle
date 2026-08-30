@@ -25,6 +25,7 @@ from services.native.download_orchestrator import (
     _IMPORT_FAILED_MSG,
     _NO_MATCH_MSG,
     _NO_SOURCE_MSG,
+    _TAG_MISMATCH_MSG,
     DownloadOrchestrator,
 )
 from services.native.download_service import ALREADY_IN_LIBRARY, DownloadService
@@ -49,6 +50,7 @@ def _record(
     task_id: str | None = "task-1",
     requested_at: str | None = None,
     year: int | None = 2026,
+    request_kind: str = "album",
 ) -> RequestHistoryRecord:
     return RequestHistoryRecord(
         musicbrainz_id=mbid,
@@ -59,6 +61,7 @@ def _record(
         user_id=user_id,
         download_task_id=task_id,
         year=year,
+        request_kind=request_kind,
     )
 
 
@@ -114,11 +117,23 @@ def env(tmp_path) -> _Env:
     store = WantedStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
     requests = AsyncMock()
     requests.async_get_history.return_value = ([], 0)
+    requests.async_get_retrying_page.return_value = ([], None)
     requests.async_get_record.return_value = None
     download_store = AsyncMock()
     download_store.get_active_task_for_album_any_user.return_value = None
     download_store.has_unresolved_held_for_task.return_value = False
     download_store.get_task.return_value = None
+
+    # F-PERF-03: the service reads linked tasks through the BATCH method.
+    # Default the batch map to whatever the per-test ``get_task`` mock is
+    # configured to return so existing per-test setups keep driving semantics.
+    async def _batched_tasks(task_ids):
+        single = download_store.get_task.return_value
+        if single is None:
+            return {}
+        return {task_id: single for task_id in task_ids}
+
+    download_store.get_tasks = AsyncMock(side_effect=_batched_tasks)
     ds = AsyncMock()
     ds.next_retry_at = Mock(return_value=None)  # sync method on the real service
     ds.scout_album.return_value = []
@@ -166,13 +181,23 @@ def env(tmp_path) -> _Env:
 
 
 def _serve_history(env: _Env, failed=(), incomplete=()):
-    async def history(page=1, page_size=200, status_filter=None):
-        records = {"failed": list(failed), "incomplete": list(incomplete)}.get(
-            status_filter, []
-        )
-        return records, len(records)
+    async def retrying_page(
+        status_filter=None,
+        page_size=200,
+        cursor=None,
+        owner_id=None,
+        request_kind=None,
+    ):
+        by_status = {"failed": list(failed), "incomplete": list(incomplete)}
+        records = [
+            record
+            for record in by_status.get(status_filter, [])
+            if (request_kind is None or record.request_kind == request_kind)
+            and (owner_id is None or record.user_id == owner_id)
+        ]
+        return records, None
 
-    env.requests.async_get_history.side_effect = history
+    env.requests.async_get_retrying_page.side_effect = retrying_page
 
 
 async def _add_watch(env: _Env, mbid="rg-1", kind="missing", due=True, **overrides):
@@ -218,12 +243,12 @@ async def test_library_removal_opt_out_does_not_revive_a_stopped_watch(env):
     assert watch.state == "stopped"
 
 
-# --- enrolment classifier, tied to the orchestrator's constants (§4.5) ---
+# enrolment classifier, tied to the orchestrator's constants (§4.5)
 
 
 def test_orchestrator_messages_start_with_the_imported_constants(tmp_path):
-    """The tie-test: the classifier prefix-matches _NO_SOURCE_MSG/_NO_MATCH_MSG,
-    so the strings the orchestrator ACTUALLY writes must start with them."""
+    """The tie-test: the classifier prefix-matches the imported availability
+    constants, so the strings the orchestrator ACTUALLY writes must start with them."""
     orch = DownloadOrchestrator(
         client=Mock(),
         indexer=Mock(),
@@ -248,6 +273,7 @@ def test_orchestrator_messages_start_with_the_imported_constants(tmp_path):
         f"{_NO_SOURCE_MSG} on Soulseek",
         f"{_NO_SOURCE_MSG} on Soulseek or Usenet",
         f"{_NO_MATCH_MSG} on Usenet",
+        _TAG_MISMATCH_MSG,
     ],
 )
 async def test_availability_failures_enrol_as_missing(env, message):
@@ -263,6 +289,24 @@ async def test_availability_failures_enrol_as_missing(env, message):
     # first check lands one age-curve interval out (13-day-old release -> 2 d ± 20 %)
     delta = watch.next_check_at - time.time()
     assert 0.8 * 2 * _DAY * 0.95 <= delta <= 1.2 * 2 * _DAY
+
+
+@pytest.mark.asyncio
+async def test_track_failures_are_excluded_from_album_wanted_enrolment(env):
+    album_record = _record(mbid="rg-album")
+    track_record = _record(mbid="recording-1", request_kind="track")
+    _serve_history(env, failed=[track_record, album_record])
+    env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
+
+    summary = await env.watcher.run_sweep()
+
+    assert summary.enrolled == 1
+    assert await env.store.get_watch("rg-album") is not None
+    assert await env.store.get_watch("recording-1") is None
+    assert all(
+        call.kwargs["request_kind"] == "album"
+        for call in env.requests.async_get_retrying_page.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -334,7 +378,7 @@ async def test_release_date_falls_back_to_request_year(env):
     assert (await env.store.get_watch("rg-1")).first_release_date == "2026"
 
 
-# --- re-enrolment rules (§5.2.1) ---
+# re-enrolment rules (§5.2.1)
 
 
 @pytest.mark.asyncio
@@ -378,7 +422,7 @@ async def test_fulfilled_watch_rearms_only_on_a_newer_failed_request(env):
     assert watch.check_count == 0
 
 
-# --- quarantine untouched (D5) ---
+# quarantine untouched (D5)
 
 
 @pytest.mark.asyncio
@@ -429,7 +473,36 @@ async def test_request_album_with_wanted_origin_skips_the_blocklist_clear():
     store.delete_quarantine_for_album.assert_awaited_once_with("rg-1")
 
 
-# --- seen-candidate dedup (D2) ---
+@pytest.mark.asyncio
+async def test_request_album_with_retry_origin_skips_the_blocklist_clear():
+    """#255 defect 1: automated re-dispatch (origin='retry') must not re-arm the
+    sources the blocklist just condemned - only explicit human actions clear."""
+    store = AsyncMock()
+    store.get_active_task_for_album.return_value = None
+    store.delete_quarantine_for_album.return_value = 2
+    store.create_task.return_value = SimpleNamespace(id="t-1")
+    library = AsyncMock()
+    library.album_quality_tier.return_value = None
+    service = DownloadService(
+        download_client=Mock(),
+        indexer=AsyncMock(),
+        scorer=AsyncMock(),
+        library_manager=library,
+        download_store=store,
+        event_bus=AsyncMock(),
+        orchestrator=Mock(),
+    )
+    await service.request_album(
+        user_id="u",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        origin="retry",
+    )
+    store.delete_quarantine_for_album.assert_not_awaited()
+
+
+# seen-candidate dedup (D2)
 
 
 @pytest.mark.asyncio
@@ -475,7 +548,7 @@ async def test_rejected_tier_results_count_as_no_results(env):
     env.sse.publish.assert_not_awaited()
 
 
-# --- auto-tier dispatch (D2/D8, §4.8) ---
+# auto-tier dispatch (D2/D8, §4.8)
 
 
 @pytest.mark.asyncio
@@ -529,7 +602,7 @@ async def test_already_in_library_dispatch_fulfils_the_watch(env):
     env.requests.async_update_download_task_id.assert_not_awaited()
 
 
-# --- partial wants (D6/D9) ---
+# partial wants (D6/D9)
 
 
 @pytest.mark.asyncio
@@ -609,7 +682,7 @@ async def test_partial_want_without_tracklist_fails_open(env):
     assert watch.next_check_at > time.time()
 
 
-# --- satisfaction-first (D6 edge case) ---
+# satisfaction-first (D6 edge case)
 
 
 @pytest.mark.asyncio
@@ -645,7 +718,7 @@ async def test_missing_want_without_tracklist_uses_library_presence(env):
     env.ds.scout_album.assert_not_awaited()
 
 
-# --- active-work guards (§4.9) ---
+# active-work guards (§4.9)
 
 
 @pytest.mark.asyncio
@@ -681,7 +754,7 @@ async def test_unresolved_held_import_guard_skips_the_scout(env):
     env.ds.scout_album.assert_not_awaited()
 
 
-# --- cadence + dormancy (D3) ---
+# cadence + dormancy (D3)
 
 
 def _date_days_ago(days: int) -> str:
@@ -719,7 +792,7 @@ async def test_want_goes_dormant_after_the_watch_window(env):
     assert watch.last_outcome == "no_results"
 
 
-# --- "None of these - keep watching" (owner decision 2026-07-06) ---
+# "None of these - keep watching" (owner decision 2026-07-06)
 
 
 def _parked_task(mbid: str = "rg-1", user_id: str = "user-a"):
@@ -821,7 +894,7 @@ async def test_dismiss_review_track_task_watches_as_partial(env):
     assert watch.kind == "partial"
 
 
-# --- read-only retrying rows (owner decision 2026-07-06) ---
+# read-only retrying rows (owner decision 2026-07-06)
 
 
 @pytest.mark.asyncio
@@ -840,6 +913,23 @@ async def test_list_retrying_returns_requests_with_a_pending_retry(env):
     assert entry.retry_count == 0
     assert entry.max_attempts == 6
     assert entry.next_retry_at == due
+
+
+@pytest.mark.asyncio
+async def test_list_retrying_excludes_track_requests(env):
+    album_record = _record(mbid="rg-album")
+    track_record = _record(mbid="recording-1", request_kind="track")
+    _serve_history(env, failed=[track_record, album_record])
+    env.download_store.get_task.return_value = _task()
+    env.ds.next_retry_at = Mock(return_value=time.time() + 60)
+
+    items = await env.watcher.list_retrying_for("user-a", "user")
+
+    assert [item.release_group_mbid for item in items] == ["rg-album"]
+    assert all(
+        call.kwargs["request_kind"] == "album"
+        for call in env.requests.async_get_retrying_page.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -872,7 +962,7 @@ async def test_list_retrying_scopes_to_the_caller_unless_admin(env):
     assert {i.release_group_mbid for i in everyone} == {"rg-mine", "rg-theirs"}
 
 
-# --- toggles + error isolation ---
+# toggles + error isolation
 
 
 @pytest.mark.asyncio
@@ -931,3 +1021,381 @@ async def test_scout_configuration_error_reschedules_quietly(env):
     watch = await env.store.get_watch("rg-1")
     assert watch.last_outcome is None
     assert watch.next_check_at > time.time()
+
+@pytest.mark.asyncio
+async def test_enrol_open_breaker_skips_provider_calls_and_uses_year_fallback_with_one_signal(env, caplog):
+    caplog.set_level("WARNING")
+    env.watcher._provider_available = lambda: False  # type: ignore[attr-defined]
+    avail_calls: list[int] = []
+    orig_avail = env.watcher._provider_available
+    def counting():
+        avail_calls.append(1)
+        return orig_avail()
+    env.watcher._provider_available = counting  # type: ignore
+    records = [_record(mbid=f"rg-{i}", year=2000+i, status="failed") for i in range(3)]
+    _serve_history(env, failed=records)
+    for rec in records:
+        env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
+    env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
+    env.mb.get_release_group_by_id.return_value = {"first-release-date": "1999-01-01"}
+    summary = await env.watcher.run_sweep()
+    assert summary.enrolled == 3
+    assert env.mb.get_release_group_by_id.call_count == 0
+    assert len(avail_calls) == 1
+    for i in range(3):
+        w = await env.store.get_watch(f"rg-{i}")
+        assert w is not None
+        assert w.first_release_date == str(2000 + i)
+    outage_logs = [r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]
+    assert len(outage_logs) == 1
+    assert outage_logs[0].exc_info is None
+    assert "rg-" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_enrol_healthy_duplicate_mbid_calls_once_and_caches(env):
+    env.watcher._provider_available = lambda: True  # type: ignore
+    # duplicate MBIDs collapse into one watch on enrol, so exercise the provider
+    # cache directly via _first_release_date_for_mbid
+    cache: dict[str, str | None] = {}
+    env.mb.get_release_group_by_id.return_value = {"first-release-date": "2020-05-17"}
+    d1 = await env.watcher._first_release_date_for_mbid("rg-dup", 1999, True, cache)
+    assert d1 == "2020-05-17"
+    assert env.mb.get_release_group_by_id.call_count == 1
+    d2 = await env.watcher._first_release_date_for_mbid("rg-dup", 1999, True, cache)
+    assert d2 == "2020-05-17"
+    assert env.mb.get_release_group_by_id.call_count == 1
+    env.mb.get_release_group_by_id.return_value = {"first-release-date": "2021-01-01"}
+    d3 = await env.watcher._first_release_date_for_mbid("rg-other", 1999, True, cache)
+    assert d3 == "2021-01-01"
+    assert env.mb.get_release_group_by_id.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_enrol_caches_none_and_fallback_year(env):
+    env.watcher._provider_available = lambda: True  # type: ignore
+    cache: dict[str, str | None] = {}
+    # Provider returns None (degraded) for this MBID
+    env.mb.get_release_group_by_id.return_value = {}
+    d1 = await env.watcher._first_release_date_for_mbid("rg-none", 2005, True, cache)
+    assert d1 == "2005"
+    assert env.mb.get_release_group_by_id.call_count == 1
+    d2 = await env.watcher._first_release_date_for_mbid("rg-none", 2005, True, cache)
+    assert d2 == "2005"
+    assert env.mb.get_release_group_by_id.call_count == 1
+    # Ensure None is cached as fallback, not re-queried
+    env.mb.get_release_group_by_id.return_value = {"first-release-date": "2022-01-01"}
+    # Even though provider now would return a date, cache still returns old fallback for same MBID in same sweep
+    d3 = await env.watcher._first_release_date_for_mbid("rg-none", 2005, True, cache)
+    assert d3 == "2005"
+    assert env.mb.get_release_group_by_id.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_enrol_preserves_existing_exclusions_under_open(env, caplog):
+    env.watcher._provider_available = lambda: False  # type: ignore
+    caplog.set_level("WARNING")
+    eligible = _record(mbid="rg-eligible", year=2020, status="failed", task_id="task-eligible")
+    taskless = _record(mbid="rg-taskless", year=2020, status="failed", task_id=None)
+    local_fault = _record(mbid="rg-fault", year=2020, status="failed", task_id="task-fault")
+    _serve_history(env, failed=[eligible, taskless, local_fault])
+    # task for eligible: terminal availability prefix -> enrols
+    # taskless: no task -> should not enrol
+    # local_fault: mount error -> should not enrol
+    async def get_task(task_id):
+        if task_id == eligible.download_task_id:
+            return _task(error=_NO_MATCH_MSG)
+        if task_id == local_fault.download_task_id:
+            return _task(error="mount error: /music missing")
+        return None
+    env.download_store.get_task.side_effect = get_task
+    env.mb.get_release_group_by_id.return_value = {"first-release-date": "1999-01-01"}
+    summary = await env.watcher.run_sweep()
+    assert summary.enrolled == 1
+    assert await env.store.get_watch("rg-eligible") is not None
+    assert await env.store.get_watch("rg-taskless") is None
+    assert await env.store.get_watch("rg-fault") is None
+    assert env.mb.get_release_group_by_id.call_count == 0
+    # Still exactly one outage signal, no MBID leak
+    assert len([r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]) == 1
+    assert "rg-" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_enrol_isolates_per_record_error_under_open(env, caplog):
+    env.watcher._provider_available = lambda: False  # type: ignore
+    caplog.set_level("WARNING")
+    rec_good = _record(mbid="rg-good", year=2020, task_id="task-good")
+    rec_bad = _record(mbid="rg-bad", year=2020, task_id="task-bad")
+    _serve_history(env, failed=[rec_bad, rec_good])
+    async def get_task(task_id):
+        if task_id == rec_bad.download_task_id:
+            raise RuntimeError("boom task store")
+        return _task(error=_NO_MATCH_MSG)
+    env.download_store.get_task.side_effect = get_task
+    summary = await env.watcher.run_sweep()
+    # Bad record isolated, good still enrolled via year fallback despite OPEN
+    assert summary.enrolled == 1
+    assert await env.store.get_watch("rg-good") is not None
+    assert (await env.store.get_watch("rg-good")).first_release_date == "2020"
+    assert await env.store.get_watch("rg-bad") is None
+    outage = [r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]
+    per_record = [r for r in caplog.records if "wanted.enrol_failed" in r.message]
+    assert len(outage) == 1
+    assert outage[0].exc_info is None
+    assert len(per_record) == 1
+    assert per_record[0].exc_info is not None
+    assert env.mb.get_release_group_by_id.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_disabled_toggle_short_circuits_without_provider_call(env):
+    env.prefs.get_wanted_settings.return_value = WantedWatcherSettings(enabled=False)
+    called = []
+    env.watcher._provider_available = lambda: called.append(1) or False  # type: ignore
+    _serve_history(env, failed=[_record()])
+    summary = await env.watcher.run_sweep()
+    assert summary.enrolled == 0
+    assert len(called) == 0
+    assert env.mb.get_release_group_by_id.call_count == 0
+    assert env.requests.async_get_history.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_outer_cadence_and_due_delay_preserved(env):
+    # _enrol must not add inter-record sleeps; run_sweep cadence stays intact
+    env.watcher._provider_available = lambda: True  # type: ignore
+    _serve_history(env, failed=[_record()])
+    env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
+    calls: list[int] = []
+    orig = env.watcher._provider_available
+    def counting():
+        calls.append(1)
+        return orig()
+    env.watcher._provider_available = counting  # type: ignore
+    await env.watcher.run_sweep()
+    assert len(calls) == 1
+
+@pytest.mark.asyncio
+async def test_duplicate_mbid_differing_years_under_open_uses_per_record_year_and_zero_calls(env, caplog):
+    caplog.set_level("WARNING")
+    env.watcher._provider_available = lambda: False  # type: ignore
+    rec1 = _record(mbid="rg-dup", year=2000, task_id="task-1")
+    rec2 = _record(mbid="rg-dup", year=2010, task_id="task-2")
+    _serve_history(env, failed=[rec1, rec2])
+    env.download_store.get_task.side_effect = lambda tid: _task(task_id=tid, error=_NO_MATCH_MSG)
+    summary = await env.watcher.run_sweep()
+    assert summary.enrolled == 1
+    assert env.mb.get_release_group_by_id.call_count == 0
+    cache: dict[str, str | None] = {}
+    d1 = await env.watcher._first_release_date_for_mbid("rg-dup2", 2000, False, cache)
+    assert d1 == "2000"
+    assert env.mb.get_release_group_by_id.call_count == 0
+    assert cache["rg-dup2"] is None
+    d2 = await env.watcher._first_release_date_for_mbid("rg-dup2", 2010, False, cache)
+    assert d2 == "2010"
+    assert env.mb.get_release_group_by_id.call_count == 0
+    outage = [r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]
+    assert len(outage) == 1
+
+@pytest.mark.asyncio
+async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses_per_record_year_and_one_call(env):
+    env.watcher._provider_available = lambda: True  # type: ignore
+    cache: dict[str, str | None] = {}
+    env.mb.get_release_group_by_id.return_value = {}
+    d1 = await env.watcher._first_release_date_for_mbid("rg-dup2", 2000, True, cache)
+    assert d1 == "2000"
+    assert env.mb.get_release_group_by_id.call_count == 1
+    assert cache["rg-dup2"] is None
+    d2 = await env.watcher._first_release_date_for_mbid("rg-dup2", 2010, True, cache)
+    assert d2 == "2010"  # per-record year, not cached 2000
+    assert env.mb.get_release_group_by_id.call_count == 1  # still one call, second hit cache None
+    cache2: dict[str, str | None] = {}
+    env.mb.get_release_group_by_id.return_value = {"first-release-date": "1995-01-01"}
+    d3 = await env.watcher._first_release_date_for_mbid("rg-dup3", 2000, True, cache2)
+    assert d3 == "1995-01-01"
+    assert env.mb.get_release_group_by_id.call_count == 2
+    d4 = await env.watcher._first_release_date_for_mbid("rg-dup3", 2010, True, cache2)
+    assert d4 == "1995-01-01"  # provider date reused, not per-record year
+    assert env.mb.get_release_group_by_id.call_count == 2
+
+
+# F-PERF-03: batched retrying-history reads
+
+
+@pytest.mark.asyncio
+async def test_list_retrying_uses_one_task_batch_per_page_never_per_row(env):
+    """250 linked rows across two pages per status: exactly one get_tasks()
+    call per page and ZERO per-row get_task() round trips."""
+    page_one = [
+        _record(mbid=f"rg-{i:03d}", requested_at=f"2026-01-{(i % 28) + 1:02d}T00:00:00+00:00")
+        for i in range(200)
+    ]
+    page_two = [
+        _record(mbid=f"rg-{i:03d}", requested_at="2025-12-01T00:00:00+00:00")
+        for i in range(200, 250)
+    ]
+    batch_sizes: list[int] = []
+
+    async def batch(task_ids):
+        batch_sizes.append(len(task_ids))
+        return {
+            task_id: _task(task_id=task_id)
+            for task_id in task_ids
+            if task_id in {r.download_task_id for r in (*page_one, *page_two)}
+        }
+
+    env.download_store.get_tasks = AsyncMock(side_effect=batch)
+    env.ds.next_retry_at = Mock(return_value=time.time() + 60)
+
+    async def paged(
+        status_filter=None,
+        page_size=200,
+        cursor=None,
+        owner_id=None,
+        request_kind=None,
+    ):
+        assert request_kind == "album"
+        if cursor is None:
+            return list(page_one), ("2026-01-01T00:00:00+00:00", "rg-000")
+        return list(page_two), None
+
+    env.requests.async_get_retrying_page.side_effect = paged
+
+    items = await env.watcher.list_retrying_for("admin-1", "admin")
+
+    # one batch per page per status (2 statuses x 2 pages), zero single reads
+    assert env.download_store.get_tasks.await_count == 4
+    assert all(size <= 200 for size in batch_sizes)
+    env.download_store.get_task.assert_not_awaited()
+    assert len(items) == 500  # 250 rows x 2 statuses
+
+
+@pytest.mark.asyncio
+async def test_list_retrying_pushes_owner_scope_into_the_history_query(env):
+    captured: dict[str, object] = {}
+
+    async def paged(
+        status_filter=None,
+        page_size=200,
+        cursor=None,
+        owner_id=None,
+        request_kind=None,
+    ):
+        captured["owner_id"] = owner_id
+        captured["request_kind"] = request_kind
+        return [], None
+
+    env.requests.async_get_retrying_page.side_effect = paged
+
+    await env.watcher.list_retrying_for("user-a", "user")
+    assert captured["owner_id"] == "user-a"
+    assert captured["request_kind"] == "album"
+
+    await env.watcher.list_retrying_for("admin-1", "admin")
+    assert captured["owner_id"] is None
+    assert captured["request_kind"] == "album"
+
+
+@pytest.mark.asyncio
+async def test_enrol_reuses_batched_task_data_without_single_reads(env):
+    _serve_history(env, failed=[_record(mbid="rg-enrol")])
+    env.download_store.get_task.return_value = _task(error=_NO_SOURCE_MSG)
+    await _add_watch(env, mbid="rg-other")  # unrelated watch keeps sweep busy
+
+    summary = await env.watcher.run_sweep()
+
+    env.download_store.get_task.assert_not_awaited()  # batched, not per row
+    assert env.download_store.get_tasks.await_count >= 1
+    assert summary.enrolled == 1
+
+
+# F-PERF-09: one immutable membership snapshot per sweep
+
+
+def _install_membership_counter(env, members: set[str]):
+    calls = {"n": 0}
+    returned_objects: list[object] = []
+
+    async def counting_mbids(include_release_ids=False):
+        calls["n"] += 1
+        snapshot = frozenset(value.lower() for value in members)
+        returned_objects.append(snapshot)
+        # the repository hands back a fresh mutable copy each call
+        return set(snapshot)
+
+    env.library.get_library_mbids = counting_mbids
+    return calls, returned_objects
+
+
+@pytest.mark.asyncio
+async def test_sweep_reuses_one_immutable_membership_snapshot(env):
+    """Several no-tracklist missing wants in ONE sweep load + normalize the
+    library membership exactly once and compare against the same frozenset."""
+    for index in range(3):  # default due cap visits all three
+        await _add_watch(env, mbid=f"rg-lib-{index}")
+    _serve_history(env)
+
+    calls, _objects = _install_membership_counter(
+        env, {f"mbid-{i}" for i in range(4000)} | {"RG-LIB-0"}
+    )
+    env.album_service.get_album_tracks_info.side_effect = RuntimeError("no tracklist")
+
+    summary = await env.watcher.run_sweep()
+
+    assert summary.checked == 3
+    assert calls["n"] == 1, "one membership load serves the whole sweep"
+    assert summary.fulfilled == 1  # rg-lib-0 matches RG-LIB-0 case-insensitively
+
+
+@pytest.mark.asyncio
+async def test_snapshot_is_not_carried_across_sweeps_or_revisions(env):
+    await _add_watch(env, mbid="rg-target-a")
+    await _add_watch(env, mbid="rg-target-b")
+    _serve_history(env)
+
+    members = {"rg-target-a"}
+    calls, snapshots = _install_membership_counter(env, members)
+    env.album_service.get_album_tracks_info.side_effect = RuntimeError("no tracklist")
+
+    first = await env.watcher.run_sweep()
+    assert first.fulfilled == 1
+    first_object = snapshots[0]
+
+    # catalog change between sweeps: membership now contains only B, and B's
+    # watch becomes due again (fulfilled A must not be carried forward).
+    members.clear()
+    members.add("rg-target-b")
+    await env.store.reschedule("rg-target-b", time.time() - 5)
+
+    second = await env.watcher.run_sweep()
+    assert second.fulfilled == 1
+    assert len(snapshots) == 2 and snapshots[1] is not first_object
+    assert calls["n"] == 2  # one load per sweep, not per want, not shared
+
+
+@pytest.mark.asyncio
+async def test_failed_membership_read_stays_fail_open_per_want(env):
+    for index in range(3):
+        await _add_watch(env, mbid=f"rg-fail-{index}")
+    _serve_history(env)
+
+    attempts = {"n": 0}
+
+    async def failing_mbids(include_release_ids=False):
+        attempts["n"] += 1
+        raise RuntimeError("library read failed")
+
+    env.library.get_library_mbids = failing_mbids
+    env.album_service.get_album_tracks_info.side_effect = RuntimeError("no tracklist")
+
+    summary = await env.watcher.run_sweep()
+
+    # fail-open: every want still got its best-effort presence check (the
+    # pre-ticket per-want retry behavior on failures is preserved), nothing
+    # was fulfilled, and the sweep completed without aborting.
+    assert summary.checked == 3
+    assert summary.fulfilled == 0
+    assert summary.errors == 0
+    assert attempts["n"] == 3

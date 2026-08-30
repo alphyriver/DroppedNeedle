@@ -24,7 +24,6 @@ def _track_ids(env):
 
 async def test_create_get_update_delete_roundtrip(compat_env):
     songs = _track_ids(compat_env)
-    # create with two songs
     created = _sub(_get(compat_env, "createPlaylist", name="My Mix",
                         songId=songs))["playlist"]
     pid = created["id"]
@@ -33,16 +32,13 @@ async def test_create_get_update_delete_roundtrip(compat_env):
     assert created["songCount"] == 2
     assert [e["id"] for e in created["entry"]] == songs  # songId<->file_id order
 
-    # appears in getPlaylists (no entries)
     lists = _sub(_get(compat_env, "getPlaylists"))["playlists"]["playlist"]
     assert any(p["id"] == pid and p["songCount"] == 2 for p in lists)
 
-    # getPlaylist returns entries
     got = _sub(_get(compat_env, "getPlaylist", id=pid))["playlist"]
     assert len(got["entry"]) == 2
     assert got["owner"] == "alice"
 
-    # update: rename + remove index 0
     _sub(_get(compat_env, "updatePlaylist", playlistId=pid, name="Renamed",
               songIndexToRemove="0"))
     got2 = _sub(_get(compat_env, "getPlaylist", id=pid))["playlist"]
@@ -50,12 +46,10 @@ async def test_create_get_update_delete_roundtrip(compat_env):
     assert got2["songCount"] == 1
     assert got2["entry"][0]["id"] == songs[1]
 
-    # update: add a song back
     _sub(_get(compat_env, "updatePlaylist", playlistId=pid, songIdToAdd=songs[0]))
     got3 = _sub(_get(compat_env, "getPlaylist", id=pid))["playlist"]
     assert got3["songCount"] == 2
 
-    # delete
     _sub(_get(compat_env, "deletePlaylist", id=pid))
     after = _sub(_get(compat_env, "getPlaylists"))["playlists"].get("playlist", [])
     assert all(p["id"] != pid for p in after)
@@ -69,7 +63,6 @@ async def test_create_requires_name(compat_env):
 async def test_create_replace_existing(compat_env):
     songs = _track_ids(compat_env)
     pid = _sub(_get(compat_env, "createPlaylist", name="Orig", songId=songs[0]))["playlist"]["id"]
-    # replace contents via playlistId
     replaced = _sub(_get(compat_env, "createPlaylist", playlistId=pid, songId=songs[1]))["playlist"]
     assert replaced["songCount"] == 1
     assert replaced["entry"][0]["id"] == songs[1]
@@ -136,7 +129,6 @@ async def test_library_file_id_roundtrip_to_stream(compat_env):
     pid = _sub(_get(compat_env, "createPlaylist", name="X", songId=songs[0]))["playlist"]["id"]
     entry = _sub(_get(compat_env, "getPlaylist", id=pid))["playlist"]["entry"][0]
     assert entry["id"] == songs[0]
-    # and the persisted row carries library_file_id
     tracks = await compat_env.playlists.get_tracks(pid[3:])
     assert tracks[0].library_file_id == songs[0][3:]
     assert tracks[0].source_type == "droppedneedle-local"
@@ -194,3 +186,56 @@ async def test_public_playlist_cover_is_visible_to_another_user(
     )
     assert response.status_code == 200
     assert response.content.endswith(b"public")
+
+
+async def test_spotify_imported_cover_advertised_and_served(
+    compat_env, db_path, write_lock
+):
+    """GH-287: a Spotify-imported playlist cover must reach Feishin - coverArt
+    advertised in the playlist list/detail and the bytes served by getCoverArt."""
+    import threading
+    from unittest.mock import AsyncMock
+
+    from repositories.async_playlist_repository import AsyncPlaylistRepository
+    from repositories.playlist_repository import PlaylistRepository
+    from services.spotify_import_service import (
+        SpotifyImportService,
+        cover_fetcher_for,
+    )
+    from tests.mocks.spotify_cdn_mock import COVER_URL, JPEG_BYTES, SpotifyCdnMock
+
+    cdn = SpotifyCdnMock()
+    spotify_client = AsyncMock()
+    spotify_client.get_playlist.return_value = {
+        "id": "spot-9",
+        "name": "From Spotify",
+        "images": [{"url": COVER_URL, "width": 640, "height": 640}],
+    }
+    spotify_client.get_playlist_tracks.return_value = []
+    factory = AsyncMock()
+    factory.resolve_spotify.return_value = spotify_client
+    importer = SpotifyImportService(
+        client_factory=factory,
+        playlist_repo=None,
+        mb_repo=AsyncMock(),
+        playlist_service=compat_env.playlists,
+        async_playlist_repo=AsyncPlaylistRepository(
+            PlaylistRepository(db_path=db_path, write_lock=write_lock)
+        ),
+        cover_fetcher=cover_fetcher_for(cdn.client()),
+    )
+
+    pid = await importer.ensure_playlist_record("user-alice", "spot-9", "From Spotify")
+    await importer.populate_playlist("user-alice", "spot-9", pid)
+
+    lists = _sub(_get(compat_env, "getPlaylists"))["playlists"]["playlist"]
+    mine = next(p for p in lists if p["id"] == f"pl-{pid}")
+    assert mine["coverArt"] == f"pl-{pid}"
+
+    detail = _sub(_get(compat_env, "getPlaylist", id=f"pl-{pid}"))["playlist"]
+    assert detail["coverArt"] == f"pl-{pid}"
+
+    response = _get(compat_env, "getCoverArt", id=f"pl-{pid}")
+    assert response.status_code == 200
+    assert response.content == JPEG_BYTES
+    assert response.headers["content-type"].startswith("image/jpeg")

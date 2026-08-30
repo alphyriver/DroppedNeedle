@@ -10,6 +10,7 @@ import os
 import sqlite3
 import unicodedata
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 import threading
@@ -29,6 +30,10 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.persistence._database import PersistenceBase
+from infrastructure.persistence.gh293_calibration import (
+    BACKGROUND_YIELD_COOLDOWN_SECONDS,
+    MATERIALIZATION_PAGE_CAP,
+)
 from infrastructure.persistence.native_library_schema import SCHEMA_SQL
 from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
 from infrastructure.validators import is_valid_mbid
@@ -124,6 +129,33 @@ from models.local_catalog import (
 )
 
 MAX_REVISION = 9_223_372_036_854_775_807
+
+
+def _provider_base_url_for(decision_source: str) -> str | None:
+    """P2 full-mirror provenance stamp (owner decision 2026-08-24).
+
+    Auditability ONLY: records which MusicBrainz endpoint class served an
+    accepted AUTOMATIC identity (get_mb_api_base() at capture time). Never
+    read by identity predicates, never gates any decision; manual and
+    legacy_import rows stay NULL by definition.
+    """
+    if decision_source != "automatic":
+        return None
+    from repositories.musicbrainz_base import get_mb_api_base
+
+    return get_mb_api_base()
+
+
+def _has_surrogates(text: str) -> bool:
+    """True when the string carries surrogateescape code points (raw
+    filesystem bytes that are not valid UTF-8 - F-021)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 _CATALOG_VALIDATION_MMAP_BYTES = 64 * 1024 * 1024
 _FOREIGN_KEY_VALIDATION_REVISION = 1
 _POST_PROCESSING_IDENTIFICATION_PRIORITY = 50
@@ -133,6 +165,7 @@ AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
     {"SUPPORTED", "ACCEPTED", "SUPPORTED_EMBEDDED_IDS"}
 )
 ATTENTION_FAILURE_CODES = frozenset({"MAX_DEFERRALS_EXCEEDED", "SUBJECT_NOT_AVAILABLE"})
+_ACTIVITY_DEFERRED_JOB_LIMIT = 20
 BULK_PREVIEW_BATCH_SIZE = 500
 BULK_PREVIEW_CLEANUP_BATCH_SIZE = 5_000
 MANAGEMENT_PERSISTENCE_BATCH_SIZE = 500
@@ -676,7 +709,16 @@ class NativeLibraryStore(PersistenceBase):
         self._scan_catalog_dirty = False
         self._provider_album_snapshot: tuple[int, frozenset[str]] | None = None
         self._provider_album_snapshot_lock = asyncio.Lock()
+        # F-PERF-05: bounded revision-keyed browse projections. The catalog
+        # revision inside each key is the invalidation authority - an entry can
+        # never outlive the data it was built from. Whole entries are evicted
+        # (stale revisions first, then oldest-touched) under a small cap, and
+        # per-key asyncio locks coalesce simultaneous first builds.
         self.work_wakeups = work_wakeups or DurableWorkWakeups()
+        self._browse_projections: OrderedDict[tuple, tuple[int, Any]] = OrderedDict()
+        self._browse_projection_lock = threading.Lock()
+        self._browse_key_locks: dict[tuple, asyncio.Lock] = {}
+        self._browse_touch_counter = 0
         super().__init__(db_path, write_lock)
 
     async def _write(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
@@ -735,6 +777,41 @@ class NativeLibraryStore(PersistenceBase):
                     self._scan_invalidation_pending = False
                 else:
                     self._scan_invalidation_pending = True
+        return result
+
+    async def _write_background(
+        self, operation: Callable[[sqlite3.Connection], _T]
+    ) -> _T:
+        """Background-priority write that still performs normal catalog
+        invalidation after commit.
+
+        (GH-293) Identity backfill mutations must not win against interactive
+        writes, so they go through the shared lock's background admission. The
+        catalog-change invalidation contract is identical to ``_write``.
+        """
+
+        def tracked(connection: sqlite3.Connection) -> tuple[_T, bool]:
+            before = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            result = operation(connection)
+            after = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            return result, before != after
+
+        result, catalog_changed = await super()._background_write(tracked)
+        if catalog_changed:
+            try:
+                await self._invalidate()
+            except Exception:  # noqa: BLE001 - the database commit already succeeded
+                logger.exception(
+                    "Target catalog cache invalidation failed after commit"
+                )
         return result
 
     async def flush_scan_invalidation(self, *, terminal: bool = False) -> None:
@@ -1160,7 +1237,8 @@ class NativeLibraryStore(PersistenceBase):
             for statement in (
                 "ALTER TABLE library_identification_jobs ADD COLUMN checkpoint_json TEXT",
                 "ALTER TABLE library_work_control ADD COLUMN high_priority_claim_count INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE local_tracks ADD COLUMN embedded_release_group_mbid TEXT",
+                "ALTER TABLE library_identification_jobs ADD COLUMN provider_reset_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE local_albums ADD COLUMN management_schedule_pending INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_release_mbid TEXT",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_recording_mbid TEXT",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_release_track_mbid TEXT",
@@ -1231,7 +1309,8 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE local_track_external_identities ADD COLUMN release_track_mbid TEXT",
                 "ALTER TABLE local_track_external_identities ADD COLUMN medium_position INTEGER CHECK(medium_position IS NULL OR medium_position > 0)",
                 "ALTER TABLE local_track_external_identities ADD COLUMN release_track_position INTEGER CHECK(release_track_position IS NULL OR release_track_position > 0)",
-                "ALTER TABLE library_management_overrides ADD COLUMN subject_revision INTEGER NOT NULL DEFAULT 1 CHECK(subject_revision BETWEEN 1 AND 9223372036854775807)",
+                "ALTER TABLE local_album_external_identities ADD COLUMN provider_base_url TEXT",
+                "ALTER TABLE local_track_external_identities ADD COLUMN provider_base_url TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN destination_collision_key TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN catalog_document_json TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN catalog_document_hash TEXT",
@@ -1254,6 +1333,8 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE library_management_import_journal ADD COLUMN baseline_file_mtime_ns INTEGER",
                 "ALTER TABLE library_management_import_journal ADD COLUMN baseline_file_mode INTEGER",
                 "ALTER TABLE library_operation_jobs ADD COLUMN next_attempt_at REAL",
+                "ALTER TABLE library_operation_jobs "
+                "ADD COLUMN reidentification_attempt_count INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE library_identification_jobs ADD COLUMN attention_cause TEXT",
             ):
                 try:
@@ -1561,6 +1642,78 @@ class NativeLibraryStore(PersistenceBase):
         if any(int(row[column]) >= MAX_REVISION for row in rows for column in columns):
             raise RevisionOverflowError("A library revision reached its maximum value.")
 
+    _BROWSE_PROJECTION_MAX_ENTRIES = 24
+    _BROWSE_PROJECTION_MAX_IDS = 20_000
+
+    def _browse_cache_get(self, key: tuple, revision: int) -> Any | None:
+        with self._browse_projection_lock:
+            entry = self._browse_projections.get(key)
+            if entry is None or entry[0] != revision:
+                return None
+            self._browse_touch_counter += 1
+            self._browse_projections[key] = (entry[0], entry[1])
+            self._browse_projections.move_to_end(key)
+            return entry[1]
+
+    def _browse_cache_put(self, key: tuple, revision: int, projection: Any) -> None:
+        """Insert a fresh entry and evict whole entries only: stale-revision
+        keys first (they can never be served again), then oldest-touched until
+        the cap holds. Projections above the ID budget are served but never
+        cached. Unreferenced per-key locks are pruned alongside."""
+        with self._browse_projection_lock:
+            stale = [
+                existing_key
+                for existing_key, (
+                    entry_revision,
+                    _,
+                ) in self._browse_projections.items()
+                if entry_revision != revision
+            ]
+            for existing_key in stale:
+                del self._browse_projections[existing_key]
+            rows = projection[0] if isinstance(projection, tuple) else ()
+            row_count = len(rows) if isinstance(rows, list) else 0
+            if row_count <= self._BROWSE_PROJECTION_MAX_IDS:
+                self._browse_projections[key] = (revision, projection)
+                self._browse_projections.move_to_end(key)
+            while len(self._browse_projections) > self._BROWSE_PROJECTION_MAX_ENTRIES:
+                self._browse_projections.popitem(last=False)
+            for lock_key in list(self._browse_key_locks):
+                if lock_key in self._browse_projections:
+                    continue
+                candidate_lock = self._browse_key_locks[lock_key]
+                if not candidate_lock.locked():
+                    del self._browse_key_locks[lock_key]
+
+    async def _via_browse_projection(
+        self,
+        key_tail: tuple,
+        revision: int,
+        build: Callable[[], Awaitable[Any]],
+    ) -> tuple[Any, bool]:
+        """Serve a browse projection keyed by endpoint/filters/revision.
+
+        Concurrent first requests coalesce onto one build through a per-key
+        asyncio lock; later callers find the finished entry. A failed builder
+        does not poison the key - the next caller rebuilds under the same
+        lock. Returns ``(projection, from_cache)``."""
+        key = key_tail + (revision,)
+        cached = self._browse_cache_get(key, revision)
+        if cached is not None:
+            return cached, True
+        with self._browse_projection_lock:
+            key_lock = self._browse_key_locks.get(key)
+            if key_lock is None:
+                key_lock = asyncio.Lock()
+                self._browse_key_locks[key] = key_lock
+        async with key_lock:
+            cached = self._browse_cache_get(key, revision)
+            if cached is not None:
+                return cached, True
+            projection = await build()
+            self._browse_cache_put(key, revision, projection)
+            return projection, False
+
     async def get_catalog_revision(self) -> int:
         def operation(connection: sqlite3.Connection) -> int:
             row = connection.execute(
@@ -1680,6 +1833,77 @@ class NativeLibraryStore(PersistenceBase):
                 connection, kind=kind, identifier=identifier
             )
             return matches[0] if len(matches) == 1 else None
+
+        return await self._read(operation)
+
+    async def resolve_canonical_target_ids(
+        self, kind: str, identifiers: list[str]
+    ) -> dict[str, str]:
+        """F-TARGETCATALOG-06: batch provider-aware canonical resolution.
+
+        Preserves ``resolve_canonical_target_id`` semantics exactly: local
+        IDs, aliases, retired IDs, and unambiguous MusicBrainz release-group /
+        release identities resolve to their one canonical local target;
+        missing and AMBIGUOUS identities (more than one active indexed match)
+        stay absent from the mapping rather than picking a first row.
+        """
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> dict[str, str]:
+            unique = list(dict.fromkeys(identifiers))
+            resolved: dict[str, str] = {}
+            provider_pending: list[str] = []
+            for identifier in unique:
+                direct = self._resolve_target_id(
+                    connection, kind=kind, identifier=identifier
+                )
+                if direct is not None:
+                    resolved[identifier] = direct
+                else:
+                    provider_pending.append(identifier)
+            if not provider_pending:
+                return resolved
+            if kind != "album":
+                # Only the album kind has the provider identity branch today;
+                # mirror the single-item resolver's per-identifier membership
+                # query for other kinds (bounded by the 200-item request cap).
+                for identifier in provider_pending:
+                    matches = self._resolve_target_membership_ids(
+                        connection, kind=kind, identifier=identifier
+                    )
+                    if len(matches) == 1:
+                        resolved[identifier] = matches[0]
+                return resolved
+            # One provider-identity read for the whole pending batch. A row
+            # matches an identifier when its release-group MBID OR release
+            # MBID equals the identifier case-insensitively - exactly the
+            # single-item membership predicate, evaluated in one query.
+            rows = connection.execute(
+                "SELECT identity.local_album_id AS id, "
+                "LOWER(identity.release_group_mbid) AS rg, "
+                "LOWER(identity.release_mbid) AS rel "
+                "FROM local_album_external_identities identity "
+                "JOIN local_albums subject ON subject.id = identity.local_album_id "
+                "WHERE identity.provider = 'musicbrainz' "
+                "AND subject.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks active_track "
+                "WHERE active_track.local_album_id = subject.id "
+                "AND active_track.availability = 'indexed')"
+            ).fetchall()
+            needles = {identifier.casefold() for identifier in provider_pending}
+            candidates_by_needle: dict[str, set[str]] = {
+                needle: set() for needle in needles
+            }
+            for row in rows:
+                for needle in needles:
+                    if row["rg"] == needle or row["rel"] == needle:
+                        candidates_by_needle[needle].add(str(row["id"]))
+            for identifier in provider_pending:
+                candidates = candidates_by_needle[identifier.casefold()]
+                if len(candidates) == 1:
+                    resolved[identifier] = next(iter(candidates))
+            return resolved
 
         return await self._read(operation)
 
@@ -2420,6 +2644,38 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def get_target_album_tracks_batch(
+        self, album_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """F-TARGETCATALOG-06: indexed track rows for many canonical local
+        album IDs in one bounded query, grouped by canonical album ID.
+
+        Rows use the same ``_TARGET_TRACK_SELECT`` fields and the same
+        disc/track/id ordering as ``get_target_album_tracks``. Unknown IDs get
+        an empty list."""
+        if not album_ids:
+            return {}
+        unique = list(dict.fromkeys(str(a) for a in album_ids))
+        placeholders = ",".join("?" for _ in unique)
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> dict[str, list[dict[str, Any]]]:
+            rows = connection.execute(
+                _TARGET_TRACK_SELECT + f" WHERE a.id IN ({placeholders}) "
+                "AND t.availability = 'indexed' "
+                "ORDER BY a.id, t.disc_number, t.track_number, t.id",
+                unique,
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {
+                album_id: [] for album_id in unique
+            }
+            for row in rows:
+                grouped.setdefault(str(row["local_album_id"]), []).append(dict(row))
+            return grouped
+
+        return await self._read(operation)
+
     async def get_target_album_tracks(
         self, album_identifier: str, *, include_unavailable: bool = False
     ) -> list[dict[str, Any]]:
@@ -2518,76 +2774,170 @@ class NativeLibraryStore(PersistenceBase):
         album_ids: list[str] | None = None,
         file_format: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        def operation(
-            connection: sqlite3.Connection,
-        ) -> tuple[list[dict[str, Any]], int]:
-            clauses = ["a.retired_into_album_id IS NULL", "t.availability = 'indexed'"]
-            parameters: list[Any] = []
-            if search:
-                folded = f"%{_fold(search) or ''}%"
-                clauses.append(
-                    "(a.title_folded LIKE ? OR a.album_artist_name_folded LIKE ?)"
-                )
-                parameters.extend((folded, folded))
-            if from_year is not None:
-                clauses.append("a.year >= ?")
-                parameters.append(from_year)
-            if to_year is not None:
-                clauses.append("a.year <= ?")
-                parameters.append(to_year)
-            if genre:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM local_track_genres genre "
-                    "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
-                )
-                parameters.append(_fold(genre))
-            if file_format:
-                clauses.append("LOWER(t.file_format) = LOWER(?)")
-                parameters.append(file_format)
-            if album_ids:
-                resolved_albums = list(
-                    dict.fromkeys(
-                        album_id
-                        for value in album_ids
-                        for album_id in self._resolve_target_membership_ids(
-                            connection, kind="album", identifier=value
+        """F-PERF-05: revision-keyed ordered album projection + page slice.
+
+        The grouped aggregate for the whole filtered catalog is built once per
+        (endpoint, normalized filters, sort, catalog revision); page requests
+        slice that ordered projection, so changing ``page`` no longer repeats
+        the count/group pass. Rows and totals equal the previous per-page SQL.
+        ``random`` keeps its exact pre-ticket behavior by bypassing the cache
+        (albums randomized over ``a.id``)."""
+
+        async def build() -> tuple[list[dict[str, Any]], int]:
+            def operation(
+                connection: sqlite3.Connection,
+            ) -> tuple[list[dict[str, Any]], int]:
+                clauses = [
+                    "a.retired_into_album_id IS NULL",
+                    "t.availability = 'indexed'",
+                ]
+                parameters: list[Any] = []
+                if search:
+                    folded = f"%{_fold(search) or ''}%"
+                    clauses.append(
+                        "(a.title_folded LIKE ? OR a.album_artist_name_folded LIKE ?)"
+                    )
+                    parameters.extend((folded, folded))
+                if from_year is not None:
+                    clauses.append("a.year >= ?")
+                    parameters.append(from_year)
+                if to_year is not None:
+                    clauses.append("a.year <= ?")
+                    parameters.append(to_year)
+                if genre:
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM local_track_genres genre "
+                        "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
+                    )
+                    parameters.append(_fold(genre))
+                if file_format:
+                    clauses.append("LOWER(t.file_format) = LOWER(?)")
+                    parameters.append(file_format)
+                if album_ids:
+                    resolved_albums = list(
+                        dict.fromkeys(
+                            album_id
+                            for value in album_ids
+                            for album_id in self._resolve_target_membership_ids(
+                                connection, kind="album", identifier=value
+                            )
                         )
                     )
-                )
-                if not resolved_albums:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved_albums)
-                clauses.append(f"a.id IN ({placeholders})")
-                parameters.extend(resolved_albums)
-            if artist_id:
-                resolved_artists = self._resolve_target_membership_ids(
-                    connection, kind="artist", identifier=artist_id
-                )
-                if not resolved_artists:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved_artists)
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM local_album_artists laa "
-                    "WHERE laa.local_album_id = a.id "
-                    f"AND laa.local_artist_id IN ({placeholders}))"
-                )
-                parameters.extend(resolved_artists)
-            where = " AND ".join(clauses)
-            total = int(
-                connection.execute(
-                    "SELECT COUNT(DISTINCT a.id) FROM local_albums a "
-                    "JOIN local_tracks t ON t.local_album_id = a.id WHERE " + where,
+                    if not resolved_albums:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved_albums)
+                    clauses.append(f"a.id IN ({placeholders})")
+                    parameters.extend(resolved_albums)
+                if artist_id:
+                    resolved_artists = self._resolve_target_membership_ids(
+                        connection, kind="artist", identifier=artist_id
+                    )
+                    if not resolved_artists:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved_artists)
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM local_album_artists laa "
+                        "WHERE laa.local_album_id = a.id "
+                        f"AND laa.local_artist_id IN ({placeholders}))"
+                    )
+                    parameters.extend(resolved_artists)
+                where = " AND ".join(clauses)
+                ordering = {
+                    "recent": "MAX(t.imported_at) DESC, a.id",
+                    "newest": "COALESCE(a.year, 0) DESC, a.title_folded, a.id",
+                    "oldest": "COALESCE(a.year, 0), a.title_folded, a.id",
+                    "name": "a.title_folded, a.id",
+                    "artist": "a.album_artist_name_folded, a.title_folded, a.id",
+                    "random": "a.id",
+                }.get(sort, "MAX(t.imported_at) DESC, a.id")
+                rows = connection.execute(
+                    "SELECT a.id AS release_group_mbid, a.title AS album_title, "
+                    "a.album_artist_name, a.album_artist_id AS album_artist_mbid, "
+                    "a.year, a.is_compilation, a.original_release_date, "
+                    "a.album_artist_sort_name, COUNT(t.id) AS track_count, "
+                    "SUM(t.file_size_bytes) AS total_size_bytes, "
+                    "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
+                    "MAX(t.imported_at) AS last_imported_at, "
+                    # F-PERF-10 display policy: normalized format for a homogeneous
+                    # album; literal 'mixed' when grouped indexed tracks carry more
+                    # than one normalized non-empty format. Lexical MAX is not a rank.
+                    f"CASE WHEN COUNT(DISTINCT LOWER(NULLIF(t.file_format, ''))) <= 1 THEN COALESCE(MIN(NULLIF(LOWER(t.file_format), '')), '') ELSE 'mixed' END AS file_format, MAX(t.album_sort) AS album_sort_name, "
+                    "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
+                    "ae.release_group_mbid AS provider_release_group_mbid, "
+                    "ae.release_mbid AS provider_release_mbid, "
+                    "custom.manifest_id AS custom_manifest_id, "
+                    "aie.provider_artist_id AS provider_artist_mbid, artwork.cover_url, "
+                    "artwork.source AS artwork_source, contribution.id AS contribution_id, "
+                    "contribution.state AS contribution_state "
+                    "FROM local_albums a JOIN local_tracks t ON t.local_album_id = a.id "
+                    "LEFT JOIN local_album_external_identities ae "
+                    "ON ae.local_album_id = a.id AND ae.provider = 'musicbrainz' "
+                    "LEFT JOIN local_artist_external_identities aie "
+                    "ON aie.local_artist_id = a.album_artist_id "
+                    "AND aie.provider = 'musicbrainz' "
+                    "LEFT JOIN library_custom_edition_active custom "
+                    "ON custom.local_album_id = a.id "
+                    "LEFT JOIN local_album_artwork artwork ON artwork.local_album_id = a.id "
+                    "LEFT JOIN library_contribution_drafts contribution "
+                    "ON contribution.local_album_id = a.id "
+                    "AND contribution.state NOT IN ('linked','cancelled','stale') "
+                    "WHERE " + where + " GROUP BY a.id ORDER BY " + ordering,
                     parameters,
-                ).fetchone()[0]
+                ).fetchall()
+                return [dict(row) for row in rows], len(rows)
+
+            return await self._read(operation)
+
+        if sort == "random":
+            # Pre-ticket random semantics preserved: never cached.
+            rows, total = await build()
+            start = max(0, offset)
+            return rows[start : start + max(1, limit)], total
+
+        revision = await self.get_catalog_revision()
+        key_tail = (
+            "albums",
+            sort,
+            _fold(search) or "" if search else "",
+            from_year,
+            to_year,
+            _fold(genre) if genre else None,
+            _fold(artist_id) if artist_id else None,
+            tuple(album_ids or ()),
+            (file_format or "").lower() or None,
+        )
+        projection, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        rows, total = projection
+        start = max(0, offset)
+        return rows[start : start + max(1, limit)], total
+
+    async def list_target_cutoff_unmet(
+        self, cutoff_rank: int, *, limit: int = 100_000
+    ) -> list[dict[str, Any]]:
+        """F-TARGETCATALOG-03: one aggregate replacing the per-album N+1 reads.
+
+        Computes each active indexed album's WORST track quality rank in SQL
+        (mirroring ``quality_tiers.tier_for`` exactly - lossless extensions,
+        MP4-family lossless only with bit-depth evidence, then the bitrate
+        bands) and returns only albums whose worst rank is below
+        ``cutoff_rank``. Same row shape as ``list_target_albums`` plus
+        ``worst_rank``; ordering matches that worklist's album/artist keys.
+        """
+
+        def operation(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            rank = (
+                "CASE "
+                "WHEN LOWER(COALESCE(t.file_format, '')) IN "
+                "('flac','alac','wav','ape','wv') THEN 4 "
+                "WHEN LOWER(COALESCE(t.file_format, '')) IN ('m4a','mp4','mov') "
+                "AND t.bit_depth IS NOT NULL THEN 4 "
+                "WHEN COALESCE(t.bit_rate, 0) >= 320 THEN 3 "
+                "WHEN COALESCE(t.bit_rate, 0) >= 256 THEN 2 "
+                "WHEN COALESCE(t.bit_rate, 0) >= 192 THEN 1 "
+                "ELSE 0 END"
             )
-            ordering = {
-                "recent": "MAX(t.imported_at) DESC, a.id",
-                "newest": "COALESCE(a.year, 0) DESC, a.title_folded, a.id",
-                "oldest": "COALESCE(a.year, 0), a.title_folded, a.id",
-                "name": "a.title_folded, a.id",
-                "artist": "a.album_artist_name_folded, a.title_folded, a.id",
-                "random": "a.id",
-            }.get(sort, "MAX(t.imported_at) DESC, a.id")
             rows = connection.execute(
                 "SELECT a.id AS release_group_mbid, a.title AS album_title, "
                 "a.album_artist_name, a.album_artist_id AS album_artist_mbid, "
@@ -2603,7 +2953,8 @@ class NativeLibraryStore(PersistenceBase):
                 "custom.manifest_id AS custom_manifest_id, "
                 "aie.provider_artist_id AS provider_artist_mbid, artwork.cover_url, "
                 "artwork.source AS artwork_source, contribution.id AS contribution_id, "
-                "contribution.state AS contribution_state "
+                "contribution.state AS contribution_state, "
+                f"MIN({rank}) AS worst_rank "
                 "FROM local_albums a JOIN local_tracks t ON t.local_album_id = a.id "
                 "LEFT JOIN local_album_external_identities ae "
                 "ON ae.local_album_id = a.id AND ae.provider = 'musicbrainz' "
@@ -2616,14 +2967,13 @@ class NativeLibraryStore(PersistenceBase):
                 "LEFT JOIN library_contribution_drafts contribution "
                 "ON contribution.local_album_id = a.id "
                 "AND contribution.state NOT IN ('linked','cancelled','stale') "
-                "WHERE "
-                + where
-                + " GROUP BY a.id ORDER BY "
-                + ordering
-                + " LIMIT ? OFFSET ?",
-                (*parameters, max(1, limit), max(0, offset)),
+                "WHERE a.retired_into_album_id IS NULL AND t.availability = 'indexed' "
+                "GROUP BY a.id "
+                f"HAVING MIN({rank}) < ? "
+                "ORDER BY a.title_folded, a.id LIMIT ?",
+                (cutoff_rank, max(1, limit)),
             ).fetchall()
-            return [dict(row) for row in rows], total
+            return [dict(row) for row in rows]
 
         return await self._read(operation)
 
@@ -2638,153 +2988,238 @@ class NativeLibraryStore(PersistenceBase):
         artist_ids: list[str] | None = None,
         scope: str = "album",
     ) -> tuple[list[dict[str, Any]], int]:
-        def operation(
-            connection: sqlite3.Connection,
-        ) -> tuple[list[dict[str, Any]], int]:
-            normalized_scope = (
-                scope if scope in {"album", "contributors", "all"} else "album"
-            )
-            clauses = ["ar.retired_into_artist_id IS NULL"]
-            parameters: list[Any] = []
-            if search:
-                clauses.append("ar.folded_name LIKE ?")
-                parameters.append(f"%{_fold(search) or ''}%")
-            if artist_ids:
-                resolved_artists = list(
-                    dict.fromkeys(
-                        artist_id
-                        for value in artist_ids
-                        for artist_id in self._resolve_target_membership_ids(
-                            connection, kind="artist", identifier=value
+        """F-PERF-05: scoped, revision-keyed artist relationship projection.
+
+        Only the relationship CTE the requested scope needs is ever built:
+        ``album`` builds album credits, ``contributors`` builds track
+        contributors, ``all`` builds both. The ordered rows plus total are
+        built once per (filters, scope, sort, catalog revision) and sliced per
+        page; ``target_artist_scope_counts`` reuses the same revision so an
+        artist browse request never runs a second full relationship scan.
+        Classification, membership resolution, ordering tie-breaks, and row
+        fields are unchanged."""
+
+        normalized_scope = (
+            scope if scope in {"album", "contributors", "all"} else "album"
+        )
+
+        async def build() -> tuple[list[dict[str, Any]], int]:
+            def operation(
+                connection: sqlite3.Connection,
+            ) -> tuple[list[dict[str, Any]], int]:
+                clauses = ["ar.retired_into_artist_id IS NULL"]
+                parameters: list[Any] = []
+                if search:
+                    clauses.append("ar.folded_name LIKE ?")
+                    parameters.append(f"%{_fold(search) or ''}%")
+                if artist_ids:
+                    resolved_artists = list(
+                        dict.fromkeys(
+                            artist_id
+                            for value in artist_ids
+                            for artist_id in self._resolve_target_membership_ids(
+                                connection, kind="artist", identifier=value
+                            )
                         )
                     )
-                )
-                if not resolved_artists:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved_artists)
-                clauses.append(f"ar.id IN ({placeholders})")
-                parameters.extend(resolved_artists)
-            if normalized_scope == "album":
-                clauses.append("album_rel.artist_id IS NOT NULL")
-            elif normalized_scope == "contributors":
-                clauses.append("contributor_rel.artist_id IS NOT NULL")
-            else:
-                clauses.append(
-                    "(album_rel.artist_id IS NOT NULL OR contributor_rel.artist_id IS NOT NULL)"
-                )
-            where = " AND ".join(clauses)
-            common = (
-                "WITH album_rel AS ("
-                "SELECT credit.local_artist_id AS artist_id, "
-                "COUNT(DISTINCT credit.local_album_id) AS album_count, "
-                "COUNT(DISTINCT track.id) AS track_count, "
-                "MIN(track.imported_at) AS album_date_added "
-                "FROM local_album_artists credit "
-                "JOIN local_albums album ON album.id = credit.local_album_id "
-                "JOIN local_tracks track ON track.local_album_id = album.id "
-                "WHERE album.retired_into_album_id IS NULL "
-                "AND track.availability = 'indexed' GROUP BY credit.local_artist_id"
-                "), contributor_rel AS ("
-                "SELECT credit.local_artist_id AS artist_id, "
-                "COUNT(DISTINCT track.local_album_id) AS appearance_release_count, "
-                "COUNT(DISTINCT track.id) AS appearance_track_count, "
-                "MIN(track.imported_at) AS appearance_date_added "
-                "FROM local_track_artists credit "
-                "JOIN local_tracks track ON track.id = credit.local_track_id "
-                "JOIN local_albums album ON album.id = track.local_album_id "
-                "WHERE album.retired_into_album_id IS NULL "
-                "AND track.availability = 'indexed' "
-                "AND NOT EXISTS (SELECT 1 FROM local_album_artists album_credit "
-                "WHERE album_credit.local_album_id = track.local_album_id "
-                "AND album_credit.local_artist_id = credit.local_artist_id) "
-                "GROUP BY credit.local_artist_id"
-                ") "
-            )
-            joins = (
-                " FROM local_artists ar "
-                "LEFT JOIN album_rel ON album_rel.artist_id = ar.id "
-                "LEFT JOIN contributor_rel ON contributor_rel.artist_id = ar.id "
-                "LEFT JOIN local_artist_external_identities aie "
-                "ON aie.local_artist_id = ar.id AND aie.provider = 'musicbrainz' "
-            )
-            total = int(
-                connection.execute(
-                    common + "SELECT COUNT(*)" + joins + "WHERE " + where,
-                    parameters,
-                ).fetchone()[0]
-            )
-            direction = "DESC" if sort_order == "desc" else "ASC"
-            order_expression = {
-                "album_count": "COALESCE(album_rel.album_count, 0)",
-                "appearance_count": "COALESCE(contributor_rel.appearance_track_count, 0)",
-                "date_added": "date_added",
-            }.get(sort_by, "ar.folded_name")
-            date_added = (
-                "contributor_rel.appearance_date_added"
-                if normalized_scope == "contributors"
-                else "album_rel.album_date_added"
-                if normalized_scope == "album"
-                else "MIN(COALESCE(album_rel.album_date_added, contributor_rel.appearance_date_added), "
-                "COALESCE(contributor_rel.appearance_date_added, album_rel.album_date_added))"
-            )
-            rows = connection.execute(
-                common + "SELECT ar.id AS artist_mbid, ar.display_name AS artist_name, "
-                "ar.row_revision, "
-                "ar.sort_name, COALESCE(album_rel.album_count, 0) AS album_count, "
-                "COALESCE(album_rel.track_count, 0) AS track_count, "
-                "COALESCE(contributor_rel.appearance_release_count, 0) "
-                "AS appearance_release_count, "
-                "COALESCE(contributor_rel.appearance_track_count, 0) "
-                "AS appearance_track_count, " + date_added + " AS date_added, "
-                "CASE WHEN album_rel.artist_id IS NOT NULL "
-                "AND contributor_rel.artist_id IS NOT NULL THEN 'both' "
-                "WHEN album_rel.artist_id IS NOT NULL THEN 'album_artist' "
-                "ELSE 'contributor' END AS library_relationship, "
-                "aie.provider_artist_id AS provider_artist_mbid"
-                + joins
-                + "WHERE "
-                + where
-                + f" ORDER BY {order_expression} {direction}, "
-                f"ar.folded_name {direction}, ar.id {direction} "
-                "LIMIT ? OFFSET ?",
-                (*parameters, max(1, limit), max(0, offset)),
-            ).fetchall()
-            return [dict(row) for row in rows], total
+                    if not resolved_artists:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved_artists)
+                    clauses.append(f"ar.id IN ({placeholders})")
+                    parameters.extend(resolved_artists)
 
-        return await self._read(operation)
-
-    async def target_artist_scope_counts(self) -> tuple[int, int]:
-        def operation(connection: sqlite3.Connection) -> tuple[int, int]:
-            album_count = int(
-                connection.execute(
-                    "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                album_cte = (
+                    "album_rel AS ("
+                    "SELECT credit.local_artist_id AS artist_id, "
+                    "COUNT(DISTINCT credit.local_album_id) AS album_count, "
+                    "COUNT(DISTINCT track.id) AS track_count, "
+                    "MIN(track.imported_at) AS album_date_added "
                     "FROM local_album_artists credit "
-                    "JOIN local_artists artist ON artist.id = credit.local_artist_id "
                     "JOIN local_albums album ON album.id = credit.local_album_id "
-                    "WHERE artist.retired_into_artist_id IS NULL "
-                    "AND album.retired_into_album_id IS NULL AND EXISTS ("
-                    "SELECT 1 FROM local_tracks track WHERE track.local_album_id = album.id "
-                    "AND track.availability = 'indexed')"
-                ).fetchone()[0]
-            )
-            contributor_count = int(
-                connection.execute(
-                    "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                    "JOIN local_tracks track ON track.local_album_id = album.id "
+                    "WHERE album.retired_into_album_id IS NULL "
+                    "AND track.availability = 'indexed' GROUP BY credit.local_artist_id)"
+                )
+                contributor_cte = (
+                    "contributor_rel AS ("
+                    "SELECT credit.local_artist_id AS artist_id, "
+                    "COUNT(DISTINCT track.local_album_id) AS appearance_release_count, "
+                    "COUNT(DISTINCT track.id) AS appearance_track_count, "
+                    "MIN(track.imported_at) AS appearance_date_added "
                     "FROM local_track_artists credit "
-                    "JOIN local_artists artist ON artist.id = credit.local_artist_id "
                     "JOIN local_tracks track ON track.id = credit.local_track_id "
                     "JOIN local_albums album ON album.id = track.local_album_id "
-                    "WHERE artist.retired_into_artist_id IS NULL "
-                    "AND album.retired_into_album_id IS NULL "
-                    "AND track.availability = 'indexed' AND NOT EXISTS ("
-                    "SELECT 1 FROM local_album_artists album_credit "
+                    "WHERE album.retired_into_album_id IS NULL "
+                    "AND track.availability = 'indexed' "
+                    "AND NOT EXISTS (SELECT 1 FROM local_album_artists album_credit "
                     "WHERE album_credit.local_album_id = track.local_album_id "
-                    "AND album_credit.local_artist_id = credit.local_artist_id)"
-                ).fetchone()[0]
-            )
-            return album_count, contributor_count
+                    "AND album_credit.local_artist_id = credit.local_artist_id) "
+                    "GROUP BY credit.local_artist_id)"
+                )
+                want_album = normalized_scope in ("album", "all")
+                want_contributor = normalized_scope in ("contributors", "all")
+                cte_parts = [
+                    part
+                    for part, wanted in (
+                        (album_cte, want_album),
+                        (contributor_cte, want_contributor),
+                    )
+                    if wanted
+                ]
+                common = "WITH " + ", ".join(cte_parts) + " " if cte_parts else ""
+                joins = " FROM local_artists ar "
+                if want_album:
+                    joins += "LEFT JOIN album_rel ON album_rel.artist_id = ar.id "
+                if want_contributor:
+                    joins += "LEFT JOIN contributor_rel ON contributor_rel.artist_id = ar.id "
+                joins += (
+                    "LEFT JOIN local_artist_external_identities aie "
+                    "ON aie.local_artist_id = ar.id AND aie.provider = 'musicbrainz' "
+                )
+                if normalized_scope == "album":
+                    clauses.append("album_rel.artist_id IS NOT NULL")
+                elif normalized_scope == "contributors":
+                    clauses.append("contributor_rel.artist_id IS NOT NULL")
+                else:
+                    clauses.append(
+                        "(album_rel.artist_id IS NOT NULL OR contributor_rel.artist_id IS NOT NULL)"
+                    )
+                where = " AND ".join(clauses)
+                total = int(
+                    connection.execute(
+                        common + "SELECT COUNT(*)" + joins + "WHERE " + where,
+                        parameters,
+                    ).fetchone()[0]
+                )
+                direction = "DESC" if sort_order == "desc" else "ASC"
+                order_expression = {
+                    "album_count": "COALESCE(album_rel.album_count, 0)",
+                    "appearance_count": (
+                        "COALESCE(contributor_rel.appearance_track_count, 0)"
+                    ),
+                    "date_added": "date_added",
+                }.get(sort_by, "ar.folded_name")
+                date_added = {
+                    "album": "album_rel.album_date_added",
+                    "contributors": "contributor_rel.appearance_date_added",
+                    "all": (
+                        "MIN(COALESCE(album_rel.album_date_added, contributor_rel.appearance_date_added), "
+                        "COALESCE(contributor_rel.appearance_date_added, album_rel.album_date_added))"
+                    ),
+                }[normalized_scope]
+                if normalized_scope == "album":
+                    aggregate_columns = (
+                        "COALESCE(album_rel.album_count, 0) AS album_count, "
+                        "COALESCE(album_rel.track_count, 0) AS track_count, "
+                        "0 AS appearance_release_count, 0 AS appearance_track_count, "
+                    )
+                    relationship_column = "'album_artist' AS library_relationship"
+                elif normalized_scope == "contributors":
+                    aggregate_columns = (
+                        "0 AS album_count, 0 AS track_count, "
+                        "COALESCE(contributor_rel.appearance_release_count, 0) "
+                        "AS appearance_release_count, "
+                        "COALESCE(contributor_rel.appearance_track_count, 0) "
+                        "AS appearance_track_count, "
+                    )
+                    relationship_column = "'contributor' AS library_relationship"
+                else:
+                    aggregate_columns = (
+                        "COALESCE(album_rel.album_count, 0) AS album_count, "
+                        "COALESCE(album_rel.track_count, 0) AS track_count, "
+                        "COALESCE(contributor_rel.appearance_release_count, 0) "
+                        "AS appearance_release_count, "
+                        "COALESCE(contributor_rel.appearance_track_count, 0) "
+                        "AS appearance_track_count, "
+                    )
+                    relationship_column = (
+                        "CASE WHEN album_rel.artist_id IS NOT NULL "
+                        "AND contributor_rel.artist_id IS NOT NULL THEN 'both' "
+                        "WHEN album_rel.artist_id IS NOT NULL THEN 'album_artist' "
+                        "ELSE 'contributor' END AS library_relationship"
+                    )
+                rows = connection.execute(
+                    common
+                    + "SELECT ar.id AS artist_mbid, ar.display_name AS artist_name, "
+                    "ar.row_revision, "
+                    "ar.sort_name, "
+                    + aggregate_columns
+                    + date_added
+                    + " AS date_added, "
+                    + relationship_column
+                    + ", aie.provider_artist_id AS provider_artist_mbid"
+                    + joins
+                    + "WHERE "
+                    + where
+                    + f" ORDER BY {order_expression} {direction}, "
+                    f"ar.folded_name {direction}, ar.id {direction}",
+                    parameters,
+                ).fetchall()
+                return [dict(row) for row in rows], len(rows)
 
-        return await self._read(operation)
+            return await self._read(operation)
+
+        revision = await self.get_catalog_revision()
+        key_tail = (
+            "artists",
+            normalized_scope,
+            sort_by,
+            sort_order,
+            _fold(search) or "" if search else "",
+            tuple(artist_ids or ()),
+        )
+        projection, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        rows, total = projection
+        start = max(0, offset)
+        return rows[start : start + max(1, limit)], total
+
+    async def target_artist_scope_counts(self) -> tuple[int, int]:
+        """F-PERF-05: revision-keyed album/contributor artist totals.
+
+        One shared cache entry per catalog revision so repeated artist-browse
+        requests do not rescan both relationship tables each time."""
+        revision = await self.get_catalog_revision()
+        key_tail = ("artist_scope_counts",)
+
+        async def build() -> tuple[int, int]:
+            def operation(connection: sqlite3.Connection) -> tuple[int, int]:
+                album_count = int(
+                    connection.execute(
+                        "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                        "FROM local_album_artists credit "
+                        "JOIN local_artists artist ON artist.id = credit.local_artist_id "
+                        "JOIN local_albums album ON album.id = credit.local_album_id "
+                        "WHERE artist.retired_into_artist_id IS NULL "
+                        "AND album.retired_into_album_id IS NULL AND EXISTS ("
+                        "SELECT 1 FROM local_tracks track WHERE track.local_album_id = album.id "
+                        "AND track.availability = 'indexed')"
+                    ).fetchone()[0]
+                )
+                contributor_count = int(
+                    connection.execute(
+                        "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                        "FROM local_track_artists credit "
+                        "JOIN local_artists artist ON artist.id = credit.local_artist_id "
+                        "JOIN local_tracks track ON track.id = credit.local_track_id "
+                        "JOIN local_albums album ON album.id = track.local_album_id "
+                        "WHERE artist.retired_into_artist_id IS NULL "
+                        "AND album.retired_into_album_id IS NULL "
+                        "AND track.availability = 'indexed' AND NOT EXISTS ("
+                        "SELECT 1 FROM local_album_artists album_credit "
+                        "WHERE album_credit.local_album_id = track.local_album_id "
+                        "AND album_credit.local_artist_id = credit.local_artist_id)"
+                    ).fetchone()[0]
+                )
+                return album_count, contributor_count
+
+            return await self._read(operation)
+
+        cached, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        return cached
 
     async def list_target_artist_appearances(
         self, artist_id: str, *, limit: int = 20, offset: int = 0
@@ -2848,7 +3283,10 @@ class NativeLibraryStore(PersistenceBase):
                 "SUM(t.file_size_bytes) AS total_size_bytes, "
                 "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
                 "MAX(t.imported_at) AS last_imported_at, "
-                "MAX(t.file_format) AS file_format, MAX(t.album_sort) AS album_sort_name, "
+                # F-PERF-10 display policy: normalized format for a homogeneous
+                # album; literal 'mixed' when grouped indexed tracks carry more
+                # than one normalized non-empty format. Lexical MAX is not a rank.
+                f"CASE WHEN COUNT(DISTINCT LOWER(NULLIF(t.file_format, ''))) <= 1 THEN COALESCE(MIN(NULLIF(LOWER(t.file_format), '')), '') ELSE 'mixed' END AS file_format, MAX(t.album_sort) AS album_sort_name, "
                 "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
                 "ae.release_group_mbid AS provider_release_group_mbid, "
                 "ae.release_mbid AS provider_release_mbid, "
@@ -2914,86 +3352,112 @@ class NativeLibraryStore(PersistenceBase):
         artist_ids: list[str] | None = None,
         album_artist_only: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
-        def operation(
-            connection: sqlite3.Connection,
-        ) -> tuple[list[dict[str, Any]], int]:
-            clauses = ["t.availability = 'indexed'", "a.retired_into_album_id IS NULL"]
-            parameters: list[Any] = []
-            if search:
-                folded = f"%{_fold(search) or ''}%"
-                clauses.append(
-                    "(t.title_folded LIKE ? OR t.artist_name_folded LIKE ? "
-                    "OR t.album_title_folded LIKE ?)"
-                )
-                parameters.extend((folded, folded, folded))
-            if genre:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM local_track_genres genre "
-                    "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
-                )
-                parameters.append(_fold(genre))
-            if from_year is not None:
-                clauses.append("t.year >= ?")
-                parameters.append(from_year)
-            if to_year is not None:
-                clauses.append("t.year <= ?")
-                parameters.append(to_year)
-            if artist_name:
-                clauses.append("t.artist_name_folded = ?")
-                parameters.append(_fold(artist_name))
-            if artist_ids:
-                resolved = list(
-                    dict.fromkeys(
-                        artist_id
-                        for value in artist_ids
-                        for artist_id in self._resolve_target_membership_ids(
-                            connection, kind="artist", identifier=value
+        """F-PERF-05: revision-keyed ordered track projection + page slice.
+
+        One full filtered/orderable projection per
+        (endpoint, normalized filters, sort, catalog revision); page requests
+        slice it instead of repeating COUNT plus OFFSET scans. Recent sorting
+        rides ``idx_local_tracks_recent`` during the single ordered build.
+        ``random`` keeps its pre-ticket re-randomized-per-call behavior by
+        bypassing the cache."""
+
+        async def build() -> tuple[list[dict[str, Any]], int]:
+            def operation(
+                connection: sqlite3.Connection,
+            ) -> tuple[list[dict[str, Any]], int]:
+                clauses = [
+                    "t.availability = 'indexed'",
+                    "a.retired_into_album_id IS NULL",
+                ]
+                parameters: list[Any] = []
+                if search:
+                    folded = f"%{_fold(search) or ''}%"
+                    clauses.append(
+                        "(t.title_folded LIKE ? OR t.artist_name_folded LIKE ? "
+                        "OR t.album_title_folded LIKE ?)"
+                    )
+                    parameters.extend((folded, folded, folded))
+                if genre:
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM local_track_genres genre "
+                        "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
+                    )
+                    parameters.append(_fold(genre))
+                if from_year is not None:
+                    clauses.append("t.year >= ?")
+                    parameters.append(from_year)
+                if to_year is not None:
+                    clauses.append("t.year <= ?")
+                    parameters.append(to_year)
+                if artist_name:
+                    clauses.append("t.artist_name_folded = ?")
+                    parameters.append(_fold(artist_name))
+                if artist_ids:
+                    resolved = list(
+                        dict.fromkeys(
+                            artist_id
+                            for value in artist_ids
+                            for artist_id in self._resolve_target_membership_ids(
+                                connection, kind="artist", identifier=value
+                            )
                         )
                     )
-                )
-                if not resolved:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved)
-                if album_artist_only:
-                    clauses.append(f"a.album_artist_id IN ({placeholders})")
-                else:
-                    clauses.append(
-                        "(a.album_artist_id IN ("
-                        + placeholders
-                        + ") OR EXISTS (SELECT 1 FROM local_track_artists fta "
-                        "WHERE fta.local_track_id = t.id AND fta.local_artist_id IN ("
-                        + placeholders
-                        + ")))"
-                    )
+                    if not resolved:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved)
+                    if album_artist_only:
+                        clauses.append(f"a.album_artist_id IN ({placeholders})")
+                    else:
+                        clauses.append(
+                            "(a.album_artist_id IN ("
+                            + placeholders
+                            + ") OR EXISTS (SELECT 1 FROM local_track_artists fta "
+                            "WHERE fta.local_track_id = t.id AND fta.local_artist_id IN ("
+                            + placeholders
+                            + ")))"
+                        )
+                        parameters.extend(resolved)
                     parameters.extend(resolved)
-                parameters.extend(resolved)
-            where = " AND ".join(clauses)
-            total = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM local_tracks t "
-                    "JOIN local_albums a ON a.id = t.local_album_id WHERE " + where,
+                where = " AND ".join(clauses)
+                ordering = {
+                    "recent": "t.imported_at DESC, t.id",
+                    "title": "t.title_folded, t.id",
+                    "artist": "t.artist_name_folded, t.title_folded, t.id",
+                    "album": "t.album_title_folded, t.disc_number, t.track_number, t.id",
+                    "random": "RANDOM()",
+                }.get(sort, "t.imported_at DESC, t.id")
+                rows = connection.execute(
+                    _TARGET_TRACK_SELECT + " WHERE " + where + " ORDER BY " + ordering,
                     parameters,
-                ).fetchone()[0]
-            )
-            ordering = {
-                "recent": "t.imported_at DESC, t.id",
-                "title": "t.title_folded, t.id",
-                "artist": "t.artist_name_folded, t.title_folded, t.id",
-                "album": "t.album_title_folded, t.disc_number, t.track_number, t.id",
-                "random": "RANDOM()",
-            }.get(sort, "t.imported_at DESC, t.id")
-            rows = connection.execute(
-                _TARGET_TRACK_SELECT
-                + " WHERE "
-                + where
-                + " ORDER BY "
-                + ordering
-                + " LIMIT ? OFFSET ?",
-                (*parameters, max(1, limit), max(0, offset)),
-            ).fetchall()
-            return [dict(row) for row in rows], total
+                ).fetchall()
+                return [dict(row) for row in rows], len(rows)
 
-        return await self._read(operation)
+            return await self._read(operation)
+
+        if sort == "random":
+            # Pre-ticket random semantics preserved: fresh RANDOM() every call.
+            rows, total = await build()
+            start = max(0, offset)
+            return rows[start : start + max(1, limit)], total
+
+        revision = await self.get_catalog_revision()
+        key_tail = (
+            "tracks",
+            sort,
+            _fold(search) or "" if search else "",
+            _fold(genre) if genre else None,
+            from_year,
+            to_year,
+            _fold(artist_name) if artist_name else None,
+            tuple(artist_ids or ()),
+            bool(album_artist_only),
+        )
+        projection, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        rows, total = projection
+        start = max(0, offset)
+        return rows[start : start + max(1, limit)], total
 
     async def target_provider_album_snapshot(self) -> tuple[int, set[str]]:
         """Return one coalesced provider-album snapshot per catalog revision."""
@@ -3064,6 +3528,132 @@ class NativeLibraryStore(PersistenceBase):
                 "ORDER BY identity.provider_artist_id"
             ).fetchall()
             return {str(row["provider_artist_id"]) for row in rows}
+
+        return await self._read(operation)
+
+    async def target_enrichment_candidates(
+        self, *, after_mbid: str | None, limit: int
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """GH-280: bounded keyset page of provider-identified artists and
+        albums for the AudioDB sweep. Mirrors the legacy
+        ``LibraryDB.get_enrichment_candidates`` contract: tuples of
+        ``(entity_type, mbid_lower, metadata)`` ordered by
+        ``entity_type, mbid_lower``; ``after_mbid`` accepts either the
+        ``"<entity_type>:<mbid>"`` cursor or a legacy bare MBID."""
+
+        cursor_type = ""
+        cursor_mbid = ""
+        legacy_cursor = (after_mbid or "").casefold()
+        if after_mbid and ":" in after_mbid:
+            candidate_type, candidate_mbid = after_mbid.split(":", 1)
+            if candidate_type in {"artist", "album"}:
+                cursor_type = candidate_type
+                cursor_mbid = candidate_mbid.casefold()
+                legacy_cursor = ""
+
+        def operation(connection: sqlite3.Connection):
+            artist_rows = connection.execute(
+                "SELECT 'artist' AS entity_type, "
+                "LOWER(identity.provider_artist_id) AS mbid_lower, "
+                "artist.display_name AS name "
+                "FROM local_artist_external_identities identity "
+                "JOIN local_artists artist ON artist.id = identity.local_artist_id "
+                "WHERE identity.provider = 'musicbrainz' "
+                "AND artist.retired_into_artist_id IS NULL"
+            ).fetchall()
+            album_rows = connection.execute(
+                "SELECT 'album' AS entity_type, "
+                "LOWER(ae.release_group_mbid) AS mbid_lower, "
+                "a.title AS name, a.album_artist_name AS artist_name "
+                "FROM local_album_external_identities ae "
+                "JOIN local_albums a ON a.id = ae.local_album_id "
+                "WHERE ae.provider = 'musicbrainz' "
+                "AND a.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks track "
+                "WHERE track.local_album_id = a.id "
+                "AND track.availability = 'indexed')"
+            ).fetchall()
+            merged: list[tuple[str, str, dict[str, Any]]] = []
+            for row in [*artist_rows, *album_rows]:
+                mbid = str(row["mbid_lower"] or "")
+                if not mbid:
+                    continue
+                if cursor_type:
+                    if (row["entity_type"], mbid) <= (cursor_type, cursor_mbid) and (
+                        row["entity_type"] != cursor_type or mbid <= cursor_mbid
+                    ):
+                        continue
+                elif legacy_cursor and mbid <= legacy_cursor:
+                    continue
+                payload: dict[str, Any] = {"name": str(row["name"] or "")}
+                if row["entity_type"] == "album":
+                    payload["artist_name"] = str(row["artist_name"] or "")
+                merged.append((str(row["entity_type"]), mbid, payload))
+            merged.sort(key=lambda item: (item[0], item[1]))
+            return merged[: max(1, limit)]
+
+        return await self._read(operation)
+
+    async def target_existing_library_mbids(self, identifiers: list[str]) -> set[str]:
+        """GH-280: case-insensitive membership for Discover queue validation.
+
+        Returns the subset of ``identifiers`` that exist as release-group
+        MBIDs on active indexed albums."""
+        normalized = list(
+            dict.fromkeys(
+                value.strip().casefold() for value in identifiers if value.strip()
+            )
+        )
+        if not normalized:
+            return set()
+        placeholders = ",".join("?" for _ in normalized)
+
+        def operation(connection: sqlite3.Connection) -> set[str]:
+            rows = connection.execute(
+                "SELECT DISTINCT LOWER(ae.release_group_mbid) FROM "
+                "local_album_external_identities ae "
+                "JOIN local_albums a ON a.id = ae.local_album_id "
+                f"WHERE LOWER(ae.release_group_mbid) IN ({placeholders}) "
+                "AND a.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks t "
+                "WHERE t.local_album_id = a.id AND t.availability = 'indexed')",
+                normalized,
+            ).fetchall()
+            return {str(row[0]) for row in rows}
+
+        return await self._read(operation)
+
+    async def target_provider_artist_ids_page(
+        self, after_mbid: str, *, limit: int
+    ) -> list[str]:
+        """F-TARGETCATALOG-04: one bounded keyset page of active provider
+        artist IDs.
+
+        Same active credited-artist population as
+        ``target_provider_artist_ids`` (non-retired album + indexed track),
+        but ordered and compared by the NORMALIZED (lower-case) provider ID so
+        a strict ``> cursor`` cannot skip or repeat case variants. Blank IDs
+        are skipped, casefold-equivalent IDs deduplicate via DISTINCT, and the
+        limit is floored at one. Returned values are lower-case.
+        """
+
+        def operation(connection: sqlite3.Connection) -> list[str]:
+            rows = connection.execute(
+                "SELECT DISTINCT LOWER(identity.provider_artist_id) AS mbid "
+                "FROM local_artist_external_identities identity "
+                "WHERE TRIM(COALESCE(identity.provider_artist_id, '')) != '' "
+                "AND (:cursor = '' OR LOWER(identity.provider_artist_id) "
+                "> LOWER(:cursor)) "
+                "AND EXISTS (SELECT 1 FROM local_album_artists credit "
+                "JOIN local_albums album ON album.id = credit.local_album_id "
+                "JOIN local_tracks track ON track.local_album_id = credit.local_album_id "
+                "WHERE credit.local_artist_id = identity.local_artist_id "
+                "AND album.retired_into_album_id IS NULL "
+                "AND track.availability = 'indexed') "
+                "ORDER BY mbid LIMIT :limit",
+                {"cursor": after_mbid or "", "limit": max(1, limit)},
+            ).fetchall()
+            return [str(row["mbid"]) for row in rows]
 
         return await self._read(operation)
 
@@ -3144,6 +3734,38 @@ class NativeLibraryStore(PersistenceBase):
                 is not None
             )
             return owned, appears
+
+        return await self._read(operation)
+
+    async def album_catalog_scope_ids(
+        self, local_album_id: str
+    ) -> tuple[set[str], set[str]]:
+        """ST1: provider ids a committed album contributes to catalog-scope
+        invalidation - (release-group mbids, artist mbids). The album identity
+        row supplies the RG; artist mbids come from the indexed tracks'
+        musicbrainz identities. Empty sets are valid (nothing to delete)."""
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[set[str], set[str]]:
+            rg_row = connection.execute(
+                "SELECT release_group_mbid FROM local_album_external_identities "
+                "WHERE local_album_id = ? AND provider = 'musicbrainz'",
+                (local_album_id,),
+            ).fetchone()
+            rg_ids = (
+                {str(rg_row["release_group_mbid"])} if rg_row is not None else set()
+            )
+            artist_rows = connection.execute(
+                "SELECT DISTINCT te.provider_artist_id FROM "
+                "local_track_external_identities te "
+                "JOIN local_tracks t ON t.id = te.local_track_id "
+                "WHERE t.local_album_id = ? AND te.provider = 'musicbrainz' "
+                "AND te.provider_artist_id IS NOT NULL",
+                (local_album_id,),
+            ).fetchall()
+            artist_ids = {str(row["provider_artist_id"]) for row in artist_rows}
+            return rg_ids, artist_ids
 
         return await self._read(operation)
 
@@ -4203,8 +4825,26 @@ class NativeLibraryStore(PersistenceBase):
     async def get_target_playlist_summary(
         self, playlist_id: str
     ) -> dict[str, Any] | None:
-        rows = await self.list_target_playlists()
-        return next((row for row in rows if row["id"] == playlist_id), None)
+        """F-TARGETCATALOG-07: ID-filtered single-playlist aggregate.
+
+        Same select shape and LEFT JOIN semantics as
+        ``list_target_playlists`` restricted to one ``p.id``; no user filter,
+        because callers (``PlaylistService.set_public``) have already enforced
+        owner access before this internal post-mutation read."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT p.*, COUNT(pt.id) AS track_count, "
+                "COALESCE(SUM(pt.duration), 0) AS total_duration, "
+                "GROUP_CONCAT(NULLIF(pt.cover_url, '')) AS cover_urls "
+                "FROM library_playlists p LEFT JOIN library_playlist_tracks pt "
+                "ON pt.playlist_id = p.id "
+                "WHERE p.id = ? GROUP BY p.id",
+                (playlist_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await self._read(operation)
 
     async def update_target_playlist(
         self,
@@ -6010,7 +6650,8 @@ class NativeLibraryStore(PersistenceBase):
                     "INSERT INTO local_album_external_identities "
                     "(local_album_id, provider, release_group_mbid, release_mbid, "
                     "decision_source, matcher_version, attempt_id, selected_by_user_id, "
-                    "selected_at, row_revision) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "selected_at, row_revision, provider_base_url) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         identity.local_album_id,
                         identity.release_group_mbid,
@@ -6021,13 +6662,15 @@ class NativeLibraryStore(PersistenceBase):
                         identity.selected_by_user_id,
                         identity.selected_at,
                         identity.row_revision,
+                        _provider_base_url_for(identity.decision_source),
                     ),
                 )
             else:
                 updated = connection.execute(
                     "UPDATE local_album_external_identities SET release_group_mbid = ?, "
                     "release_mbid = ?, decision_source = ?, matcher_version = ?, attempt_id = ?, "
-                    "selected_by_user_id = ?, selected_at = ?, row_revision = row_revision + 1 "
+                    "selected_by_user_id = ?, selected_at = ?, row_revision = row_revision + 1, "
+                    "provider_base_url = ? "
                     "WHERE local_album_id = ? AND provider = 'musicbrainz' AND row_revision < ?",
                     (
                         identity.release_group_mbid,
@@ -6037,6 +6680,7 @@ class NativeLibraryStore(PersistenceBase):
                         identity.attempt_id,
                         identity.selected_by_user_id,
                         identity.selected_at,
+                        _provider_base_url_for(identity.decision_source),
                         identity.local_album_id,
                         MAX_REVISION,
                     ),
@@ -6857,25 +7501,77 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def get_identification_job_row(self, job_id: str) -> dict[str, Any] | None:
+        """F-057: callers renewing leases mid-run need the CURRENT row_revision
+        for the finish CAS instead of the claim-time snapshot."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT * FROM library_identification_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await self._read(operation)
+
+    async def mark_management_schedule_pending(self, local_album_id: str) -> None:
+        """F-061: durable marker for a swallowed post-identification
+        management-scheduling failure; cleared by any later successful
+        scheduling pass for the same album."""
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "UPDATE local_albums SET management_schedule_pending = 1, "
+                "row_revision = row_revision + 1 WHERE id = ?",
+                (local_album_id,),
+            )
+
+        await self._write(operation)
+
+    async def clear_management_schedule_pending(self, local_album_id: str) -> None:
+        """F-061: called when management scheduling later succeeds."""
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "UPDATE local_albums SET management_schedule_pending = 0 "
+                "WHERE id = ? AND management_schedule_pending != 0",
+                (local_album_id,),
+            )
+
+        await self._write(operation)
+
     async def heartbeat_identification_job(
         self, job_id: str, worker_id: str, *, now: float, lease_seconds: float
-    ) -> bool:
-        def operation(connection: sqlite3.Connection) -> bool:
+    ) -> int | None:
+        """F-057: renew one running claim's lease. Returns the NEW row_revision
+        so the caller can keep its CAS expectations current (heartbeats bump
+        the revision by design), or None when the lease is lost."""
+
+        def operation(connection: sqlite3.Connection) -> int | None:
             cursor = connection.execute(
-                "UPDATE library_identification_jobs SET heartbeat_at = ?, lease_expires_at = ?, "
-                "updated_at = ?, row_revision = row_revision + 1 WHERE id = ? "
-                "AND state = 'running' AND lease_owner = ? AND row_revision < ?",
-                (now, now + lease_seconds, now, job_id, worker_id, MAX_REVISION),
+                "UPDATE library_identification_jobs SET heartbeat_at = ?, "
+                "lease_expires_at = ?, updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ? AND row_revision < ? "
+                "RETURNING row_revision",
+                (
+                    now,
+                    now + lease_seconds,
+                    now,
+                    job_id,
+                    worker_id,
+                    MAX_REVISION,
+                ),
             )
-            if cursor.rowcount == 1:
-                return True
+            row = cursor.fetchone()
+            if row is not None:
+                return int(row["row_revision"])
             self._refuse_max_revision(
                 connection,
                 table="library_identification_jobs",
                 predicate="id = ? AND state = 'running' AND lease_owner = ?",
                 parameters=(job_id, worker_id),
             )
-            return False
+            return None
 
         return await self._write(operation)
 
@@ -7274,14 +7970,16 @@ class NativeLibraryStore(PersistenceBase):
                 connection.execute(
                     "INSERT INTO local_album_external_identities "
                     "(local_album_id, provider, release_group_mbid, release_mbid, decision_source, "
-                    "matcher_version, attempt_id, selected_by_user_id, selected_at) "
-                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?) "
+                    "matcher_version, attempt_id, selected_by_user_id, selected_at, "
+                    "provider_base_url) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
                     "release_group_mbid = excluded.release_group_mbid, "
                     "release_mbid = excluded.release_mbid, decision_source = excluded.decision_source, "
                     "matcher_version = excluded.matcher_version, attempt_id = excluded.attempt_id, "
                     "selected_by_user_id = excluded.selected_by_user_id, "
-                    "selected_at = excluded.selected_at, row_revision = row_revision + 1",
+                    "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
+                    "provider_base_url = excluded.provider_base_url",
                     (
                         attempt.local_album_id,
                         selected.release_group_mbid,
@@ -7291,6 +7989,7 @@ class NativeLibraryStore(PersistenceBase):
                         attempt.id,
                         selected_by_user_id,
                         completed_at,
+                        _provider_base_url_for(decision_source),
                     ),
                 )
                 connection.execute(
@@ -7306,15 +8005,16 @@ class NativeLibraryStore(PersistenceBase):
                         "INSERT INTO local_track_external_identities "
                         "(local_track_id, provider, recording_mbid, release_mbid, "
                         "release_track_mbid, medium_position, release_track_position, "
-                        "decision_source, attempt_id, selected_at) "
-                        "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "decision_source, attempt_id, selected_at, provider_base_url) "
+                        "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
                         "recording_mbid = excluded.recording_mbid, release_mbid = excluded.release_mbid, "
                         "release_track_mbid = excluded.release_track_mbid, "
                         "medium_position = excluded.medium_position, "
                         "release_track_position = excluded.release_track_position, "
                         "decision_source = excluded.decision_source, attempt_id = excluded.attempt_id, "
-                        "selected_at = excluded.selected_at, row_revision = row_revision + 1",
+                        "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
+                        "provider_base_url = excluded.provider_base_url",
                         (
                             track.local_track_id,
                             track.recording_mbid,
@@ -7325,6 +8025,7 @@ class NativeLibraryStore(PersistenceBase):
                             decision_source,
                             attempt.id,
                             completed_at,
+                            _provider_base_url_for(decision_source),
                         ),
                     )
                 if (
@@ -7582,26 +8283,45 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
-    async def reset_provider_identification_deferrals(self, *, now: float) -> int:
-        """Clear backoff on provider-deferred queued jobs after recovery.
+    async def reset_provider_identification_deferrals(
+        self, *, now: float, staleness_seconds: float
+    ) -> int:
+        """Release provider-deferred jobs after an outage-recovery edge.
 
-        Only rows deferred for PROVIDER_TEMPORARILY_UNAVAILABLE are reset; other
-        deferral reasons keep their backoff untouched.
+        F-056: resets preserve failure history. A PROVIDER_TEMPORARILY_
+        UNAVAILABLE row that has sat for at least one full backoff quantum
+        gets its attempt counter wiped at most TWICE per failure streak
+        (provider_reset_count); afterwards only a far-future ``not_before``
+        is released, so deterministically-poison payloads still reach
+        MAX_DEFERRAL_ATTEMPTS and attention instead of churning forever.
         """
 
         def operation(connection: sqlite3.Connection) -> int:
-            cursor = connection.execute(
+            wiped = connection.execute(
                 "UPDATE library_identification_jobs SET attempt_count = 0, "
-                "not_before = 0, last_failure_code = NULL, updated_at = ?, "
+                "not_before = 0, last_failure_code = NULL, "
+                "provider_reset_count = provider_reset_count + 1, updated_at = ?, "
                 "row_revision = row_revision + 1, event_revision = event_revision + 1 "
                 "WHERE state = 'queued' "
                 "AND last_failure_code = 'PROVIDER_TEMPORARILY_UNAVAILABLE' "
+                "AND provider_reset_count < 2 "
+                "AND updated_at < ? - ? "
                 "AND row_revision < ? AND event_revision < ?",
-                (now, MAX_REVISION, MAX_REVISION),
+                (now, now, staleness_seconds, MAX_REVISION, MAX_REVISION),
             )
-            if cursor.rowcount:
+            released = connection.execute(
+                "UPDATE library_identification_jobs SET not_before = 0, updated_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE state = 'queued' "
+                "AND last_failure_code = 'PROVIDER_TEMPORARILY_UNAVAILABLE' "
+                "AND not_before > ? + ? "
+                "AND row_revision < ? AND event_revision < ?",
+                (now, now, staleness_seconds, MAX_REVISION, MAX_REVISION),
+            )
+            touched = wiped.rowcount + released.rowcount
+            if touched:
                 self._bump_stream(connection, "identification")
-            return cursor.rowcount
+            return touched
 
         result = await self._write(operation)
         if result:
@@ -7761,7 +8481,7 @@ class NativeLibraryStore(PersistenceBase):
     async def get_identification_activity_snapshot(
         self, *, now: float
     ) -> dict[str, Any]:
-        """Return redacted aggregate queue state for activity and admin progress UI."""
+        """Return redacted aggregate queue state plus bounded deferred-job summaries."""
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             control = dict(
@@ -7827,6 +8547,19 @@ class NativeLibraryStore(PersistenceBase):
                     "AND last_failure_code IS NOT NULL GROUP BY last_failure_code"
                 ).fetchall()
             }
+            deferred_job_rows = connection.execute(
+                "SELECT j.id AS job_id, j.local_album_id AS local_album_id, "
+                "a.title AS album_title, ar.display_name AS artist_name, "
+                "j.last_failure_code AS last_failure_code, j.attempt_count AS attempt_count, "
+                "j.not_before AS not_before, j.updated_at AS updated_at "
+                "FROM library_identification_jobs j "
+                "LEFT JOIN local_albums a ON a.id = j.local_album_id "
+                "LEFT JOIN local_artists ar ON ar.id = a.album_artist_id "
+                "WHERE j.state IN ('queued','running','paused') "
+                "AND j.last_failure_code IS NOT NULL "
+                "ORDER BY j.priority ASC, j.enqueue_sequence ASC LIMIT ?",
+                (_ACTIVITY_DEFERRED_JOB_LIMIT,),
+            ).fetchall()
             return {
                 "control_state": str(control["state"]),
                 "control_revision": int(control["row_revision"]),
@@ -7846,6 +8579,7 @@ class NativeLibraryStore(PersistenceBase):
                 "failure_event_id": str(failure["id"]) if failure else None,
                 "failure_at": float(failure["terminal_at"]) if failure else None,
                 "foreground_operation_count": foreground_operation_count,
+                "deferred_jobs": [dict(row) for row in deferred_job_rows],
             }
 
         return await self._read(operation)
@@ -7870,6 +8604,16 @@ class NativeLibraryStore(PersistenceBase):
         return await self._read(operation)
 
     async def record_fingerprint_outcome(self, outcome: FingerprintOutcome) -> int:
+        """Upsert one outcome; terminal states (matched/no_match/skipped)
+        short-circuit to the stored row_revision.
+
+        F-046 concurrency invariant: two racing writers for one key both pass
+        the SELECT guard only while the row is non-terminal, and the upsert's
+        ``attempt_count = attempt_count + 1`` makes the stored count monotonic
+        under interleaving even though last-write-wins picks one payload -
+        bounded workers make double-generation rare and idempotent.
+        """
+
         def operation(connection: sqlite3.Connection) -> int:
             existing = connection.execute(
                 "SELECT state, row_revision FROM audio_fingerprint_outcomes "
@@ -7880,10 +8624,12 @@ class NativeLibraryStore(PersistenceBase):
                     outcome.fingerprinter_version,
                 ),
             ).fetchone()
+            # F-041: "disabled" is NOT terminal - it must be overwritable so
+            # tracks locked out by an absent AcoustID key recover when the key
+            # is configured later.
             if existing is not None and existing["state"] in (
                 "matched",
                 "no_match",
-                "disabled",
                 "skipped",
             ):
                 return int(existing["row_revision"])
@@ -7930,6 +8676,90 @@ class NativeLibraryStore(PersistenceBase):
                 ),
             ).fetchone()
             return int(row["row_revision"])
+
+        return await self._write(operation)
+
+    async def prune_old_terminal_identification_jobs(
+        self,
+        *,
+        now: float,
+        retention_days: int = 30,
+        limit: int = 500,
+    ) -> tuple[int, bool]:
+        """F-PERF-04: bounded 30-day retention for terminal automatic jobs.
+
+        Signed decision (LibraryAudit DECISIONS-LIVE): keep terminal automatic
+        jobs for 30 days with a strict ``terminal_at < now - N*86400`` cutoff,
+        prune in one bounded transaction, and preserve queued/running/paused
+        work, needs-review rows, deferred active rows, failed attention rows
+        (``MAX_DEFERRALS_EXCEEDED`` / ``SUBJECT_NOT_AVAILABLE``), review-retry
+        and post-processing kinds, and any job/attempt/evidence chain still
+        referenced by an identity, a review, or another job. An attempt is
+        removed only when it was this job's terminal result AND nothing else
+        references it; evidence goes first (RESTRICT) and only when no repair
+        finding holds it. Returns ``(removed_jobs, more_candidates)`` so the
+        caller can observe bounded progress and continue.
+        """
+        cutoff = now - retention_days * 86400.0
+
+        def operation(connection: sqlite3.Connection) -> tuple[int, bool]:
+            candidates = connection.execute(
+                "SELECT id, terminal_result_id FROM library_identification_jobs "
+                "WHERE kind = 'automatic' "
+                "AND state IN ('succeeded','failed','cancelled') "
+                "AND terminal_at IS NOT NULL AND terminal_at < ? "
+                "AND (state != 'failed' OR COALESCE(last_failure_code, '') NOT IN "
+                "('MAX_DEFERRALS_EXCEEDED','SUBJECT_NOT_AVAILABLE')) "
+                "ORDER BY terminal_at ASC, id ASC LIMIT ?",
+                (cutoff, max(1, limit) + 1),
+            ).fetchall()
+            has_more = len(candidates) > max(1, limit)
+            removed = 0
+            for row in candidates[: max(1, limit)]:
+                attempt_id = row["terminal_result_id"]
+                connection.execute(
+                    "DELETE FROM library_identification_jobs WHERE id = ?",
+                    (row["id"],),
+                )
+                removed += 1
+                if not attempt_id:
+                    continue
+                still_referenced = connection.execute(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM local_album_external_identities i "
+                    "WHERE i.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM local_artist_external_identities i "
+                    "WHERE i.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM local_track_external_identities i "
+                    "WHERE i.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM library_identification_reviews r "
+                    "WHERE r.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM library_identification_jobs j "
+                    "WHERE j.terminal_result_id = ?)",
+                    (attempt_id,) * 5,
+                ).fetchone()[0]
+                if still_referenced:
+                    # Identity/review/other-job chain survives; its evidence
+                    # and attempt stay for audit (RESTRICT-safe by design).
+                    continue
+                blocked_by_findings = connection.execute(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM library_identity_repair_findings f "
+                    "JOIN library_identification_evidence e ON e.id = f.evidence_id "
+                    "WHERE e.attempt_id = ?)",
+                    (attempt_id,),
+                ).fetchone()[0]
+                if blocked_by_findings:
+                    continue
+                connection.execute(
+                    "DELETE FROM library_identification_evidence WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+                connection.execute(
+                    "DELETE FROM library_identification_attempts WHERE id = ?",
+                    (attempt_id,),
+                )
+            return removed, has_more
 
         return await self._write(operation)
 
@@ -8032,6 +8862,15 @@ class NativeLibraryStore(PersistenceBase):
                 (run_id, inventory_limit + 1),
             ).fetchall()
             exported_inventory = inventory[:inventory_limit]
+            # NEW-SCAN-04: bounded, redacted failure rows join the export so a
+            # stuck tag read or malformed file is distinguishable off-box.
+            failures = connection.execute(
+                "SELECT root_id, relative_path, failure_code, failure_detail, phase, "
+                "recorded_at FROM library_scan_failures WHERE run_id = ? "
+                "ORDER BY recorded_at, root_id, relative_path LIMIT ?",
+                (run_id, row_limit + 1),
+            ).fetchall()
+            exported_failures = failures[:row_limit]
             evidence = connection.execute(
                 "SELECT COUNT(*) rows, COALESCE(SUM(evidence_size_bytes),0) bytes, "
                 "COALESCE(SUM(compacted),0) compacted_rows, MIN(created_at) oldest_at, "
@@ -8067,7 +8906,13 @@ class NativeLibraryStore(PersistenceBase):
                 "scopes_truncated": len(scopes) > row_limit,
                 "inventory": [dict(row) for row in exported_inventory],
                 "inventory_truncated": len(inventory) > inventory_limit,
-                "exported_row_count": len(exported_scopes) + len(exported_inventory),
+                "failures": [dict(row) for row in exported_failures],
+                "failures_truncated": len(failures) > row_limit,
+                "exported_row_count": (
+                    len(exported_scopes)
+                    + len(exported_inventory)
+                    + len(exported_failures)
+                ),
                 "evidence": {
                     **dict(evidence),
                     "protected_rows": int(protected),
@@ -8109,6 +8954,15 @@ class NativeLibraryStore(PersistenceBase):
         parent = str(existing["relative_path"])
         child = requested.relative_path
         return parent == "." or parent == child or child.startswith(f"{parent}/")
+
+    @staticmethod
+    def _scan_scope_covers_path(ancestor: str, descendant: str) -> bool:
+        """True when ancestor path covers descendant within the same root."""
+        return (
+            ancestor == "."
+            or ancestor == descendant
+            or descendant.startswith(f"{ancestor}/")
+        )
 
     @staticmethod
     def _scan_state_from_row(row: sqlite3.Row) -> ScanRun:
@@ -8226,6 +9080,13 @@ class NativeLibraryStore(PersistenceBase):
             queued = next((row for row in rows if row["state"] == "queued"), None)
 
             def covers(row: sqlite3.Row) -> bool:
+                # Signed F-SCAN-02 rule (LibraryAudit DECISIONS-LIVE): only a
+                # queued run may cover a request. A matching request during
+                # active, paused, or stopping work must fall through and create
+                # or expand the one durable queued follow-up instead of being
+                # acknowledged against work that can still fail or be cancelled.
+                if row["state"] != "queued":
+                    return False
                 if row["kind"] != request.kind:
                     return False
                 existing = connection.execute(
@@ -8272,7 +9133,7 @@ class NativeLibraryStore(PersistenceBase):
                     row_revision=int(updated["row_revision"]),
                 )
 
-            if active is not None and queued is not None:
+            if queued is not None:
                 if (
                     queued["kind"] != request.kind
                     or connection.execute(
@@ -8294,11 +9155,36 @@ class NativeLibraryStore(PersistenceBase):
                     "SELECT root_id, relative_path FROM library_scan_run_scopes WHERE run_id = ?",
                     (queued["id"],),
                 ).fetchall()
+                # Signed F-INDEXREC-01 rule: normalize the union of existing queued
+                # scopes and the request inside this transaction. For each root and
+                # matching policy revision retain the broadest ancestor and drop its
+                # descendants; a root "." supersedes every scope for that root.
                 additions = [
                     scope
                     for scope in request.scopes
                     if not any(self._scan_scope_covers(row, scope) for row in existing)
                 ]
+                superseded = [
+                    (str(row["root_id"]), str(row["relative_path"]))
+                    for row in existing
+                    if any(
+                        str(row["root_id"]) == scope.root_id
+                        and self._scan_scope_covers_path(
+                            scope.relative_path, str(row["relative_path"])
+                        )
+                        and str(row["relative_path"]) != scope.relative_path
+                        for scope in additions
+                    )
+                ]
+                if superseded:
+                    connection.executemany(
+                        "DELETE FROM library_scan_run_scopes WHERE run_id = ? "
+                        "AND root_id = ? AND relative_path = ?",
+                        [
+                            (str(queued["id"]), root_id, path)
+                            for root_id, path in superseded
+                        ],
+                    )
                 self._insert_scan_scopes(connection, str(queued["id"]), additions)
                 updated = connection.execute(
                     "UPDATE library_scan_runs SET aggregate_scope = ?, updated_at = ?, "
@@ -8791,18 +9677,32 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE id = ? AND stop_requested_at IS NOT NULL",
                     (now, run_id),
                 )
-            if new_state == "completed" and updated["kind"] == "policy_reconcile":
+            if (
+                new_state in {"completed", "failed"}
+                and updated["kind"] == "policy_reconcile"
+            ):
                 policy_state = connection.execute(
                     "SELECT * FROM library_policy_state WHERE singleton = 1"
                 ).fetchone()
                 scopes = connection.execute(
-                    "SELECT scope_id, policy_revision FROM library_scan_run_scopes "
-                    "WHERE run_id = ?",
+                    "SELECT scope_id, policy_revision, discovery_state, error_code "
+                    "FROM library_scan_run_scopes WHERE run_id = ?",
                     (run_id,),
                 ).fetchall()
+                # GH-296: a failed policy_apply whose every scope proved
+                # ROOT_UNAVAILABLE at the desired revision has settled its
+                # frozen scopes as far as they can ever be reached; keeping
+                # them pending would strand reconciliation forever. Any other
+                # failure (e.g. WALK_TIMEOUT) stays pending for retry.
+                settled_unreachable = bool(scopes) and all(
+                    scope["discovery_state"] == "unavailable"
+                    and scope["error_code"] == "ROOT_UNAVAILABLE"
+                    for scope in scopes
+                )
                 if (
                     policy_state is not None
                     and scopes
+                    and (new_state == "completed" or settled_unreachable)
                     and all(
                         scope["policy_revision"]
                         == policy_state["desired_policy_revision"]
@@ -9244,6 +10144,39 @@ class NativeLibraryStore(PersistenceBase):
 
         return await super()._background_write(operation)
 
+    async def recover_stopping_scan_runs(self, *, now: float) -> list[ScanRun]:
+        def operation(connection: sqlite3.Connection) -> list[ScanRun]:
+            stopping = connection.execute(
+                "SELECT id FROM library_scan_runs WHERE state = 'stopping' "
+                "OR requested_control = 'stop'"
+            ).fetchall()
+            for row in stopping:
+                connection.execute(
+                    "UPDATE library_scan_runs SET state = 'cancelled', terminal_at = ?, "
+                    "updated_at = ?, requested_control = 'none', row_revision = row_revision + 1, "
+                    "event_revision = event_revision + 1 WHERE id = ?",
+                    (now, now, row["id"]),
+                )
+                connection.execute(
+                    "UPDATE library_scan_runs SET inventory_cleanup_pending = (EXISTS("
+                    "SELECT 1 FROM library_scan_inventory WHERE run_id = ?) OR EXISTS("
+                    "SELECT 1 FROM library_scan_grouping_contexts WHERE run_id = ?)) "
+                    "WHERE id = ?",
+                    (row["id"], row["id"], row["id"]),
+                )
+            if stopping:
+                self._bump_stream(connection, "scan")
+                ids = [row["id"] for row in stopping]
+                placeholders = ",".join("?" for _ in ids)
+                rows = connection.execute(
+                    f"SELECT * FROM library_scan_runs WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                return [self._scan_state_from_row(row) for row in rows]
+            return []
+
+        return await super()._background_write(operation)
+
     async def cleanup_terminal_scan_inventory(
         self, *, limit: int = 5_000
     ) -> tuple[str | None, int, bool]:
@@ -9339,40 +10272,60 @@ class NativeLibraryStore(PersistenceBase):
         discovery_generation: int = 1,
     ) -> tuple[int, int]:
         def operation(connection: sqlite3.Connection) -> tuple[int, int]:
-            connection.executemany(
-                "INSERT INTO library_scan_inventory "
-                "(run_id, root_id, relative_path, scope_relative_path, discovery_generation, absolute_path, file_size_bytes, "
-                "file_mtime_ns, stat_revision, policy_revision, effective_policy, "
-                "comparison_result, local_track_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(run_id, root_id, relative_path) DO UPDATE SET "
-                "scope_relative_path = excluded.scope_relative_path, "
-                "discovery_generation = excluded.discovery_generation, "
-                "absolute_path = excluded.absolute_path, file_size_bytes = excluded.file_size_bytes, "
-                "file_mtime_ns = excluded.file_mtime_ns, stat_revision = excluded.stat_revision, "
-                "policy_revision = excluded.policy_revision, "
-                "effective_policy = excluded.effective_policy, "
-                "comparison_result = excluded.comparison_result, "
-                "local_track_id = excluded.local_track_id, row_revision = "
-                "library_scan_inventory.row_revision + 1",
-                [
+            rows = [
+                (
+                    run_id,
+                    item.root_id,
+                    item.relative_path,
+                    item.scope_relative_path,
+                    discovery_generation,
+                    item.absolute_path,
+                    item.file_size_bytes,
+                    item.file_mtime_ns,
+                    item.stat_revision,
+                    item.policy_revision,
+                    item.effective_policy,
+                    item.comparison_result,
+                    item.local_track_id,
+                )
+                for item in items
+            ]
+            try:
+                connection.executemany(
+                    "INSERT INTO library_scan_inventory "
+                    "(run_id, root_id, relative_path, scope_relative_path, discovery_generation, absolute_path, file_size_bytes, "
+                    "file_mtime_ns, stat_revision, policy_revision, effective_policy, "
+                    "comparison_result, local_track_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(run_id, root_id, relative_path) DO UPDATE SET "
+                    "scope_relative_path = excluded.scope_relative_path, "
+                    "discovery_generation = excluded.discovery_generation, "
+                    "absolute_path = excluded.absolute_path, file_size_bytes = excluded.file_size_bytes, "
+                    "file_mtime_ns = excluded.file_mtime_ns, stat_revision = excluded.stat_revision, "
+                    "policy_revision = excluded.policy_revision, "
+                    "effective_policy = excluded.effective_policy, "
+                    "comparison_result = excluded.comparison_result, "
+                    "local_track_id = excluded.local_track_id, row_revision = "
+                    "library_scan_inventory.row_revision + 1",
+                    rows,
+                )
+            except UnicodeEncodeError as exc:
+                # F-021 defense-in-depth: the scanner skips non-UTF-8 names
+                # upstream; if one ever reaches here anyway, fail with the
+                # offending index instead of a bare UnicodeEncodeError.
+                bad = next(
                     (
-                        run_id,
-                        item.root_id,
-                        item.relative_path,
-                        item.scope_relative_path,
-                        discovery_generation,
-                        item.absolute_path,
-                        item.file_size_bytes,
-                        item.file_mtime_ns,
-                        item.stat_revision,
-                        item.policy_revision,
-                        item.effective_policy,
-                        item.comparison_result,
-                        item.local_track_id,
-                    )
-                    for item in items
-                ],
-            )
+                        index
+                        for index, row in enumerate(rows)
+                        if any(
+                            isinstance(value, str) and _has_surrogates(value)
+                            for value in row
+                        )
+                    ),
+                    None,
+                )
+                raise ValueError(
+                    f"Scan inventory row {bad} for run {run_id} is not valid UTF-8 TEXT."
+                ) from exc
             if items:
                 connection.execute(
                     "UPDATE library_scan_run_scopes SET discovered_count = discovered_count + ?, "
@@ -9785,8 +10738,11 @@ class NativeLibraryStore(PersistenceBase):
                 "embedded_album_artist_mbid = ?, duration_seconds = ?, file_format = ?, bit_rate = ?, "
                 "sample_rate = ?, bit_depth = ?, channels = ?, replaygain_track_gain = ?, "
                 "replaygain_album_gain = ?, replaygain_track_peak = ?, replaygain_album_peak = ?, "
+                # F-INDEXREC-05: a rescan preserves the original import time; only
+                # new inserts take the incoming scan-time value.
                 "availability = 'indexed', missing_since = NULL, excluded_at = NULL, "
-                "ingest_source = ?, download_task_id = ?, source_path = ?, imported_at = ?, "
+                "ingest_source = ?, download_task_id = ?, source_path = ?, "
+                "imported_at = COALESCE(local_tracks.imported_at, ?), "
                 "desired_policy_revision = ?, applied_policy_revision = ?, applied_policy = ?, "
                 "row_revision = row_revision + 1 WHERE id = ?",
                 (
@@ -9913,11 +10869,15 @@ class NativeLibraryStore(PersistenceBase):
         *,
         writes: list[ScannedTrackWrite],
         states: dict[str, list[tuple[str, str]]],
-        failures: list[tuple[str, str, str]],
+        failures: list[ScanFailureRecord],
         increments: dict[str, int],
         updated_at: float,
     ) -> ScanRun:
-        """Commit catalog, inventory, counters, heartbeat, and stream atomically."""
+        """Commit catalog, inventory, counters, heartbeat, and stream atomically.
+
+        NEW-SCAN-04: indexing failures arrive as detailed ``ScanFailureRecord``
+        values; the same detail is written to the inventory failure code and the
+        failure-table row in this one transaction."""
 
         def operation(connection: sqlite3.Connection) -> ScanRun:
             catalog_changed = False
@@ -9944,17 +10904,25 @@ class NativeLibraryStore(PersistenceBase):
                 "failure_code = ?, row_revision = row_revision + 1 "
                 "WHERE run_id = ? AND root_id = ? AND relative_path = ?",
                 [
-                    (failure_code, run_id, root_id, path)
-                    for root_id, path, failure_code in failures
+                    (record.failure_code, run_id, record.root_id, record.relative_path)
+                    for record in failures
                 ],
             )
             connection.executemany(
                 "INSERT OR IGNORE INTO library_scan_failures "
                 "(run_id, root_id, relative_path, failure_code, failure_detail, "
-                "phase, recorded_at) VALUES (?, ?, ?, ?, '', 'indexing', ?)",
+                "phase, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (run_id, root_id, path, failure_code, updated_at)
-                    for root_id, path, failure_code in failures
+                    (
+                        run_id,
+                        record.root_id,
+                        record.relative_path,
+                        record.failure_code,
+                        record.failure_detail,
+                        "indexing",
+                        record.recorded_at,
+                    )
+                    for record in failures
                 ],
             )
             if catalog_changed:
@@ -10819,6 +11787,39 @@ class NativeLibraryStore(PersistenceBase):
                 (run_id, root_id, relative_directory, cursor, limit),
             ).fetchall()
             if not tokens:
+                # F-MATCH-06: before leaving the summary phase, disambiguate
+                # distinct grouping tokens that computed the same base key.
+                # The pass runs once over the whole directory in sorted-token
+                # order, so the result is stable across page boundaries,
+                # checkpoint resumes, and process restarts. The first token
+                # keeps the plain base key (mirroring LocalAlbumGrouper's
+                # seen_keys rule); each later token gains a deterministic
+                # ":<ordinal>" suffix. Non-colliding keys are untouched.
+                staged_keys = connection.execute(
+                    "SELECT grouping_token,grouping_key FROM "
+                    "library_scan_grouping_groups WHERE run_id=? AND root_id=? "
+                    "AND relative_directory=? ORDER BY grouping_token",
+                    (run_id, root_id, relative_directory),
+                ).fetchall()
+                key_occurrences: dict[str, int] = {}
+                for staged_row in staged_keys:
+                    base_key = str(staged_row["grouping_key"])
+                    occurrences = key_occurrences.get(base_key, 0) + 1
+                    key_occurrences[base_key] = occurrences
+                    if occurrences == 1:
+                        continue
+                    connection.execute(
+                        "UPDATE library_scan_grouping_groups SET grouping_key=? "
+                        "WHERE run_id=? AND root_id=? AND relative_directory=? "
+                        "AND grouping_token=?",
+                        (
+                            f"{base_key}:{occurrences}",
+                            run_id,
+                            root_id,
+                            relative_directory,
+                            str(staged_row["grouping_token"]),
+                        ),
+                    )
                 connection.execute(
                     "UPDATE library_scan_grouping_contexts SET staging_state='continuity',"
                     "staging_cursor=NULL,row_revision=row_revision+1 WHERE run_id=? "
@@ -11304,6 +12305,32 @@ class NativeLibraryStore(PersistenceBase):
         now: float,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> int:
+            # F-MATCH-06 fail-closed guard (equivalent in effect to
+            # apply_grouping_context's duplicate-target rejection): two distinct
+            # staged groups must never target one new local album ID, and one
+            # grouping key must never appear twice. The summary-phase
+            # disambiguation makes this unreachable for fresh collisions, but a
+            # regression must abort loudly instead of silently merging albums.
+            seen_targets: dict[str, str] = {}
+            seen_keys: set[str] = set()
+            for group in groups:
+                album_id = str(group["local_album_id"])
+                grouping_key = str(group["grouping_key"])
+                previous_key = seen_targets.get(album_id)
+                if previous_key is not None and previous_key != grouping_key:
+                    raise ConflictError(
+                        "Staged grouping produced two distinct groups for one "
+                        "local album."
+                    )
+                if previous_key is None:
+                    seen_targets[album_id] = grouping_key
+                if grouping_key in seen_keys and previous_key is None:
+                    raise ConflictError(
+                        "Staged grouping reused one grouping key for two "
+                        "distinct local albums."
+                    )
+                seen_keys.add(grouping_key)
+
             changed = False
             for group in groups:
                 album_id = str(group["local_album_id"])
@@ -11981,7 +13008,13 @@ class NativeLibraryStore(PersistenceBase):
                 "track.availability,track.manual_excluded,track.applied_policy,"
                 "track.applied_policy_revision,inventory.effective_policy AS "
                 "inventory_effective_policy,inventory.policy_revision AS "
-                "inventory_policy_revision FROM local_tracks AS track LEFT JOIN "
+                "inventory_policy_revision, EXISTS(SELECT 1 FROM library_scan_inventory "
+                "AS sibling WHERE sibling.run_id=? "
+                "AND sibling.root_id=track.root_id "
+                "AND sibling.relative_path=track.relative_path "
+                "AND sibling.discovery_generation=? "
+                "AND sibling.scope_relative_path != ?) AS "
+                "same_run_other_scope FROM local_tracks AS track LEFT JOIN "
                 "library_scan_inventory AS inventory ON inventory.run_id=? "
                 "AND inventory.root_id=track.root_id "
                 "AND inventory.relative_path=track.relative_path "
@@ -11990,6 +13023,9 @@ class NativeLibraryStore(PersistenceBase):
                 f"AND ({path_clause}) AND track.relative_path > COALESCE(?, '') "
                 "ORDER BY track.relative_path LIMIT ?",
                 (
+                    run_id,
+                    scope["discovery_generation"],
+                    relative_path,
                     run_id,
                     relative_path,
                     scope["discovery_generation"],
@@ -12040,6 +13076,11 @@ class NativeLibraryStore(PersistenceBase):
                 inventory_policy = track["inventory_effective_policy"]
                 inventory_revision = track["inventory_policy_revision"]
                 if inventory_policy is None:
+                    # F-INDEXREC-01 defense in depth: a same-run, same-root,
+                    # same-generation row under another scope means the path WAS
+                    # observed by this run; never mark it missing on scope label alone.
+                    if int(track["same_run_other_scope"] or 0):
+                        continue
                     if not allow_missing:
                         continue
                     missing_track_ids.add(str(track["id"]))
@@ -13580,6 +14621,56 @@ class NativeLibraryStore(PersistenceBase):
         return mbids[0]
 
     @staticmethod
+    def _album_has_provider_proof_tx(
+        connection: sqlite3.Connection,
+        source_artist_id: str,
+        expected_artist_mbid: str,
+    ) -> bool:
+        """F-IDENT-01 option B gate for the name-anchored convergence path.
+
+        Album-level proof for the source artist's album is an accepted
+        MusicBrainz release identity or a revision-valid stored credit proof
+        row agreeing on the expected provider MBID. A current, revision-valid
+        contradictory proof row vetoes the retirement; a missing identity and
+        missing proof rows (the name-only case) never satisfies the gate.
+        """
+        current_proofs = connection.execute(
+            "SELECT lower(proof.artist_mbid) artist_mbid "
+            "FROM library_artist_credit_proofs proof "
+            "JOIN local_album_external_identities album_identity "
+            "ON album_identity.local_album_id = proof.local_album_id "
+            "AND album_identity.provider = 'musicbrainz' "
+            "AND proof.album_identity_revision = album_identity.row_revision "
+            "AND proof.release_mbid = album_identity.release_mbid "
+            "LEFT JOIN local_track_external_identities track_identity "
+            "ON track_identity.local_track_id = proof.local_track_id "
+            "AND track_identity.provider = 'musicbrainz' "
+            "AND proof.track_identity_revision = track_identity.row_revision "
+            "AND proof.release_track_mbid = track_identity.release_track_mbid "
+            "WHERE proof.source_local_artist_id = ?",
+            (source_artist_id,),
+        ).fetchall()
+        expected = expected_artist_mbid.casefold()
+        if any(row["artist_mbid"] != expected for row in current_proofs):
+            return False
+        if current_proofs:
+            return True
+        accepted_release = connection.execute(
+            "SELECT 1 FROM local_track_artists credit "
+            "JOIN local_tracks track ON track.id = credit.local_track_id "
+            "JOIN local_albums album ON album.id = track.local_album_id "
+            "JOIN local_album_external_identities identity "
+            "ON identity.local_album_id = album.id "
+            "AND identity.provider = 'musicbrainz' "
+            "WHERE credit.local_artist_id = ? "
+            "AND track.availability = 'indexed' "
+            "AND album.retired_into_album_id IS NULL "
+            "AND identity.release_mbid IS NOT NULL LIMIT 1",
+            (source_artist_id,),
+        ).fetchone()
+        return accepted_release is not None
+
+    @staticmethod
     def _finish_artist_reconciliation_work_tx(
         connection: sqlite3.Connection,
         *,
@@ -14240,7 +15331,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return result
 
-        result = await self._write(operation)
+        result = await self._write_background(operation)
         if result.get("reidentification_job_created") is True:
             self.work_wakeups.notify("identification")
         return result
@@ -14280,7 +15371,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def apply_provider_anchored_artist_convergence(
         self,
@@ -14512,6 +15603,15 @@ class NativeLibraryStore(PersistenceBase):
                 if not valid or resolved_target is None:
                     continue
                 survivor_id, artist_mbid = resolved_target
+                # F-IDENT-01 (option B, owner 2026-08-20): album-level provider
+                # proof gates every name-anchored retirement. An accepted
+                # MusicBrainz release identity on the source album, or a stored,
+                # revision-valid credit proof row, is required; normalized-name
+                # agreement alone never retires.
+                if not self._album_has_provider_proof_tx(
+                    connection, source_id, artist_mbid
+                ):
+                    continue
                 if (
                     direct_identity is not None
                     and str(direct_identity["provider_artist_id"]).casefold()
@@ -14622,7 +15722,7 @@ class NativeLibraryStore(PersistenceBase):
                 "filesystem_writes": 0,
             }
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def apply_artist_credit_projection(
         self,
@@ -15076,7 +16176,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return result
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def get_artist_reconciliation_context(
         self, local_album_id: str
@@ -15186,7 +16286,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return result
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def defer_artist_reconciliation_work(
         self,
@@ -15238,7 +16338,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def get_artist_reconciliation_status_data(self) -> dict[str, Any]:
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -16402,7 +17502,14 @@ class NativeLibraryStore(PersistenceBase):
                     "row_revision = row_revision + 1, event_revision = event_revision + 1 "
                     "WHERE state = 'failed' AND input_revision = ? AND "
                     "((local_album_id = ? AND ? IS NOT NULL) OR (local_track_id = ? AND ? IS NOT NULL))",
-                    (now, review["input_revision"], album_id, album_id, track_id, track_id),
+                    (
+                        now,
+                        review["input_revision"],
+                        album_id,
+                        album_id,
+                        track_id,
+                        track_id,
+                    ),
                 )
             updated = connection.execute(
                 "UPDATE library_identification_reviews SET state = ?, reason_code = ?, "
@@ -19747,8 +20854,16 @@ class NativeLibraryStore(PersistenceBase):
         expected_job_revision: int,
         idempotency_key: str,
         now: float,
+        current_settings_revision: str | None = None,
+        current_policy_revision: str | None = None,
     ) -> dict[str, Any]:
-        """Atomically convert one exact sealed preview into its apply operation."""
+        """Atomically convert one exact sealed preview into its apply operation.
+
+        F-079: pass the caller's freshly-read settings/policy revisions to
+        have them verified INSIDE this transaction alongside the catalog
+        revision, so drift surfaces as one clean rejection instead of N
+        per-bundle stage failures later.
+        """
 
         if not idempotency_key.strip():
             raise ValidationError("An apply idempotency key is required.")
@@ -19775,15 +20890,6 @@ class NativeLibraryStore(PersistenceBase):
                         "The Library Management preview is already being applied."
                     )
                 return dict(job)
-            reused = connection.execute(
-                "SELECT job_id FROM library_management_job_snapshots "
-                "WHERE apply_idempotency_key=?",
-                (idempotency_key,),
-            ).fetchone()
-            if reused is not None:
-                raise ConflictError(
-                    "The apply idempotency key belongs to another operation."
-                )
             if (
                 str(job["state"]) != "ready"
                 or int(job["row_revision"]) != expected_job_revision
@@ -19813,6 +20919,21 @@ class NativeLibraryStore(PersistenceBase):
                 raise StaleRevisionError(
                     "The library catalog changed after the preview."
                 )
+            # F-079: settings/policy drift verified inside the same
+            # transaction (values freshly read by the caller) so the apply is
+            # rejected once, cleanly, instead of failing per bundle later.
+            if (
+                current_settings_revision is not None
+                and str(snapshot["settings_revision"]) != current_settings_revision
+            ):
+                raise StaleRevisionError(
+                    "Library Management settings changed before apply."
+                )
+            if (
+                current_policy_revision is not None
+                and str(snapshot["policy_revision"]) != current_policy_revision
+            ):
+                raise StaleRevisionError("The library policy changed before apply.")
             if (
                 connection.execute(
                     "SELECT 1 FROM library_operation_work WHERE job_id=? LIMIT 1",
@@ -20362,6 +21483,10 @@ class NativeLibraryStore(PersistenceBase):
                 "SUM(eligibility = 'eligible') eligible_count, "
                 "SUM(eligibility = 'warning') warning_count, "
                 "SUM(eligibility = 'blocked') blocked_count, "
+                # F-080: 'stale' IS written - by the duplicate-resolution lane
+                # (library_management_duplicate_service persists items with
+                # eligibility="stale") and those rows flow through this same
+                # finalize; stale_count is therefore reachable telemetry.
                 "SUM(eligibility = 'stale') stale_count, "
                 "COALESCE(SUM(estimated_temporary_bytes), 0) estimated_temporary_bytes, "
                 "SUM(COALESCE(json_extract(diff_json, '$.requires_write'), 0) = 0) "
@@ -22500,10 +23625,16 @@ class NativeLibraryStore(PersistenceBase):
             raise ValidationError(
                 "One automatic import bundle must resolve to one catalog album."
             )
+        # P2-backend fix: album_id was referenced but never extracted.
+        (album_id,) = album_ids
+        # P2-backend hotfix: job_id was unconditionally generated as a fresh
+        # UUID even when operation_job_id was provided, causing the
+        # UPDATE branch to match zero rows and raise StaleRevisionError.
+        job_id = operation_job_id if operation_job_id is not None else str(uuid.uuid4())
         first_request = next(iter(requests.values()))
+        release_group_mbid = first_request.release_group_mbid or ""
+        release_mbid = first_request.release_mbid or ""
         pinned = first_request.pinned_profile
-        if pinned is None:
-            raise ValidationError("The automatic import profile is missing.")
         profile_json = msgspec.json.encode(pinned).decode()
         if any(
             request.pinned_profile is None
@@ -22526,23 +23657,28 @@ class NativeLibraryStore(PersistenceBase):
                 for warning in request.management_warnings
             )
         )
-        album_id = next(iter(album_ids))
-        release_group_mbid = str(first_request.release_group_mbid)
-        release_mbid = str(first_request.release_mbid)
         connection.execute(
             "INSERT INTO local_album_external_identities "
             "(local_album_id,provider,release_group_mbid,release_mbid,decision_source,"
-            "matcher_version,attempt_id,selected_by_user_id,selected_at,row_revision) "
-            "VALUES (?,'musicbrainz',?,?,'automatic','import-publisher-v1',NULL,NULL,?,1) "
+            "matcher_version,attempt_id,selected_by_user_id,selected_at,row_revision,"
+            "provider_base_url) "
+            "VALUES (?,'musicbrainz',?,?,'automatic','import-publisher-v1',NULL,NULL,?,1,?) "
             "ON CONFLICT(local_album_id,provider) DO UPDATE SET "
             "release_group_mbid=excluded.release_group_mbid,"
             "release_mbid=excluded.release_mbid,decision_source='automatic',"
             "matcher_version=excluded.matcher_version,attempt_id=NULL,"
             "selected_by_user_id=NULL,selected_at=excluded.selected_at,"
-            "row_revision=local_album_external_identities.row_revision+1",
-            (album_id, release_group_mbid, release_mbid, now),
+            "row_revision=local_album_external_identities.row_revision+1,"
+            "provider_base_url=excluded.provider_base_url",
+            (
+                album_id,
+                release_group_mbid,
+                release_mbid,
+                now,
+                _provider_base_url_for("automatic"),
+            ),
         )
-        for (_track_id, _write), request in selected.values():
+        for (track_id, _write), request in selected.values():
             if (
                 not request.recording_mbid
                 or not request.release_track_mbid
@@ -22552,13 +23688,12 @@ class NativeLibraryStore(PersistenceBase):
                 raise ValidationError(
                     "An automatic import lost its accepted release-track mapping."
                 )
-        for ordinal, ((track_id, _write), request) in selected.items():
             connection.execute(
                 "INSERT INTO local_track_external_identities "
                 "(local_track_id,provider,recording_mbid,release_mbid,release_track_mbid,"
                 "medium_position,release_track_position,decision_source,attempt_id,"
-                "selected_at,row_revision) "
-                "VALUES (?,'musicbrainz',?,?,?,?,?,'automatic',NULL,?,1) "
+                "selected_at,row_revision,provider_base_url) "
+                "VALUES (?,'musicbrainz',?,?,?,?,?,'automatic',NULL,?,1,?) "
                 "ON CONFLICT(local_track_id,provider) DO UPDATE SET "
                 "recording_mbid=excluded.recording_mbid,"
                 "release_mbid=excluded.release_mbid,"
@@ -22567,7 +23702,8 @@ class NativeLibraryStore(PersistenceBase):
                 "release_track_position=excluded.release_track_position,"
                 "decision_source='automatic',attempt_id=NULL,"
                 "selected_at=excluded.selected_at,"
-                "row_revision=local_track_external_identities.row_revision+1",
+                "row_revision=local_track_external_identities.row_revision+1,"
+                "provider_base_url=excluded.provider_base_url",
                 (
                     track_id,
                     request.recording_mbid,
@@ -22576,12 +23712,9 @@ class NativeLibraryStore(PersistenceBase):
                     request.medium_position,
                     request.release_track_position,
                     now,
+                    _provider_base_url_for("automatic"),
                 ),
             )
-
-        job_id = operation_job_id or str(
-            uuid.uuid5(_IMPORT_MANAGEMENT_JOB_NAMESPACE, bundle_id)
-        )
         selection_json = json.dumps(
             {"kind": "albums", "ids": [album_id], "import_bundle_id": bundle_id},
             separators=(",", ":"),
@@ -23767,7 +24900,13 @@ class NativeLibraryStore(PersistenceBase):
         failure_code: str,
         now: float,
     ) -> None:
-        """Make a recovery failure visible and prevent an unsafe automatic retry."""
+        """Make one bundle's recovery failure visible without failing its siblings.
+
+        E30 scopes a recovery failure to every still-active row in the bundle;
+        E31 keeps unrelated bundles continuing. The operation job therefore
+        stays live while sibling work rows remain resumable and settles
+        terminal only when this was its last active bundle.
+        """
 
         def operation(connection: sqlite3.Connection) -> None:
             work = connection.execute(
@@ -23783,6 +24922,15 @@ class NativeLibraryStore(PersistenceBase):
                     "updated_at=?,row_revision=row_revision+1 WHERE job_id=? AND ordinal=?",
                     (failure_code, now, job_id, bundle_ordinal),
                 )
+            siblings = connection.execute(
+                "SELECT COUNT(*) AS active FROM library_operation_work "
+                "WHERE job_id=? AND ordinal<>? AND state IN ('pending','running')",
+                (job_id, bundle_ordinal),
+            ).fetchone()
+            if int(siblings["active"] or 0):
+                # Sibling bundles stay resumable; only this work row failed.
+                self._bump_stream(connection, "operation")
+                return
             connection.execute(
                 "UPDATE library_operation_jobs SET state='failed',terminal_code=?,"
                 "terminal_at=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,"
@@ -24209,6 +25357,9 @@ class NativeLibraryStore(PersistenceBase):
                     catalog_revision=int(snapshot["catalog_revision"]),
                     snapshot_revision=int(snapshot["row_revision"]),
                     committed_journal_ids=tuple(sorted(journal_by_id)),
+                    committed_journal_revisions={
+                        str(row["id"]): int(row["row_revision"]) for row in journal_rows
+                    },
                 )
             if not journal_rows or any(
                 str(row["state"]) != "published" for row in journal_rows
@@ -24853,6 +26004,16 @@ class NativeLibraryStore(PersistenceBase):
                 + ") AND state='published'",
                 (now, *journal_ids),
             )
+            committed_revision_rows = connection.execute(
+                "SELECT id,row_revision FROM library_file_mutation_journal WHERE id IN ("
+                + placeholders
+                + ")",
+                journal_ids,
+            ).fetchall()
+            committed_journal_revisions = {
+                str(row["id"]): int(row["row_revision"])
+                for row in committed_revision_rows
+            }
             connection.execute(
                 "UPDATE library_operation_work SET state='succeeded', result_json=?, "
                 "failure_code=NULL, updated_at=?, row_revision=row_revision+1 "
@@ -24893,6 +26054,7 @@ class NativeLibraryStore(PersistenceBase):
                 catalog_revision=new_catalog_revision,
                 snapshot_revision=int(updated_snapshot["row_revision"]),
                 committed_journal_ids=journal_ids,
+                committed_journal_revisions=committed_journal_revisions,
             )
 
         return await self._write(operation)
@@ -25549,6 +26711,14 @@ class NativeLibraryStore(PersistenceBase):
         evidence: list[IdentificationEvidenceRecord],
         now: float,
     ) -> dict[str, Any]:
+        """Commit one explicit re-identification evaluation terminally.
+
+        F-055/F-IDENT-03: degradation-flag outages no longer reach here on
+        their first pass - the worker defers them like raised outages. This
+        finish records the honest PROVIDER_TEMPORARILY_UNAVAILABLE failure
+        only once the bounded retry budget is exhausted.
+        """
+
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             snapshot = connection.execute(
                 "SELECT * FROM library_reidentification_snapshots WHERE job_id = ?",
@@ -25687,6 +26857,57 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def defer_reidentification_work(
+        self,
+        job_id: str,
+        ordinal: int,
+        *,
+        worker_id: str,
+        reason_code: str,
+        now: float,
+        retry_not_before: float,
+    ) -> dict[str, Any]:
+        """F-IDENT-03: durably defer one transient explicit re-identification.
+
+        The running work item returns to 'pending' with the failure code, the
+        job returns to 'queued' with ``next_attempt_at`` set, and the durable
+        attempt counter advances. Nothing is marked succeeded or failed and no
+        candidate is selected; the sealed snapshot stays untouched so the next
+        claim re-evaluates against the original revisions.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            work_update = connection.execute(
+                "UPDATE library_operation_work SET state = 'pending', failure_code = ?, "
+                "updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE job_id = ? AND ordinal = ? AND state = 'running'",
+                (reason_code, now, job_id, ordinal),
+            )
+            if work_update.rowcount != 1:
+                raise StaleRevisionError(
+                    "The re-identification work lease changed while it was deferred."
+                )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = 'queued', lease_owner = NULL, "
+                "lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?, "
+                "next_attempt_at = ?, "
+                "reidentification_attempt_count = reidentification_attempt_count + 1, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND kind = 'explicit_reidentification' "
+                "AND state = 'running' AND lease_owner = ? RETURNING *",
+                (now, retry_not_before, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The re-identification lease changed while it was deferred."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        result = await self._write(operation)
+        self.work_wakeups.notify_after("operation", retry_not_before - now)
+        return result
+
     async def accept_reidentification_candidate(
         self,
         job_id: str,
@@ -25719,8 +26940,7 @@ class NativeLibraryStore(PersistenceBase):
             if (
                 job["state"] != "ready"
                 and not (
-                    job["state"] == "succeeded"
-                    and decision_mode == "leave_unmanaged"
+                    job["state"] == "succeeded" and decision_mode == "leave_unmanaged"
                 )
             ) or int(job["row_revision"]) != expected_job_revision:
                 raise StaleRevisionError(
@@ -26580,6 +27800,25 @@ class NativeLibraryStore(PersistenceBase):
             self.work_wakeups.notify("operation")
         return result
 
+    async def probe_operation_control(self, job_id: str, worker_id: str) -> bool:
+        """Read-only per-unit control check (no write lock, no transaction).
+
+        (GH-293) Workers check control at pass cadence with a real transition,
+        and probe this cheap read between units so a pause/stop issued mid-pass
+        is honored within one unit instead of writing a control transaction per
+        subject.
+        """
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT control_request FROM library_operation_jobs "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ?",
+                (job_id, worker_id),
+            ).fetchone()
+            return row is not None and str(row["control_request"]) != "none"
+
+        return await self._read(operation)
+
     async def checkpoint_operation_control(
         self, job_id: str, worker_id: str, *, now: float
     ) -> dict[str, Any] | None:
@@ -26609,7 +27848,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def finish_operation_job(
         self, job_id: str, worker_id: str, *, state: str, terminal_code: str, now: float
@@ -27546,6 +28785,23 @@ class NativeLibraryStore(PersistenceBase):
         source_matcher_version: str | None,
         target_matcher_version: str,
     ) -> dict[str, Any]:
+        """Create a repair job header plus its strictly pinned materialization state.
+
+        (GH-293) The header, snapshot, and materialization marker are created in
+        one small foreground transaction. The catalog revision is captured from
+        the store INSIDE this transaction and used for BOTH the job header
+        (``input_catalog_revision``) and the materialization pin, so the subject
+        set is fixed for the job's whole life: every materialization page
+        enforces the pin and fails/stales the job BEFORE any live changed
+        subject is inserted when the revision moved; an unsealed, zero-progress
+        job is atomically REBASED onto the current revision by
+        ``rebase_repair_operation`` (same static job, no fresh startup job).
+        Work rows are materialized in keyset pages of at most 500 subjects per
+        transaction by ``materialize_repair_operation_batch`` (background lock
+        priority). ``expected_work_count`` starts as a pinned COUNT(*) estimate
+        and is corrected to the exact staged count when materialization seals.
+        """
+
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             if job.idempotency_key:
                 existing = connection.execute(
@@ -27555,72 +28811,22 @@ class NativeLibraryStore(PersistenceBase):
                 if existing is not None:
                     return dict(existing)
             purpose = str(scope.get("purpose", "existing_matches"))
-            root_ids = [str(value) for value in scope.get("root_ids", [])]
-            root_clause = ""
-            parameters: list[Any] = []
-            if root_ids:
-                root_clause = f"AND a.root_id IN ({','.join('?' for _ in root_ids)})"
-                parameters.extend(root_ids)
-            if purpose in {
-                "artist_identity_reconciliation",
-                "catalog_identity_hygiene",
-            }:
-                album_ids = [str(value) for value in scope.get("album_ids", [])]
-                album_clause = ""
-                if album_ids:
-                    album_clause = f"AND a.id IN ({','.join('?' for _ in album_ids)})"
-                    parameters.extend(album_ids)
-                active_track_clause = (
-                    "AND EXISTS (SELECT 1 FROM local_tracks active_track "
-                    "WHERE active_track.local_album_id = a.id "
-                    "AND active_track.availability = 'indexed') "
-                    if purpose == "artist_identity_reconciliation"
-                    else ""
-                )
-                rows = connection.execute(
-                    "SELECT a.id, a.row_revision, i.row_revision identity_revision, "
-                    "i.decision_source, i.attempt_id, i.release_mbid "
-                    "FROM local_albums a LEFT JOIN local_album_external_identities i "
-                    "ON i.local_album_id = a.id AND i.provider = 'musicbrainz' "
-                    "WHERE a.retired_into_album_id IS NULL "
-                    f"{active_track_clause}{root_clause} {album_clause} ORDER BY a.id",
-                    parameters,
-                ).fetchall()
-            elif purpose == "management_readiness":
-                rows = connection.execute(
-                    "SELECT a.id, a.row_revision, i.row_revision identity_revision, "
-                    "i.decision_source, i.attempt_id FROM local_albums a "
-                    "LEFT JOIN local_album_external_identities i ON i.local_album_id = a.id "
-                    "AND i.provider = 'musicbrainz' "
-                    "WHERE a.retired_into_album_id IS NULL "
-                    "AND EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id "
-                    "AND t.availability = 'indexed') "
-                    "AND NOT EXISTS (SELECT 1 FROM library_management_exclusions exclusion "
-                    "WHERE exclusion.local_album_id=a.id) "
-                    "AND NOT EXISTS (SELECT 1 FROM library_edition_conversion_jobs conversion "
-                    "WHERE conversion.local_album_id=a.id AND conversion.state IN "
-                    "('preflight','acquiring','ready','needs_recheck')) "
-                    f"{root_clause} ORDER BY a.id",
-                    parameters,
-                ).fetchall()
-            else:
-                identity_clause = ""
-                if source_matcher_version is not None:
-                    identity_clause = "AND i.matcher_version = ?"
-                    parameters.append(source_matcher_version)
-                elif bool(scope.get("legacy_only", True)):
-                    identity_clause = "AND i.decision_source = 'legacy_import'"
-                rows = connection.execute(
-                    "SELECT a.id, a.row_revision, i.row_revision identity_revision, "
-                    "i.decision_source, i.attempt_id FROM local_albums a "
-                    "JOIN local_album_external_identities i ON i.local_album_id = a.id "
-                    "WHERE a.retired_into_album_id IS NULL "
-                    "AND EXISTS (SELECT 1 FROM local_tracks t "
-                    "WHERE t.local_album_id = a.id AND t.availability = 'indexed') "
-                    f"{root_clause} "
-                    f"{identity_clause} ORDER BY a.id",
-                    parameters,
-                ).fetchall()
+            from_sql, where_sql, parameters = self._repair_scope_sql(
+                scope, purpose=purpose, source_matcher_version=source_matcher_version
+            )
+            # Strict pin: the catalog revision is captured INSIDE this creation
+            # transaction and used for BOTH the job header and the materialization
+            # row, so the subject set is fixed for the job's whole life.
+            pinned_revision = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            estimated_count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) {from_sql} {where_sql}", parameters
+                ).fetchone()[0]
+            )
             connection.execute(
                 "INSERT INTO library_operation_jobs "
                 "(id, kind, state, requested_by_user_id, input_catalog_revision, expected_work_count, "
@@ -27628,8 +28834,8 @@ class NativeLibraryStore(PersistenceBase):
                 (
                     job.id,
                     job.requested_by_user_id,
-                    job.input_catalog_revision,
-                    len(rows),
+                    pinned_revision,
+                    estimated_count,
                     job.idempotency_key,
                     job.created_at,
                     job.created_at,
@@ -27647,36 +28853,23 @@ class NativeLibraryStore(PersistenceBase):
                     job.created_at,
                 ),
             )
-            connection.executemany(
-                "INSERT INTO library_operation_work "
-                "(job_id, ordinal, local_album_id, expected_subject_revision, expected_input_revision, "
-                "action, idempotency_key, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                [
+            connection.execute(
+                "INSERT INTO library_repair_materialization "
+                "(job_id, pinned_catalog_revision, eligibility_version, purpose, "
+                "staging_cursor, staged_ordinal, staged_count, sealed, created_at, updated_at) "
+                "VALUES (?,?,?,?,NULL,-1,0,0,?,?)",
+                (
+                    job.id,
+                    pinned_revision,
                     (
-                        job.id,
-                        ordinal,
-                        row["id"],
-                        row["row_revision"],
-                        (
-                            f"{row['identity_revision'] or ''}:"
-                            f"{row['decision_source'] or ''}:"
-                            f"{row['attempt_id'] or ''}:"
-                            f"{(row['release_mbid'] if 'release_mbid' in row.keys() else '') or ''}"
-                        ),
-                        (
-                            "artist_identity_reconciliation"
-                            if purpose == "artist_identity_reconciliation"
-                            else "catalog_identity_hygiene"
-                            if purpose == "catalog_identity_hygiene"
-                            else "management_identity_audit"
-                            if purpose == "management_readiness"
-                            else "repair_audit"
-                        ),
-                        f"{job.id}:{row['id']}:audit",
-                        job.created_at,
-                    )
-                    for ordinal, row in enumerate(rows)
-                ],
+                        f"{purpose}:"
+                        f"{source_matcher_version or ''}:"
+                        f"{target_matcher_version}"
+                    ),
+                    purpose,
+                    job.created_at,
+                    job.created_at,
+                ),
             )
             self._bump_stream(connection, "operation")
             return dict(
@@ -27688,6 +28881,600 @@ class NativeLibraryStore(PersistenceBase):
         result = await self._write(operation)
         self.work_wakeups.notify("operation")
         return result
+
+    def _repair_scope_sql(
+        self,
+        scope: dict[str, Any],
+        *,
+        purpose: str,
+        source_matcher_version: str | None,
+    ) -> tuple[str, str, list[Any]]:
+        """Canonical eligibility predicate shared by count, pin, and pages."""
+        parameters: list[Any] = []
+        root_ids = [str(value) for value in scope.get("root_ids", [])]
+        root_clause = ""
+        if root_ids:
+            root_clause = f"AND a.root_id IN ({','.join('?' for _ in root_ids)})"
+            parameters.extend(root_ids)
+        if purpose in {
+            "artist_identity_reconciliation",
+            "catalog_identity_hygiene",
+        }:
+            album_ids = [str(value) for value in scope.get("album_ids", [])]
+            album_clause = ""
+            if album_ids:
+                album_clause = f"AND a.id IN ({','.join('?' for _ in album_ids)})"
+                parameters.extend(album_ids)
+            active_track_clause = (
+                "AND EXISTS (SELECT 1 FROM local_tracks active_track "
+                "WHERE active_track.local_album_id = a.id "
+                "AND active_track.availability = 'indexed') "
+                if purpose == "artist_identity_reconciliation"
+                else ""
+            )
+            return (
+                "FROM local_albums a LEFT JOIN local_album_external_identities i "
+                "ON i.local_album_id = a.id AND i.provider = 'musicbrainz'",
+                (
+                    "WHERE a.retired_into_album_id IS NULL "
+                    f"{active_track_clause}{root_clause} {album_clause}"
+                ),
+                parameters,
+            )
+        if purpose == "management_readiness":
+            return (
+                "FROM local_albums a LEFT JOIN local_album_external_identities i "
+                "ON i.local_album_id = a.id AND i.provider = 'musicbrainz'",
+                (
+                    "WHERE a.retired_into_album_id IS NULL "
+                    "AND EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id "
+                    "AND t.availability = 'indexed') "
+                    "AND NOT EXISTS (SELECT 1 FROM library_management_exclusions exclusion "
+                    "WHERE exclusion.local_album_id=a.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM library_edition_conversion_jobs conversion "
+                    "WHERE conversion.local_album_id=a.id AND conversion.state IN "
+                    "('preflight','acquiring','ready','needs_recheck')) "
+                    f"{root_clause}"
+                ),
+                parameters,
+            )
+        identity_clause = ""
+        if source_matcher_version is not None:
+            identity_clause = "AND i.matcher_version = ?"
+            parameters.append(source_matcher_version)
+        elif bool(scope.get("legacy_only", True)):
+            identity_clause = "AND i.decision_source = 'legacy_import'"
+        return (
+            "FROM local_albums a "
+            "JOIN local_album_external_identities i ON i.local_album_id = a.id",
+            (
+                "WHERE a.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks t "
+                "WHERE t.local_album_id = a.id AND t.availability = 'indexed') "
+                f"{root_clause} {identity_clause}"
+            ),
+            parameters,
+        )
+
+    def _repair_subject_select(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: dict[str, Any],
+        purpose: str,
+        source_matcher_version: str | None,
+        after_id: str | None,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        """Keyset page of eligible repair subjects ordered by album id.
+
+        Shared by the creation-time COUNT(*) and by paged materialization so the
+        eligibility predicate is identical for the whole job. Binds in fixed
+        order (GH-293 review fix):
+        root_ids -> album_ids -> identity matcher -> keyset -> limit. The page
+        caller must hold the pinned catalog revision unchanged (strict pin).
+        """
+        from_sql, where_sql, parameters = self._repair_scope_sql(
+            scope, purpose=purpose, source_matcher_version=source_matcher_version
+        )
+        keyset_clause = "AND a.id > ?" if after_id is not None else ""
+        if after_id is not None:
+            parameters.append(after_id)
+        parameters.append(limit)
+        sql = (
+            f"SELECT a.id, a.row_revision, i.row_revision identity_revision, "
+            f"i.decision_source, i.attempt_id, i.release_mbid "
+            f"{from_sql} {where_sql} {keyset_clause} "
+            f"ORDER BY a.id LIMIT ?"
+        )
+        return connection.execute(sql, parameters).fetchall()
+
+    def _repair_materialization_backfill_tx(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        now: float,
+    ) -> bool:
+        """Compatibility backfill for repair jobs created before GH-293.
+
+        Old jobs carry their full work row set already (inline materialization)
+        and no ``library_repair_materialization`` row. On first sight they are
+        retro-sealed with the existing row count, idempotently, so queued /
+        running / paused / ready / succeeded jobs keep their semantics across
+        the upgrade. Returns True when a row was inserted.
+        """
+        existing = connection.execute(
+            "SELECT 1 FROM library_repair_materialization WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if existing is not None:
+            return False
+        job = connection.execute(
+            "SELECT input_catalog_revision FROM library_operation_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        snapshot = connection.execute(
+            "SELECT scope_json, source_matcher_version, target_matcher_version "
+            "FROM library_repair_snapshots WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if job is None or snapshot is None:
+            return False
+        purpose = str(
+            json.loads(str(snapshot["scope_json"])).get("purpose", "existing_matches")
+        )
+        count, max_ordinal = connection.execute(
+            "SELECT COUNT(*), COALESCE(MAX(ordinal), -1) "
+            "FROM library_operation_work WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO library_repair_materialization "
+            "(job_id, pinned_catalog_revision, eligibility_version, purpose, "
+            "staging_cursor, staged_ordinal, staged_count, sealed, created_at, updated_at) "
+            "VALUES (?,?,?,?,NULL,?,?,1,?,?) ON CONFLICT(job_id) DO NOTHING",
+            (
+                job_id,
+                int(job["input_catalog_revision"] or 0),
+                (
+                    f"{purpose}:"
+                    f"{snapshot['source_matcher_version'] or ''}:"
+                    f"{snapshot['target_matcher_version']}"
+                ),
+                purpose,
+                int(max_ordinal),
+                int(count),
+                now,
+                now,
+            ),
+        )
+        return True
+
+    async def materialize_repair_operation_batch(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+        batch_size: int = MATERIALIZATION_PAGE_CAP,
+    ) -> dict[str, Any]:
+        """Materialize one keyset page of repair work rows atomically.
+
+        (GH-293) At most ``batch_size`` subjects per transaction, in background
+        lock priority, strictly pinned to the creation catalog revision. The
+        page advances the durable cursor, staged ordinal and count, and seals
+        materialization when the keyset is exhausted; a revision change before
+        sealing raises ``StaleRevisionError`` inside the page transaction BEFORE
+        any live changed subject is inserted. A crash before or after a page
+        commit resumes from the cursor without omission, duplication, or false
+        completion. Jobs created before this change (no materialization row,
+        work already inline) are retro-sealed on first sight. Once sealed, the
+        probe is a read and never opens a write transaction. The job must be
+        running under this worker's lease.
+        """
+        limit = min(max(batch_size, 1), MATERIALIZATION_PAGE_CAP)
+
+        async def sealed_probe() -> dict[str, Any] | None:
+            def read(connection: sqlite3.Connection) -> dict[str, Any] | None:
+                row = connection.execute(
+                    "SELECT sealed, staged_count FROM library_repair_materialization "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if row is not None and int(row["sealed"]) == 1:
+                    return {
+                        "complete": True,
+                        "materialized_count": int(row["staged_count"]),
+                        "page_size": 0,
+                    }
+                return None
+
+            return await self._read(read)
+
+        sealed = await sealed_probe()
+        if sealed is not None:
+            # A sealed no-op must NOT open a write transaction (or acquire the
+            # write lock) on the per-pass hot path (GH-293 review fix).
+            return sealed
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            job = connection.execute(
+                "SELECT id FROM library_operation_jobs WHERE id = ? AND state = 'running' "
+                "AND lease_owner = ?",
+                (job_id, worker_id),
+            ).fetchone()
+            if job is None:
+                raise StaleRevisionError(
+                    "The operation lease changed while its work was materialized."
+                )
+            materialization = connection.execute(
+                "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                self._repair_materialization_backfill_tx(connection, job_id, now=now)
+                materialization = connection.execute(
+                    "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if materialization is None:
+                    raise ResourceNotFoundError(
+                        "Repair materialization state not found."
+                    )
+            if int(materialization["sealed"]) == 1:
+                return {
+                    "complete": True,
+                    "materialized_count": int(materialization["staged_count"]),
+                    "page_size": 0,
+                }
+            # Strict pin (review fix): if the catalog revision moved since the
+            # creation transaction, THIS page fails BEFORE inserting any live
+            # changed subject. The job is stale and must be re-created or
+            # versioned; no partial/changing set ever materializes.
+            current_revision = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            if current_revision != int(materialization["pinned_catalog_revision"]):
+                raise StaleRevisionError(
+                    "The catalog revision changed after the repair worklist was "
+                    "pinned; re-create the job at the new revision."
+                )
+            snapshot = connection.execute(
+                "SELECT scope_json, source_matcher_version FROM library_repair_snapshots "
+                "WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if snapshot is None:
+                raise ResourceNotFoundError("Repair snapshot not found.")
+            scope = json.loads(str(snapshot["scope_json"]))
+            purpose = str(materialization["purpose"])
+            rows = self._repair_subject_select(
+                connection,
+                scope=scope,
+                purpose=purpose,
+                source_matcher_version=snapshot["source_matcher_version"],
+                after_id=materialization["staging_cursor"],
+                limit=limit + 1,
+            )
+            page = rows[:limit]
+            action = (
+                "artist_identity_reconciliation"
+                if purpose == "artist_identity_reconciliation"
+                else "catalog_identity_hygiene"
+                if purpose == "catalog_identity_hygiene"
+                else "management_identity_audit"
+                if purpose == "management_readiness"
+                else "repair_audit"
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO library_operation_work "
+                "(job_id, ordinal, local_album_id, expected_subject_revision, expected_input_revision, "
+                "action, idempotency_key, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        job_id,
+                        int(materialization["staged_ordinal"]) + 1 + offset,
+                        row["id"],
+                        row["row_revision"],
+                        (
+                            f"{row['identity_revision'] or ''}:"
+                            f"{row['decision_source'] or ''}:"
+                            f"{row['attempt_id'] or ''}:"
+                            f"{(row['release_mbid'] if 'release_mbid' in row.keys() else '') or ''}"
+                        ),
+                        action,
+                        f"{job_id}:{row['id']}:audit",
+                        now,
+                    )
+                    for offset, row in enumerate(page)
+                ],
+            )
+            complete = len(rows) <= limit
+            new_ordinal = (
+                int(materialization["staged_ordinal"]) + len(page)
+                if page
+                else int(materialization["staged_ordinal"])
+            )
+            new_count = int(materialization["staged_count"]) + len(page)
+            new_cursor = (
+                str(page[-1]["id"]) if page else materialization["staging_cursor"]
+            )
+            connection.execute(
+                "UPDATE library_repair_materialization SET staging_cursor = ?, "
+                "staged_ordinal = ?, staged_count = ?, sealed = ?, updated_at = ? "
+                "WHERE job_id = ?",
+                (
+                    new_cursor,
+                    new_ordinal,
+                    new_count,
+                    int(complete),
+                    now,
+                    job_id,
+                ),
+            )
+            if complete:
+                # The sealed count is authoritative; make the display truthful.
+                connection.execute(
+                    "UPDATE library_operation_jobs SET expected_work_count = ?, "
+                    "updated_at = ?, row_revision = row_revision + 1, "
+                    "event_revision = event_revision + 1 WHERE id = ?",
+                    (new_count, now, job_id),
+                )
+            self._bump_stream(connection, "operation")
+            return {
+                "complete": bool(complete),
+                "materialized_count": new_count,
+                "page_size": len(page),
+            }
+
+        return await self._write_background(operation)
+
+    async def rebase_repair_operation(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        """Atomically rebase a pin-stale, unsealed repair job onto the current
+        catalog revision (GH-293 review fix).
+
+        Preconditions, verified in ONE transaction:
+        - the job is running under this worker's lease,
+        - materialization is UNSEALED,
+        - ZERO completed work (no succeeded/failed/skipped rows, completed_count
+          == 0).
+
+        On success the SAME static-idempotency job is reused: only its staged
+        work rows are deleted, the durable cursor/count/seal are reset, the job's
+        ``input_catalog_revision`` AND the materialization pin are moved to the
+        current in-store revision, ``expected_work_count`` is re-estimated, and
+        the operation stream is bumped. The worker resumes on a later bounded
+        pass (cooldown + timed wakeup), so a startup catalog change never
+        strands a static-key backfill and never creates a fresh job.
+
+        On failure of the preconditions (completed work exists, or the job is
+        already sealed/terminal) the job FAILS CLOSED to a durable ``failed``
+        state with terminal code ``PIN_STALE_WITH_PROGRESS`` instead of silently
+        discarding evidence.
+        """
+        from infrastructure.persistence.gh293_calibration import (
+            BACKGROUND_YIELD_COOLDOWN_SECONDS,
+        )
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            job = connection.execute(
+                "SELECT * FROM library_operation_jobs WHERE id = ? AND state = 'running' "
+                "AND lease_owner = ?",
+                (job_id, worker_id),
+            ).fetchone()
+            if job is None:
+                raise StaleRevisionError(
+                    "The operation lease changed while the pin was stale."
+                )
+            materialization = connection.execute(
+                "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                raise StaleRevisionError(
+                    "Repair materialization state not found for rebase."
+                )
+            terminal_work = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
+                    "AND state IN ('succeeded','failed','skipped')",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            if (
+                int(materialization["sealed"]) == 1
+                or terminal_work > 0
+                or int(job["completed_count"]) > 0
+            ):
+                failed = connection.execute(
+                    "UPDATE library_operation_jobs SET state = 'failed', "
+                    "terminal_code = 'PIN_STALE_WITH_PROGRESS', terminal_at = ?, "
+                    "updated_at = ?, lease_owner = NULL, lease_expires_at = NULL, "
+                    "heartbeat_at = NULL, row_revision = row_revision + 1, "
+                    "event_revision = event_revision + 1 "
+                    "WHERE id = ? AND state = 'running' AND lease_owner = ? RETURNING *",
+                    (now, now, job_id, worker_id),
+                ).fetchone()
+                self._bump_stream(connection, "operation")
+                return {"rebased": False, "job": dict(failed)}
+
+            snapshot = connection.execute(
+                "SELECT scope_json, source_matcher_version FROM library_repair_snapshots "
+                "WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            scope = json.loads(str(snapshot["scope_json"]))
+            purpose = str(materialization["purpose"])
+            from_sql, where_sql, parameters = self._repair_scope_sql(
+                scope,
+                purpose=purpose,
+                source_matcher_version=snapshot["source_matcher_version"],
+            )
+            current_revision = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            estimated_count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) {from_sql} {where_sql}", parameters
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "DELETE FROM library_operation_work WHERE job_id = ?", (job_id,)
+            )
+            connection.execute(
+                "UPDATE library_repair_materialization SET "
+                "pinned_catalog_revision = ?, staging_cursor = NULL, "
+                "staged_ordinal = -1, staged_count = 0, sealed = 0, updated_at = ? "
+                "WHERE job_id = ?",
+                (current_revision, now, job_id),
+            )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET input_catalog_revision = ?, "
+                "expected_work_count = ?, updated_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ? RETURNING *",
+                (current_revision, estimated_count, now, job_id, worker_id),
+            ).fetchone()
+            self._bump_stream(connection, "operation")
+            return {"rebased": True, "job": dict(updated)}
+
+        result = await self._write_background(operation)
+        # Rebind the operation wakeup so a later bounded pass resumes promptly
+        # (never an immediate self-wakeup into a rebase loop).
+        self.work_wakeups.notify_after(
+            "operation", max(0.1, BACKGROUND_YIELD_COOLDOWN_SECONDS)
+        )
+        return result
+
+    async def get_repair_materialization_status(
+        self, job_id: str
+    ) -> dict[str, Any] | None:
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            return _row(
+                connection.execute(
+                    "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+
+        return await self._read(operation)
+
+    async def yield_operation_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+        reason_code: str,
+        retry_not_before: float | None = None,
+    ) -> dict[str, Any]:
+        """Release a running operation back to 'queued' without losing progress.
+
+        (GH-293) Used when a background timeslice expires, public bootstrap
+        demand or WAL backpressure suspends background producers, or scan-active
+        deferral is needed. Running work rows are reset to pending so the job
+        resumes exactly at the interrupted unit; the durable cursor, sealed
+        marker, and counters are untouched. A positive ``next_attempt_at``
+        (default: the calibration cooldown) is persisted and a real timed
+        wakeup is scheduled, so the yielding worker never wakes itself into an
+        immediate re-claim hot loop.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            connection.execute(
+                "UPDATE library_operation_work SET state = 'pending', failure_code = ?, "
+                "updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE job_id = ? AND state = 'running'",
+                (reason_code, now, job_id),
+            )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = 'queued', lease_owner = NULL, "
+                "lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?, "
+                "next_attempt_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND kind = 'repair' AND state = 'running' "
+                "AND lease_owner = ? RETURNING *",
+                (now, next_attempt_at, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The operation lease changed while it yielded."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        if retry_not_before is not None:
+            next_attempt_at = retry_not_before
+        else:
+            next_attempt_at = now + BACKGROUND_YIELD_COOLDOWN_SECONDS
+        result = await self._write_background(operation)
+        if next_attempt_at is not None:
+            self.work_wakeups.notify_after("operation", next_attempt_at - now)
+        else:
+            self.work_wakeups.notify("operation")
+        return result
+
+    async def finish_sealed_repair_operation_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        state: str,
+        terminal_code: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """Finish a repair job only after materialization is sealed and every
+        materialized subject is terminal (GH-293). Jobs created before GH-293
+        (inline work, no materialization row) are retro-sealed first."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            materialization = connection.execute(
+                "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                self._repair_materialization_backfill_tx(connection, job_id, now=now)
+                materialization = connection.execute(
+                    "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            if materialization is None or int(materialization["sealed"]) != 1:
+                raise StaleRevisionError("The repair worklist is not sealed yet.")
+            active = connection.execute(
+                "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
+                "AND state IN ('pending','running')",
+                (job_id,),
+            ).fetchone()[0]
+            if int(active) != 0:
+                raise StaleRevisionError(
+                    "The repair still has unfinished materialized subjects."
+                )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = ?, terminal_code = ?, terminal_at = ?, "
+                "updated_at = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ? RETURNING *",
+                (state, terminal_code, now, now, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The operation lease changed before completion."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        return await self._write_background(operation)
 
     async def estimate_management_identity_preparation(
         self, root_ids: list[str]
@@ -27865,7 +29652,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        result = await self._write(operation)
+        result = await self._write_background(operation)
         if retry_not_before is not None:
             self.work_wakeups.notify_after("operation", retry_not_before - now)
         return result
@@ -27880,9 +29667,21 @@ class NativeLibraryStore(PersistenceBase):
         finding: RepairFinding,
         attempt: IdentificationAttempt | None = None,
         evidence: list[IdentificationEvidenceRecord] | None = None,
+        auto_accept_edition: bool = False,
         now: float,
-    ) -> None:
-        def operation(connection: sqlite3.Connection) -> None:
+    ) -> str:
+        """Persist one audit finding; optionally auto-apply the suggestion.
+
+        With ``auto_accept_edition`` the just-saved ``exact_release_suggested``
+        finding is applied in this same transaction through
+        ``_apply_suggested_edition_tx`` as actor system with
+        ``decision_source='automatic'`` (D-EDITION-AUTO). The finding row is
+        then flipped to ``exact_release_auto_accepted``; if the apply hit a
+        stale subject instead, the tx already marked it stale. Returns
+        ``"saved"``, ``"auto_applied"`` or ``"auto_stale"``.
+        """
+
+        def operation(connection: sqlite3.Connection) -> str:
             work = connection.execute(
                 "SELECT * FROM library_operation_work WHERE job_id = ? AND ordinal = ? "
                 "AND state = 'running' AND row_revision = ?",
@@ -27946,10 +29745,94 @@ class NativeLibraryStore(PersistenceBase):
                     now,
                 ),
             )
+            outcome = "saved"
+            result_payload: dict[str, object] = {"finding_id": finding.id}
+            if auto_accept_edition:
+                assert finding.finding_code == "exact_release_suggested"
+                finding_row = connection.execute(
+                    "SELECT * FROM library_identity_repair_findings WHERE id = ?",
+                    (finding.id,),
+                ).fetchone()
+                album = connection.execute(
+                    "SELECT row_revision FROM local_albums WHERE id = ?",
+                    (work["local_album_id"],),
+                ).fetchone()
+                identity = connection.execute(
+                    "SELECT * FROM local_album_external_identities "
+                    "WHERE local_album_id = ?",
+                    (work["local_album_id"],),
+                ).fetchone()
+                evidence_row = (
+                    connection.execute(
+                        "SELECT e.evidence_json, e.attempt_id, e.compacted, "
+                        "a.input_tag_revision, a.input_file_revision, "
+                        "a.input_policy_revision FROM library_identification_evidence e "
+                        "JOIN library_identification_attempts a ON a.id = e.attempt_id "
+                        "WHERE e.id = ?",
+                        (finding.evidence_id,),
+                    ).fetchone()
+                    if finding.evidence_id
+                    else None
+                )
+                track_rows = connection.execute(
+                    "SELECT t.*, ti.recording_mbid, "
+                    "ti.release_mbid AS identity_release_mbid, "
+                    "ti.release_track_mbid, ti.medium_position, "
+                    "ti.release_track_position FROM local_tracks t "
+                    "LEFT JOIN local_track_external_identities ti "
+                    "ON ti.local_track_id = t.id AND ti.provider = 'musicbrainz' "
+                    "WHERE t.local_album_id = ? AND t.availability = 'indexed' "
+                    "ORDER BY t.id",
+                    (work["local_album_id"],),
+                ).fetchall()
+                evidence_candidate = (
+                    msgspec.json.decode(
+                        bytes(evidence_row["evidence_json"]), type=CandidateEvidence
+                    )
+                    if evidence_row is not None
+                    else None
+                )
+                summary_payload = (
+                    json.loads(finding.suggested_edition_json)
+                    if finding.suggested_edition_json
+                    else {}
+                )
+                apply_state, _failure = self._apply_suggested_edition_tx(
+                    connection,
+                    work=work,
+                    finding=finding_row,
+                    album=album,
+                    identity=identity,
+                    evidence_row=evidence_row,
+                    track_rows=track_rows,
+                    evidence=evidence_candidate,
+                    job_id=job_id,
+                    actor_user_id=None,
+                    now=now,
+                    decision_source="automatic",
+                    ranking_inputs=summary_payload.get("auto_ranking"),
+                )
+                if apply_state == "succeeded":
+                    connection.execute(
+                        "UPDATE library_identity_repair_findings SET "
+                        "finding_code = 'exact_release_auto_accepted', "
+                        "reason_code = 'EXACT_EDITION_AUTO_ACCEPTED', "
+                        "confidence = 'complete', apply_eligible = 0, "
+                        "state = 'applied', apply_result = 'EDITION_AUTO_ACCEPTED', "
+                        "updated_at = ?, row_revision = row_revision + 1 WHERE id = ?",
+                        (now, finding.id),
+                    )
+                    outcome = "auto_applied"
+                    result_payload["outcome"] = "EDITION_AUTO_ACCEPTED"
+                else:
+                    # The apply tx already flipped the inserted finding to
+                    # stale; the audit unit itself still completed.
+                    outcome = "auto_stale"
+                    result_payload["outcome"] = "STALE_SUBJECT"
             connection.execute(
                 "UPDATE library_operation_work SET state = 'succeeded', result_json = ?, "
                 "updated_at = ?, row_revision = row_revision + 1 WHERE job_id = ? AND ordinal = ?",
-                (json.dumps({"finding_id": finding.id}), now, job_id, ordinal),
+                (json.dumps(result_payload), now, job_id, ordinal),
             )
             connection.execute(
                 "UPDATE library_operation_jobs SET completed_count = completed_count + 1, "
@@ -27959,13 +29842,255 @@ class NativeLibraryStore(PersistenceBase):
                 (now, job_id, worker_id),
             )
             self._bump_stream(connection, "operation")
+            return outcome
 
-        await self._write(operation)
+        return await self._write_background(operation)
+
+    async def get_live_automatic_edition_undo(
+        self, local_album_ids: list[str]
+    ) -> dict[str, tuple[int, int]]:
+        """Map albums to their still-reversible auto-accept CAS revisions."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, tuple[int, int]]:
+            result: dict[str, tuple[int, int]] = {}
+            for local_album_id in local_album_ids:
+                snapshot = connection.execute(
+                    "SELECT expected_post_album_revision, "
+                    "expected_post_identity_revision FROM "
+                    "library_automatic_edition_undo WHERE local_album_id = ? "
+                    "AND consumed_at IS NULL",
+                    (local_album_id,),
+                ).fetchone()
+                if snapshot is None:
+                    continue
+                identity = connection.execute(
+                    "SELECT row_revision FROM local_album_external_identities "
+                    "WHERE local_album_id = ? AND decision_source = 'automatic'",
+                    (local_album_id,),
+                ).fetchone()
+                if identity is None or int(identity["row_revision"]) != int(
+                    snapshot["expected_post_identity_revision"]
+                ):
+                    continue
+                album = connection.execute(
+                    "SELECT row_revision FROM local_albums WHERE id = ?",
+                    (local_album_id,),
+                ).fetchone()
+                if album is None or int(album["row_revision"]) != int(
+                    snapshot["expected_post_album_revision"]
+                ):
+                    continue
+                result[local_album_id] = (
+                    int(album["row_revision"]),
+                    int(identity["row_revision"]),
+                )
+            return result
+
+        return await self._read(operation)
+
+    async def undo_automatic_edition_acceptance(
+        self,
+        local_album_id: str,
+        *,
+        expected_album_revision: int,
+        expected_identity_revision: int,
+        actor_user_id: str | None,
+        now: float,
+    ) -> dict[str, Any]:
+        """S-2: one revisioned catalog-identity operation restoring the prior
+        identity snapshot, or clearing the acceptance back to review when no
+        prior existed. Never touches album pins."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            snapshot = connection.execute(
+                "SELECT * FROM library_automatic_edition_undo "
+                "WHERE local_album_id = ? AND consumed_at IS NULL",
+                (local_album_id,),
+            ).fetchone()
+            if snapshot is None:
+                raise ResourceNotFoundError(
+                    "This album has no reversible automatic edition acceptance."
+                )
+            album = connection.execute(
+                "SELECT row_revision FROM local_albums WHERE id = ?",
+                (local_album_id,),
+            ).fetchone()
+            identity = connection.execute(
+                "SELECT * FROM local_album_external_identities WHERE local_album_id = ?",
+                (local_album_id,),
+            ).fetchone()
+            if (
+                album is None
+                or int(album["row_revision"]) != expected_album_revision
+                or identity is None
+                or identity["decision_source"] != "automatic"
+                or int(identity["row_revision"]) != expected_identity_revision
+                or int(snapshot["expected_post_identity_revision"])
+                != int(identity["row_revision"])
+            ):
+                raise StaleRevisionError(
+                    "The album identity changed since the automatic acceptance; "
+                    "undo would restore a stale identity."
+                )
+            current_tracks = connection.execute(
+                "SELECT ti.local_track_id, ti.recording_mbid, ti.release_mbid, "
+                "ti.release_track_mbid, ti.medium_position, "
+                "ti.release_track_position, ti.decision_source "
+                "FROM local_track_external_identities ti JOIN local_tracks t "
+                "ON t.id = ti.local_track_id WHERE t.local_album_id = ? "
+                "AND t.availability = 'indexed' ORDER BY ti.local_track_id",
+                (local_album_id,),
+            ).fetchall()
+            before = {
+                "identity": {
+                    "release_group_mbid": identity["release_group_mbid"],
+                    "release_mbid": identity["release_mbid"],
+                    "decision_source": identity["decision_source"],
+                    "row_revision": int(identity["row_revision"]),
+                },
+                "tracks": [dict(row) for row in current_tracks],
+            }
+            prior_json = snapshot["prior_identity_json"]
+            prior_tracks = json.loads(str(snapshot["prior_track_identities_json"]))
+            review_id = None
+            if prior_json is not None:
+                prior = json.loads(str(prior_json))
+                connection.execute(
+                    "INSERT INTO local_album_external_identities "
+                    "(local_album_id, provider, release_group_mbid, release_mbid, "
+                    "decision_source, matcher_version, attempt_id, "
+                    "selected_by_user_id, selected_at) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
+                    "release_group_mbid = excluded.release_group_mbid, "
+                    "release_mbid = excluded.release_mbid, "
+                    "decision_source = excluded.decision_source, "
+                    "matcher_version = excluded.matcher_version, "
+                    "attempt_id = excluded.attempt_id, "
+                    "selected_by_user_id = excluded.selected_by_user_id, "
+                    "selected_at = excluded.selected_at, "
+                    "row_revision = row_revision + 1",
+                    (
+                        local_album_id,
+                        prior["release_group_mbid"],
+                        prior["release_mbid"],
+                        prior["decision_source"],
+                        prior["matcher_version"],
+                        prior["attempt_id"],
+                        prior["selected_by_user_id"],
+                        prior["selected_at"],
+                    ),
+                )
+                outcome = "restored"
+            else:
+                connection.execute(
+                    "DELETE FROM local_album_external_identities "
+                    "WHERE local_album_id = ?",
+                    (local_album_id,),
+                )
+                review_id = str(uuid.uuid4())
+                connection.execute(
+                    "INSERT INTO library_identification_reviews "
+                    "(id, local_album_id, state, reason_code, attempt_id, "
+                    "input_revision, created_at, updated_at) "
+                    "VALUES (?, ?, 'needs_review', "
+                    "'AUTOMATIC_EDITION_CLEARED_TO_REVIEW', ?, ?, ?, ?)",
+                    (
+                        review_id,
+                        local_album_id,
+                        identity["attempt_id"],
+                        f"undo:{snapshot['id']}",
+                        now,
+                        now,
+                    ),
+                )
+                outcome = "cleared_to_review"
+            connection.execute(
+                "DELETE FROM local_track_external_identities WHERE "
+                "local_track_id IN (SELECT id FROM local_tracks "
+                "WHERE local_album_id = ? AND availability = 'indexed')",
+                (local_album_id,),
+            )
+            for track in prior_tracks:
+                connection.execute(
+                    "INSERT INTO local_track_external_identities "
+                    "(local_track_id, provider, recording_mbid, release_mbid, "
+                    "release_track_mbid, medium_position, release_track_position, "
+                    "decision_source, attempt_id, selected_at) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
+                    "recording_mbid = excluded.recording_mbid, "
+                    "release_mbid = excluded.release_mbid, "
+                    "release_track_mbid = excluded.release_track_mbid, "
+                    "medium_position = excluded.medium_position, "
+                    "release_track_position = excluded.release_track_position, "
+                    "decision_source = excluded.decision_source, "
+                    "attempt_id = excluded.attempt_id, "
+                    "selected_at = excluded.selected_at, "
+                    "row_revision = row_revision + 1",
+                    (
+                        track["local_track_id"],
+                        track["recording_mbid"],
+                        track["release_mbid"],
+                        track["release_track_mbid"],
+                        track["medium_position"],
+                        track["release_track_position"],
+                        track["decision_source"],
+                        track["attempt_id"],
+                        track["selected_at"],
+                    ),
+                )
+            action_id = str(uuid.uuid4())
+            connection.execute(
+                "UPDATE library_automatic_edition_undo SET consumed_at = ?, "
+                "consumed_action_id = ? WHERE id = ?",
+                (now, action_id, snapshot["id"]),
+            )
+            connection.execute(
+                "INSERT INTO library_catalog_actions "
+                "(id, actor_user_id, action_kind, local_album_id, before_json, "
+                "after_json, reason_code, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    action_id,
+                    actor_user_id,
+                    "undo_automatic_edition",
+                    local_album_id,
+                    json.dumps(before, sort_keys=True),
+                    json.dumps(
+                        {
+                            "outcome": outcome,
+                            "review_id": review_id,
+                            "undo_snapshot_id": snapshot["id"],
+                        },
+                        sort_keys=True,
+                    ),
+                    "AUTOMATIC_EDITION_UNDONE",
+                    now,
+                ),
+            )
+            self._bump_catalog(connection)
+            self._bump_stream(connection, "operation")
+            return {"outcome": outcome, "review_id": review_id}
+
+        return await self._write(operation)
 
     async def mark_repair_ready(
         self, job_id: str, worker_id: str, *, now: float
     ) -> dict[str, Any]:
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            materialization = connection.execute(
+                "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                # Pre-GH-293 jobs carry their work inline; retro-seal them.
+                self._repair_materialization_backfill_tx(connection, job_id, now=now)
+                materialization = connection.execute(
+                    "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            if materialization is None or int(materialization["sealed"]) != 1:
+                raise StaleRevisionError("The repair worklist is not sealed yet.")
             pending = connection.execute(
                 "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
                 "AND state IN ('pending','running')",
@@ -28267,7 +30392,9 @@ class NativeLibraryStore(PersistenceBase):
                         now=now,
                     )
                 else:
-                    current_revisions = tuple(_album_input_revision(track_rows).split(":"))
+                    current_revisions = tuple(
+                        _album_input_revision(track_rows).split(":")
+                    )
                     proposed = {
                         item.local_track_id: item
                         for item in (evidence.track_evidence if evidence else [])
@@ -28315,7 +30442,8 @@ class NativeLibraryStore(PersistenceBase):
                                 )
                                 or (
                                     row["release_track_mbid"]
-                                    and row["release_track_mbid"] != item.release_track_mbid
+                                    and row["release_track_mbid"]
+                                    != item.release_track_mbid
                                 )
                                 or (
                                     row["embedded_release_group_mbid"]
@@ -28559,7 +30687,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return {"state": state, "failure_code": failure_code}
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     def _apply_suggested_edition_tx(
         self,
@@ -28575,8 +30703,19 @@ class NativeLibraryStore(PersistenceBase):
         job_id: str,
         actor_user_id: str,
         now: float,
+        decision_source: str = "manual",
+        ranking_inputs: object | None = None,
     ) -> tuple[str, str | None]:
-        """Seal one accepted suggested edition; mirrors manual candidate accept."""
+        """Seal one accepted suggested edition; mirrors manual candidate accept.
+
+        ``decision_source='automatic'`` (D-EDITION-AUTO) writes
+        ``decision_source='automatic'`` identity rows, a dedicated
+        ``library_catalog_actions`` audit row with source string
+        ``automatic_exact_edition`` carrying reason/ranking inputs/evidence,
+        and an undo snapshot in ``library_automatic_edition_undo`` - all
+        inside this same transaction. The manual default is byte-identical
+        to the pre-D-EDITION-AUTO behavior.
+        """
         mapped = (
             _complete_track_identity_mapping(track_rows, evidence)
             if evidence is not None
@@ -28602,6 +30741,11 @@ class NativeLibraryStore(PersistenceBase):
                     int(identity["row_revision"])
                     != int(finding["expected_identity_revision"])
                     or identity["release_mbid"] is not None
+                    # F-EDITION-01: an existing release group must equal the
+                    # candidate's - a cross-RG write is an identity conflict,
+                    # evaluated in addition to every revision guard above.
+                    or (identity["release_group_mbid"] or "").casefold()
+                    != (evidence.release_group_mbid or "").casefold()
                 )
             )
             or evidence.reason_code not in AUTOMATIC_SAFE_EVIDENCE_REASONS
@@ -28659,16 +30803,73 @@ class NativeLibraryStore(PersistenceBase):
             if identity is not None
             else {}
         )
+        if decision_source == "automatic":
+            # S-1/S-2: capture the reversible prior-identity snapshot before
+            # any mutation, inside this same transaction.
+            assert album is not None
+            prior_tracks = connection.execute(
+                "SELECT ti.local_track_id, ti.recording_mbid, ti.release_mbid, "
+                "ti.release_track_mbid, ti.medium_position, "
+                "ti.release_track_position, ti.decision_source, ti.attempt_id, "
+                "ti.selected_at FROM local_track_external_identities ti "
+                "JOIN local_tracks t ON t.id = ti.local_track_id "
+                "WHERE t.local_album_id = ? AND t.availability = 'indexed' "
+                "ORDER BY ti.local_track_id",
+                (work["local_album_id"],),
+            ).fetchall()
+            connection.execute(
+                "INSERT INTO library_automatic_edition_undo "
+                "(id, local_album_id, job_id, evidence_id, prior_identity_json, "
+                "prior_track_identities_json, expected_post_album_revision, "
+                "expected_post_identity_revision, reason_code, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(local_album_id) DO UPDATE SET id = excluded.id, "
+                "job_id = excluded.job_id, evidence_id = excluded.evidence_id, "
+                "prior_identity_json = excluded.prior_identity_json, "
+                "prior_track_identities_json = excluded.prior_track_identities_json, "
+                "expected_post_album_revision = excluded.expected_post_album_revision, "
+                "expected_post_identity_revision = "
+                "excluded.expected_post_identity_revision, "
+                "reason_code = excluded.reason_code, created_at = excluded.created_at, "
+                "consumed_at = NULL, consumed_action_id = NULL",
+                (
+                    str(uuid.uuid4()),
+                    work["local_album_id"],
+                    job_id,
+                    finding["evidence_id"],
+                    json.dumps(
+                        {
+                            "release_group_mbid": identity["release_group_mbid"],
+                            "release_mbid": identity["release_mbid"],
+                            "decision_source": identity["decision_source"],
+                            "matcher_version": identity["matcher_version"],
+                            "attempt_id": identity["attempt_id"],
+                            "selected_by_user_id": identity["selected_by_user_id"],
+                            "selected_at": identity["selected_at"],
+                            "row_revision": int(identity["row_revision"]),
+                        },
+                        sort_keys=True,
+                    )
+                    if identity is not None
+                    else None,
+                    json.dumps([dict(row) for row in prior_tracks], sort_keys=True),
+                    int(album["row_revision"]),
+                    (int(identity["row_revision"]) + 1 if identity is not None else 1),
+                    evidence.reason_code,
+                    now,
+                ),
+            )
         connection.execute(
             "INSERT INTO local_album_external_identities "
             "(local_album_id, provider, release_group_mbid, release_mbid, "
             "decision_source, matcher_version, attempt_id, selected_by_user_id, "
             "selected_at) "
-            "VALUES (?, 'musicbrainz', ?, ?, 'manual', ?, ?, ?, ?) "
+            "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
             "release_group_mbid = excluded.release_group_mbid, "
             "release_mbid = excluded.release_mbid, "
-            "decision_source = 'manual', matcher_version = excluded.matcher_version, "
+            "decision_source = excluded.decision_source, "
+            "matcher_version = excluded.matcher_version, "
             "attempt_id = excluded.attempt_id, "
             "selected_by_user_id = excluded.selected_by_user_id, "
             "selected_at = excluded.selected_at, row_revision = row_revision + 1",
@@ -28676,6 +30877,7 @@ class NativeLibraryStore(PersistenceBase):
                 work["local_album_id"],
                 evidence.release_group_mbid,
                 evidence.release_mbid,
+                decision_source,
                 evidence.matcher_version,
                 evidence_row["attempt_id"],
                 actor_user_id,
@@ -28694,7 +30896,7 @@ class NativeLibraryStore(PersistenceBase):
                 "(local_track_id, provider, recording_mbid, release_mbid, "
                 "release_track_mbid, medium_position, release_track_position, "
                 "decision_source, attempt_id, selected_at) "
-                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, 'manual', ?, ?)",
+                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item.local_track_id,
                     item.recording_mbid,
@@ -28702,6 +30904,7 @@ class NativeLibraryStore(PersistenceBase):
                     item.release_track_mbid,
                     item.candidate_disc_number,
                     item.candidate_track_position,
+                    decision_source,
                     evidence_row["attempt_id"],
                     now,
                 ),
@@ -28736,23 +30939,64 @@ class NativeLibraryStore(PersistenceBase):
                 for item in mapped
             ],
         }
-        connection.execute(
-            "INSERT INTO library_catalog_actions "
-            "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
-            "before_json, after_json, reason_code, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                str(uuid.uuid4()),
-                actor_user_id,
-                "accept_suggested_edition",
-                work["local_album_id"],
-                job_id,
-                json.dumps(before, sort_keys=True),
-                json.dumps(after, sort_keys=True),
-                "SUGGESTED_EDITION_ACCEPTED",
-                now,
-            ),
-        )
+        if decision_source == "automatic":
+            # S-1: one dedicated audit row whose source string records the
+            # automatic acceptance with reason, ranking inputs, evidence id,
+            # prior identity revision, and actor=system (NULL user).
+            connection.execute(
+                "INSERT INTO library_catalog_actions "
+                "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
+                "before_json, after_json, reason_code, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    None,
+                    "automatic_exact_edition",
+                    work["local_album_id"],
+                    job_id,
+                    json.dumps(
+                        {
+                            **before,
+                            "prior_identity_revision": (
+                                int(identity["row_revision"])
+                                if identity is not None
+                                else None
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        {
+                            **after,
+                            "evidence_id": finding["evidence_id"],
+                            "gate_reason": "AUTO_ACCEPT",
+                            "ranking_inputs": ranking_inputs,
+                            "actor": "system",
+                        },
+                        sort_keys=True,
+                    ),
+                    evidence.reason_code,
+                    now,
+                ),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO library_catalog_actions "
+                "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
+                "before_json, after_json, reason_code, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    actor_user_id,
+                    "accept_suggested_edition",
+                    work["local_album_id"],
+                    job_id,
+                    json.dumps(before, sort_keys=True),
+                    json.dumps(after, sort_keys=True),
+                    "SUGGESTED_EDITION_ACCEPTED",
+                    now,
+                ),
+            )
         connection.execute(
             "UPDATE library_identity_repair_findings SET state = 'applied', "
             "apply_result = 'EDITION_ACCEPTED', updated_at = ?, "
@@ -28785,11 +31029,22 @@ class NativeLibraryStore(PersistenceBase):
                 params.extend((cursor_updated_at, cursor_updated_at, cursor_id))
             current_filter = ""
             if current_only:
+                # D-EDITION-AUTO: an applied auto-accept stays listed while
+                # its undo snapshot is live, so the readiness UI can offer
+                # the revisioned undo action.
                 current_filter = (
-                    "AND f.state = 'open' "
+                    "AND ("
+                    "(f.state = 'open' "
                     "AND a.row_revision = f.expected_album_revision "
-                    "AND ((f.expected_identity_revision IS NULL AND identity.row_revision IS NULL) "
-                    "OR identity.row_revision = f.expected_identity_revision)"
+                    "AND ((f.expected_identity_revision IS NULL "
+                    "AND identity.row_revision IS NULL) "
+                    "OR identity.row_revision = f.expected_identity_revision))"
+                    " OR (f.finding_code = 'exact_release_auto_accepted' "
+                    "AND f.state = 'applied' "
+                    "AND EXISTS (SELECT 1 FROM library_automatic_edition_undo u "
+                    "WHERE u.local_album_id = f.local_album_id "
+                    "AND u.consumed_at IS NULL))"
+                    ")"
                 )
             rows = connection.execute(
                 "SELECT f.*, a.title AS album_title, "
@@ -29975,9 +32230,7 @@ class NativeLibraryStore(PersistenceBase):
     async def catalog_has_tracks(self) -> bool:
         def operation(connection: sqlite3.Connection) -> bool:
             return (
-                connection.execute(
-                    "SELECT 1 FROM local_tracks LIMIT 1"
-                ).fetchone()
+                connection.execute("SELECT 1 FROM local_tracks LIMIT 1").fetchone()
                 is not None
             )
 

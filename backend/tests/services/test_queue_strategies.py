@@ -445,6 +445,49 @@ class TestGetTrendingFiller:
         assert "ok-1" in rg_ids
 
     @pytest.mark.asyncio
+    async def test_dedup_repeated_release_group_preserves_first_seen(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(random, "shuffle", lambda _: None)
+        lb_repo = AsyncMock()
+        lb_repo.get_sitewide_top_release_groups.return_value = [
+            ListenBrainzReleaseGroup(
+                release_group_name="First",
+                artist_name="Artist",
+                listen_count=500,
+                release_group_mbid="DUPE-1",
+                artist_mbids=["a-1"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Repeated",
+                artist_name="Artist",
+                listen_count=400,
+                release_group_mbid="dupe-1",
+                artist_mbids=["a-1"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Distinct",
+                artist_name="Artist",
+                listen_count=300,
+                release_group_mbid="distinct-1",
+                artist_mbids=["a-2"],
+            ),
+        ]
+
+        result = await get_trending_filler(
+            5,
+            set(),
+            set(),
+            None,
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=AsyncMock(),
+            mbid_svc=_make_mbid_svc(),
+        )
+
+        assert [item.release_group_mbid for item in result] == ["DUPE-1", "distinct-1"]
+
+    @pytest.mark.asyncio
     async def test_returns_empty_when_count_zero(self) -> None:
         lb_repo = AsyncMock()
         mb_repo = AsyncMock()

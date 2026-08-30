@@ -44,7 +44,10 @@ from services.native.album_preflight_scorer import (
     AlbumPreflightScorer,
     rank_stored_candidates,
 )
-from services.native.download_orchestrator import DownloadOrchestrator
+from services.native.download_orchestrator import (
+    DownloadOrchestrator,
+    _DefaultPolicyShim,
+)
 from services.native.library_manager import LibraryManager
 from services.native.quality_tiers import should_acquire, tier_for, tier_rank
 
@@ -145,6 +148,7 @@ class DownloadService:
         release_pin_store=None,  # AlbumReleasePinStore | None - edition pins (Feature E)
         ownership_service: "LibraryOwnershipService | None" = None,
         library_reconciler=None,
+        snapshot_factory=None,  # Callable[[], AcquisitionQualitySnapshot] (post-cutover)
     ):
         self._client = download_client
         self._indexer = indexer
@@ -175,6 +179,7 @@ class DownloadService:
         # Per-file scorer for 1-track releases in the manual-search lane (the auto path
         # branches inside SoulseekStrategy; this covers _search_soulseek + pick).
         self._track_matcher = track_matcher
+        self._snapshot_factory = snapshot_factory
         self._auto = auto_accept_threshold
         self._manual = manual_threshold
         self._enabled = enabled
@@ -522,12 +527,14 @@ class DownloadService:
                 return await self._track_matcher.rank(
                     track_target,
                     results,
+                    snapshot=self._search_snapshot(),
                     auto_accept_threshold=self._auto,
                     manual_threshold=self._manual,
                 )
         return await self._scorer.rank(
             target,
             results,
+            snapshot=self._search_snapshot(),
             auto_accept_threshold=self._auto,
             manual_threshold=self._manual,
         )
@@ -540,6 +547,7 @@ class DownloadService:
         return await self._usenet_scorer.rank(
             target,
             releases,
+            snapshot=self._search_snapshot(),
             auto_accept_threshold=self._auto,
             manual_threshold=self._manual,
             track_count=target.track_count,
@@ -808,10 +816,16 @@ class DownloadService:
         # A manual re-request is an explicit "try again" - clear this album's blocklist so
         # releases quarantined by an earlier failed attempt are reconsidered (otherwise the
         # scorer keeps filtering them and the re-request finds nothing). Album-scoped only;
-        # a per-track retry must not wipe the whole album's blocklist. The wanted watcher's
-        # dispatches never clear (Wanted D5): the blocklist records verified-bad releases
-        # and only an explicit human re-request/retry may reset it.
-        if download_type == "album" and release_group_mbid and origin != "wanted":
+        # a per-track retry must not wipe the whole album's blocklist. Automated dispatches
+        # NEVER clear (#255 defect 1): the blocklist records verified-bad releases, and a
+        # 'retry' or 'wanted' task re-arming its own condemned sources is what turned one
+        # bad attempt into an endless re-download loop. Only an explicit human re-request
+        # here - or retry_task's manual-retry clear - may reset it.
+        if (
+            download_type == "album"
+            and release_group_mbid
+            and origin not in ("wanted", "retry")
+        ):
             cleared = await self._store.delete_quarantine_for_album(release_group_mbid)
             if cleared:
                 logger.info(
@@ -909,9 +923,36 @@ class DownloadService:
             track_count=track_count,
             track_duration_seconds=track_duration_seconds,
             origin=origin,
+            **self._pinned_snapshot(),
         )
         self._orchestrator.dispatch(task.id)
         return task.id
+
+    def _search_snapshot(self):
+        """The manual-search lane scores under the CURRENT global policy (the
+        auto path pins each task's creation-time snapshot instead). Legacy
+        constructions without a factory keep the pre-cutover default range."""
+        if self._snapshot_factory is not None:
+            return self._snapshot_factory()
+        from services.native.acquisition.quality import build_snapshot
+
+        return build_snapshot(_DefaultPolicyShim())
+
+    def _pinned_snapshot(self):
+        """Creation-time immutable policy snapshot; tests/legacy constructions
+        without a factory produce untagged rows the startup backfill covers."""
+        if self._snapshot_factory is None:
+            return {}
+        import json as _json
+
+        from infrastructure.serialization import to_jsonable as _to
+
+        snapshot = self._snapshot_factory()
+        return {
+            "quality_snapshot_json": _json.dumps(_to(snapshot)),
+            "quality_snapshot_hash": snapshot.snapshot_hash,
+            "quality_snapshot_summary": snapshot.summary,
+        }
 
     async def request_track(
         self,
@@ -1137,7 +1178,9 @@ class DownloadService:
                 continue
             if not self._upgrade_allowed:
                 continue
-            held_tier = tier_for(row.get("file_format") or "", row.get("bit_rate"))
+            held_tier = tier_for(
+                row.get("file_format") or "", row.get("bit_rate"), row.get("bit_depth")
+            )
             if tier_rank(held_tier) >= tier_rank(self._quality_cutoff):
                 continue
             recording = row.get("recording_mbid") or track.recording_id
@@ -1294,7 +1337,7 @@ class DownloadService:
         """The full auto-retry backoff schedule (minutes) for the queue UI's ladder."""
         return self._orchestrator.retry_ladder_minutes()
 
-    # -- held imports ("import anyway" review) --
+    # held imports ("import anyway" review)
 
     async def held_task_ids(self, user_id: str, user_role: str) -> set[str]:
         """Task ids paused for a held-track review, so the queue shows them as needing a

@@ -2,10 +2,6 @@
 
 Aggregation-on-read: albums are a ``GROUP BY release_group_mbid`` over the file
 table; there is no materialised album table or nightly reconcile.
-
-Inherits safe-default shims from ``LibraryStub`` for the surface not-yet-migrated
-services still call, overriding only the methods it implements for real; the
-inherited shims are temporary bridges that shrink as consumers migrate.
 """
 
 import asyncio
@@ -18,7 +14,6 @@ from pathlib import Path
 
 from infrastructure.msgspec_fastapi import AppStruct
 from models.audio import AudioInfo, AudioTag
-from services.native.stubs import LibraryStub
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +36,9 @@ def _tag_is_compilation(tag: AudioTag) -> bool:
     return bool(tag.compilation or tag.album_artist == "Various Artists")
 
 
-_AUDIO_SUFFIXES = {".flac", ".mp3", ".m4a", ".m4b", ".mp4", ".ogg", ".oga", ".opus", ".wav"}
+from infrastructure.audio.metadata_engine import AUDIO_SUFFIXES
+
+_AUDIO_SUFFIXES = AUDIO_SUFFIXES  # F-NL-03: shared admitted set
 # files imported within this window are protected from a reconcile race with the
 # orchestrator that may have just moved them
 _DOWNLOAD_PROTECT_WINDOW_SECONDS = 300.0
@@ -175,9 +172,8 @@ class LibraryAlbumStatus(AppStruct):
     orphans: list[LibraryTrack] = []
 
 
-class LibraryManager(LibraryStub):
+class LibraryManager:
     def __init__(self, library_db) -> None:  # noqa: ANN001 - LibraryDB, avoid import cycle
-        super().__init__()
         self._db = library_db
         # serialises read-modify-write so concurrent async tasks can't interleave
         # between SELECT and write. lock ordering: async lock → to_thread() →
@@ -186,9 +182,6 @@ class LibraryManager(LibraryStub):
 
     def is_configured(self) -> bool:
         return True  # always available; data may be empty
-
-    # is_library_empty() stays the inherited sync stub: the protocol method is sync
-    # so it can't await the DB
 
     async def has_album(self, mbid: str) -> bool:
         return await self._db.has_album_files(mbid)
@@ -200,7 +193,14 @@ class LibraryManager(LibraryStub):
         from services.native.quality_tiers import tier_for, tier_rank
 
         rows = await self._db.get_library_files_for_album(release_group_mbid)
-        tiers = [tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows]
+        tiers = [
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
+        ]
         return min(tiers, key=tier_rank) if tiers else None
 
     async def list_cutoff_unmet(self, cutoff: str) -> list[dict]:
@@ -222,7 +222,14 @@ class LibraryManager(LibraryStub):
         from services.native.quality_tiers import tier_for, tier_rank
 
         rows = await self._db.get_library_files_for_recording(recording_mbid)
-        tiers = [tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows]
+        tiers = [
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
+        ]
         return max(tiers, key=tier_rank) if tiers else None
 
     async def has_track(self, recording_mbid: str) -> bool:
@@ -236,7 +243,7 @@ class LibraryManager(LibraryStub):
     async def get_library_mbids(self, include_release_ids: bool = True) -> set[str]:
         """Release-group (and optionally release) MBIDs in the native library.
 
-        Overrides the empty ``LibraryStub`` so the /library/mbids set, artist
+        Real native implementation so the /library/mbids set, artist
         discography in_library flags, and the request-completion check all reflect
         native imports written to ``library_files``."""
         return await self._db.get_library_mbids(include_release_ids=include_release_ids)
@@ -402,7 +409,9 @@ class LibraryManager(LibraryStub):
 
         tracks = await self.get_tracks(release_group_mbid)
         for track in tracks:
-            track.current_tier = tier_for(track.file_format or "", track.bit_rate)
+            track.current_tier = tier_for(
+                track.file_format or "", track.bit_rate, track.bit_depth
+            )
             track.below_cutoff = (
                 upgrade_allowed
                 and quality_cutoff is not None

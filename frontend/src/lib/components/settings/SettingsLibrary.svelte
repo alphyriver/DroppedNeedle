@@ -22,6 +22,7 @@
 	import LibraryScanScheduleControl from '$lib/components/library/LibraryScanScheduleControl.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
+	import { withBasePath } from '$lib/utils/basePath';
 	import type {
 		LibraryRootSettings,
 		TargetLibrarySettingsResponse,
@@ -362,7 +363,10 @@
 					<p class="text-xs text-base-content/60">
 						Fallback for downloaded imports that file organization does not handle. Once
 						organization is enabled, its assigned profile controls managed paths. Variables:
-						{'{albumartist} {album} {year} {disc} {track} {title} {ext}'}.
+						{'{initial} {albumartist} {album} {year} {disc} {track} {title} {ext}'}.
+						{'{initial}'} uses the effective album artist, ignores leading Unicode whitespace and a case-insensitive
+						"The" plus following Unicode whitespace, then returns one uppercase letter; empty or nonletter
+						leads return "#".
 					</p>
 					<input
 						class="input input-bordered w-full bg-base-100 font-mono text-sm"
@@ -494,7 +498,9 @@
 						workspace under the Automation tab.
 					</p>
 				</div>
-				<a href="/library/management?tab=automation" class="btn management-btn btn-sm"
+				<a
+					href={withBasePath('/library/management?tab=automation')}
+					class="btn management-btn btn-sm"
 					>Open Organize files settings <ArrowRight class="h-4 w-4" /></a
 				>
 			</section>

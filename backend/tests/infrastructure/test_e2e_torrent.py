@@ -26,6 +26,7 @@ import httpx
 import pytest
 from mutagen.flac import FLAC
 
+from api.v1.schemas.settings import DownloadPolicySettings
 from infrastructure.audio.tagger import AudioTagger
 from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.persistence.library_db import LibraryDB
@@ -254,14 +255,19 @@ def _build(tmp_path: Path, *, album_tracks, qbt: _FakeQbtServer,
         client=_EmptySlskdIndexer(),  # placeholder; download-side not used for torrent
         indexer=_EmptySlskdIndexer(),
         download_store=store, file_processor=fp, library_manager=manager,
-        scorer=AlbumPreflightScorer(store, quality_min="low", flac_mp3_only=False),
-        track_matcher=TrackMatcher(store, quality_min="low", flac_mp3_only=False),
+        scorer=AlbumPreflightScorer(store),
+        track_matcher=TrackMatcher(store),
         manifest_codec=ManifestCodec(), event_bus=SSEPublisher(), staging_path=staging,
         naming_template=_TEMPLATE, poll_interval=0.0, auto_accept_threshold=0.5, manual_threshold=0.1,
         torrent_indexer=indexer, torrent_client=qbt_dl,
-        torrent_scorer=TorrentReleaseScorer(store, quality_min="low", flac_mp3_only=False),
+        torrent_scorer=TorrentReleaseScorer(store),
         torrent_enabled=True, album_service=_album_service(album_tracks),
         source_priority=["soulseek", "torrent"], usenet_import_settle_seconds=0.0,
+        # The scorers read quality from a task-derived snapshot; a permissive
+        # global policy replaces the pre-snapshot constructor kwargs.
+        get_download_policy=lambda: DownloadPolicySettings(
+            quality_min="low", flac_mp3_only=False
+        ),
     )
     return store, manager, orch, prowlarr, library, mount
 

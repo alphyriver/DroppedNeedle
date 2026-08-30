@@ -51,10 +51,82 @@ def test_track_without_format_spec_is_unpadded(engine):
     assert result == Path("7")
 
 
-def test_year_empty_when_none(engine):
+def test_year_empty_when_none_leaves_no_bracket_litter(engine):
+    # An empty variable must not leave its template decoration behind:
+    # "{album} ({year})" with no year renders "OK Computer", not "OK Computer ()".
     result = engine.format_path("{album} ({year})", _tag(year=None), "flac")
-    assert result == Path("OK Computer ()")
+    assert result == Path("OK Computer")
 
+
+def test_default_template_without_year_has_no_empty_parens(engine):
+    result = engine.format_path(engine.DEFAULT, _tag(year=None), "flac")
+    assert result == Path("Radiohead/OK Computer/0101 Airbag.flac")
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("{album} [{year}]", Path("OK Computer")),
+        ("{album} {{year}}", Path("OK Computer")),
+    ],
+)
+def test_empty_template_groups_drop_only_their_decoration(engine, template, expected):
+    result = engine.format_path(template, _tag(year=None), "flac")
+    assert result == expected
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("{album} [({year})]", Path("OK Computer [()]")),
+        ("{album} {{{year}}}", Path("OK Computer {{}}")),
+        ("{album} ([{year}])", Path("OK Computer ([])")),
+    ],
+)
+def test_empty_nested_template_groups_keep_their_decoration(engine, template, expected):
+    result = engine.format_path(template, _tag(year=None), "flac")
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("{album} ({year})", Path("OK Computer (1997)")),
+        ("{album} [{year}]", Path("OK Computer [1997]")),
+        ("{album} {{year}}", Path("OK Computer {1997}")),
+    ],
+)
+def test_populated_template_groups_keep_their_decoration(engine, template, expected):
+    result = engine.format_path(template, _tag(year=1997), "flac")
+    assert result == expected
+
+
+def test_tag_value_brackets_are_not_template_decorations(engine):
+    result = engine.format_path("{title}", _tag(title="Song []"), "flac")
+    assert result == Path("Song []")
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("{album} (Deluxe {year})", Path("OK Computer (Deluxe )")),
+        ("{album} ({year}]", Path("OK Computer (]")),
+        ("{album} {}", Path("OK Computer {}")),
+    ],
+)
+def test_nonempty_or_malformed_groups_are_preserved(engine, template, expected):
+    result = engine.format_path(template, _tag(year=None), "flac")
+    assert result == expected
+
+
+def test_large_whitespace_tag_value_stays_bounded_by_normalization(engine):
+    result = engine.format_path("{title}", _tag(title=(" " * 10_000) + ("A" * 300)), "flac")
+    assert len(result.parts[-1].encode("utf-8")) == 252
+
+
+def test_year_present_keeps_its_brackets(engine):
+    # Only EMPTY groups are collapsed - a populated year renders as before.
+    result = engine.format_path("{album} ({year})", _tag(year=1997), "flac")
+    assert result == Path("OK Computer (1997)")
 
 def test_unknown_variable_renders_empty(engine):
     result = engine.format_path("a{unknown}b", _tag(), "flac")
@@ -69,6 +141,73 @@ def test_musicbrainz_id_and_artist_mbid_variables(engine):
 def test_genre_variable(engine):
     result = engine.format_path("{genre}", _tag(genre="Jazz"), "flac")
     assert result == Path("Jazz")
+
+@pytest.mark.parametrize(
+    ("album_artist", "artist", "expected"),
+    [
+        ("Radiohead", "Fallback", "R"),
+        (" The National ", "Fallback", "N"),
+        ("\t tHe\u2003National\u00a0", "Fallback", "N"),
+        ("The\tNational", "Fallback", "N"),
+        ("The  Doors", "Fallback", "D"),
+        ("the xx", "Fallback", "X"),
+        ("t0ni", "Fallback", "T"),
+        ("2 Chainz", "Fallback", "#"),
+        ("_m0lly", "Fallback", "#"),
+        ("Öxxö Xööx", "Fallback", "Ö"),
+        ("高橋洋子", "Fallback", "高"),
+        ("The", "Fallback", "T"),
+        ("\u0301Radiohead", "Fallback", "#"),
+        ("ßeta", "Fallback", "S"),
+        ("ﬃn", "Fallback", "F"),
+        (None, "The National", "N"),
+        ("", "Radiohead", "R"),
+        ("  ", "Radiohead", "#"),
+        (None, "", "#"),
+    ],
+)
+def test_initial_variable_uses_exact_artist_bucket(
+    engine, album_artist, artist, expected
+):
+    result = engine.format_path(
+        "{initial}",
+        _tag(album_artist=album_artist, artist=artist),
+        "flac",
+    )
+
+    assert result == Path(expected)
+    assert len(result.name) == 1
+
+
+def test_initial_composes_nfd_artist_before_selecting_the_bucket(engine):
+    composed = "Éclair"
+    decomposed = unicodedata.normalize("NFD", composed)
+
+    composed_result = engine.format_path(
+        "{initial}", _tag(album_artist=composed), "flac"
+    )
+    decomposed_result = engine.format_path(
+        "{initial}", _tag(album_artist=decomposed), "flac"
+    )
+
+    assert composed_result == decomposed_result == Path("É")
+
+
+def test_initial_keeps_legacy_paths_relative_when_artist_is_traversal_text(engine):
+    result = engine.format_path(
+        "{initial}/{albumartist}/{title}.{ext}",
+        _tag(album_artist="../escape"),
+        "flac",
+    )
+
+    assert result == Path("#/_escape/Airbag.flac")
+    assert not result.is_absolute()
+    assert ".." not in result.parts
+
+
+def test_validate_template_accepts_initial(engine):
+    assert engine.validate_template("{initial}/{albumartist}/{album}.{ext}") == []
+
 
 
 def test_medium_variable_is_empty(engine):

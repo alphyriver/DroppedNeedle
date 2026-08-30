@@ -338,10 +338,21 @@ async def test_automatic_import_holds_stale_activation_and_unmapped_files(
     preferences.save_library_management_settings_if_current(
         settings, expected_settings_revision=current.settings_revision
     )
+    # F-NL-01: an unmapped file is now imported unmanaged by default instead
+    # of holding the unit. A MAPPED file that lost its accepted mapping must
+    # still hold with TRACK_NOT_MAPPED - the identity gate stays at the
+    # managed-request boundary.
+    unmanaged = await service.prepare(
+        _bundle(tmp_path, source, policy_revision, authoritative=False)
+    )
+    assert all(value.pinned_profile is None for value in unmanaged.files)
+
+    mapped_bundle = _bundle(tmp_path, source, policy_revision)
+    broken = msgspec.structs.replace(
+        mapped_bundle.files[0], release_track_mbid=None
+    )
     with pytest.raises(AutomaticManagementHoldError) as unmapped:
-        await service.prepare(
-            _bundle(tmp_path, source, policy_revision, authoritative=False)
-        )
+        await service.prepare(msgspec.structs.replace(mapped_bundle, files=(broken,)))
     assert unmapped.value.reason_code == TRACK_NOT_MAPPED
 
 
@@ -529,6 +540,26 @@ async def test_required_replaygain_failure_holds_automatic_unit(
 
 
 @pytest.mark.asyncio
+async def test_optional_replaygain_failure_defers_and_continues(tmp_path: Path) -> None:
+    _root, source, preferences, store, _settings, policy_revision = _configured(tmp_path)
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID)
+    profile.enrichment.replaygain.enabled = True
+    profile.enrichment.replaygain.mode = "replace"
+    profile.enrichment.replaygain.required = False
+    preferences.save_library_management_settings_if_current(settings, expected_settings_revision=current.settings_revision)
+    _activate(preferences, policy_revision)
+    replaygain = AsyncMock()
+    replaygain.analyze.return_value = ReplayGainAnalysis(status="deferred", reason="Analyzer unavailable.")
+    service, _planner_value = _service(tmp_path, preferences, store, replaygain=replaygain)
+    prepared = await service.prepare(_bundle(tmp_path, source, policy_revision))
+    # Optional failure must not hold, but publish with deferred enrichment
+    assert prepared is not None
+    replaygain.analyze.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_automatic_import_holds_before_staging_when_capacity_is_insufficient(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -547,3 +578,112 @@ async def test_automatic_import_holds_before_staging_when_capacity_is_insufficie
         await service.prepare(_bundle(tmp_path, source, policy_revision))
 
     assert held.value.reason_code == INSUFFICIENT_SPACE
+
+
+@pytest.mark.asyncio
+async def test_mixed_mapped_plus_bonus_bundle_publishes_bonus_unmanaged(
+    tmp_path: Path,
+) -> None:
+    """F-NL-01: a confirmed automatic drop unit with one mapped file and one
+    unmapped bonus file pins only the mapped file; the bonus stays unpinned
+    (unmanaged) and the unit no longer holds with TRACK_NOT_MAPPED."""
+    _root, source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _activate(preferences, policy_revision, drop_imports=True)
+    service, _planner_value = _service(tmp_path, preferences, store)
+
+    mapped = _bundle(tmp_path, source, policy_revision, origin="drop_import").files[0]
+    bonus = msgspec.structs.replace(
+        mapped,
+        ordinal=1,
+        input_path=str(tmp_path / "incoming-bonus.flac"),
+        destination_relative_path="Incoming/Bonus.flac",
+        release_group_mbid=None,
+        release_mbid=None,
+        recording_mbid=None,
+        release_track_mbid=None,
+        medium_position=None,
+        release_track_position=None,
+        authoritative_mapping=False,
+        confidence=0.5,
+    )
+    shutil.copy2(source, tmp_path / "incoming-bonus.flac")
+
+    prepared = await service.prepare(
+        LibraryManagementImportBundle(
+            idempotency_key="drop-import:mixed-bonus",
+            origin="drop_import",
+            policy_revision=policy_revision,
+            files=(mapped, bonus),
+        )
+    )
+
+    by_ordinal = {value.ordinal: value for value in prepared.files}
+    assert by_ordinal[0].pinned_profile is not None
+    assert by_ordinal[0].authoritative_mapping is True
+    # The bonus file publishes unmanaged through the same staged bundle.
+    assert by_ordinal[1].pinned_profile is None
+    assert by_ordinal[1].authoritative_mapping is False
+    assert by_ordinal[1].release_track_mbid is None
+
+
+@pytest.mark.asyncio
+async def test_automatic_import_fallback_keeps_braced_destination_literal(
+    tmp_path: Path,
+) -> None:
+    """F-075 parity: the automatic lane's default artwork fallback must treat
+    the composed path literally so brace-bearing album directories survive."""
+    import msgspec
+
+    root, source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.artwork.embedded_enabled = False
+    profile.artwork.external_enabled = True
+    preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+    _activate(preferences, policy_revision)
+    service, _planner_value = _service(tmp_path, preferences, store)
+    artwork = b"braced destination artwork"
+    service._artwork.project = AsyncMock(
+        return_value=ArtworkProjection(
+            external=(
+                ArtworkOutput(
+                    output_kind="external",
+                    image_type="front",
+                    content=artwork,
+                    mime_type="image/jpeg",
+                    format="jpeg",
+                    width=800,
+                    height=800,
+                    byte_size=len(artwork),
+                    sha256=hashlib.sha256(artwork).hexdigest(),
+                    source="cover_art_archive_release",
+                    source_candidate_id="exact-release-front",
+                    source_is_exact_release=True,
+                ),
+            )
+        )
+    )
+    # brace the canonical album title so the rendered album directory itself
+    # contains braces (the fallback parent derives from that rendered path)
+    _service_planner = _planner_value
+    release = _service_planner._canonical._musicbrainz.get_canonical_release.return_value
+    braced = copy.deepcopy(release)
+    braced.title = "Live {2020}"
+    _service_planner._canonical._musicbrainz.get_canonical_release.return_value = braced
+
+    bundle = _bundle(tmp_path, source, policy_revision)
+
+    prepared = await service.prepare(bundle)
+
+    artifact = prepared.files[0].artifacts[0]
+    assert "Live {2020}" in artifact.destination_relative_path
+    assert artifact.destination_relative_path.endswith("cover.jpg")

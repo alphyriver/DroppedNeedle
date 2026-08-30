@@ -16,11 +16,11 @@
 			which is tried first, and tune the shared policy.
 		</p>
 	</div>
-	<SettingsDownloadPolicy />
-	<SettingsWanted />
-	<SettingsSourcePriority />
 	<SettingsDownloadClient />
 	<SettingsSabnzbd />
 	<SettingsQbittorrent />
+	<SettingsSourcePriority />
+	<SettingsDownloadPolicy />
+	<SettingsWanted />
 	<SettingsOnboardingChecklist />
 </div>

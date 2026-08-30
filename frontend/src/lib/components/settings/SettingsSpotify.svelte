@@ -1,6 +1,9 @@
 <script lang="ts">
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { api } from '$lib/api/client';
+	import { API } from '$lib/constants';
 	import type { SpotifySettings } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
 	import { Copy, ExternalLink } from 'lucide-svelte';
 	import { onMount, onDestroy } from 'svelte';
@@ -21,8 +24,8 @@
 	}
 
 	const form = createSettingsForm<SpotifySettings>({
-		loadEndpoint: '/api/v1/settings/spotify',
-		saveEndpoint: '/api/v1/settings/spotify'
+		loadEndpoint: API.settingsSpotify(),
+		saveEndpoint: API.settingsSpotify()
 	});
 
 	let showSecret = $state(false);
@@ -30,12 +33,13 @@
 	onMount(async () => {
 		form.load();
 		try {
-			const data = await api.global.get<{ redirect_uri: string }>(
-				'/api/v1/settings/spotify/redirect-uri'
-			);
+			const data = await api.global.get<{ redirect_uri: string }>(API.settingsSpotifyRedirectUri());
 			redirectUri = data.redirect_uri;
 		} catch {
-			redirectUri = `${window.location.origin}/api/v1/me/connections/spotify/auth/callback`;
+			redirectUri = new URL(
+				getApiUrl('/api/v1/me/connections/spotify/auth/callback'),
+				window.location.origin
+			).toString();
 		}
 	});
 	onDestroy(() => form.cleanup());
@@ -62,7 +66,8 @@
 		<div class="rounded-xl border border-info/20 bg-info/5 p-3 text-sm text-base-content/70">
 			These are the shared app credentials for one registered Spotify application. Each user links
 			<span class="font-medium">their own</span> Spotify account from their
-			<a href="/profile" class="link link-primary">profile</a> to import their personal playlists.
+			<a href={withBasePath('/profile')} class="link link-primary">profile</a> to import their personal
+			playlists.
 		</div>
 
 		<div class="rounded-xl border border-warning/20 bg-warning/5 p-3 text-sm text-base-content/70">
@@ -122,6 +127,25 @@
 						{showSecret ? 'Hide' : 'Show'}
 					</button>
 				</div>
+			</label>
+
+			<label class="form-control w-full">
+				<span
+					class="label-text mb-1 text-xs font-semibold uppercase tracking-wider text-base-content/50"
+				>
+					Redirect Origin <span class="normal-case font-normal">(optional)</span>
+				</span>
+				<input
+					type="text"
+					class="input input-soft w-full"
+					bind:value={form.data.spotify_redirect_origin}
+					placeholder="https://music.example.com"
+					autocomplete="off"
+				/>
+				<p class="mt-1 text-xs text-base-content/50">
+					Origin (no path) used to build the redirect URI below. Leave empty to derive it from the
+					incoming request address - set this when a reverse proxy makes that resolve to localhost.
+				</p>
 			</label>
 
 			<label class="flex cursor-pointer items-center gap-3">

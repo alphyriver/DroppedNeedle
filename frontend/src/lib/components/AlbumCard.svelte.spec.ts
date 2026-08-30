@@ -4,6 +4,12 @@ import { render } from 'vitest-browser-svelte';
 import AlbumCard from './AlbumCard.svelte';
 import type { Album, EnrichmentSource } from '$lib/types';
 
+// Stub the album-request mutation factory so the card renders without a QueryClientProvider
+// (same approach as the TopPicksDeck spec).
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	requestAlbum: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
+
 const baseAlbum: Album = {
 	title: 'OK Computer',
 	artist: 'Radiohead',
@@ -94,11 +100,13 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('requests optional enrichment on pointer intent', async () => {
-		expect.assertions(1);
+		expect.assertions(2);
 		const onenrichmentrequest = vi.fn();
 		renderComponent({ onenrichmentrequest });
 
-		await page.getByRole('link', { name: 'Open OK Computer' }).hover();
+		const link = page.getByRole('link', { name: 'Open OK Computer' });
+		await expect.element(link).toBeInTheDocument();
+		link.element().dispatchEvent(new PointerEvent('pointerenter'));
 
 		expect(onenrichmentrequest).toHaveBeenCalledTimes(1);
 	});

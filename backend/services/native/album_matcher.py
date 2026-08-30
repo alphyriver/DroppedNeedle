@@ -9,7 +9,10 @@ from rapidfuzz.distance import Levenshtein
 
 from infrastructure.msgspec_fastapi import AppStruct
 from infrastructure.queue.priority_queue import RequestPriority
-from repositories.musicbrainz_base import extract_artist_name
+from repositories.musicbrainz_base import (
+    extract_artist_name,
+    select_edition,
+)
 from services.native.musicbrainz_matcher import MusicBrainzMatcher
 
 if TYPE_CHECKING:
@@ -20,6 +23,13 @@ logger = logging.getLogger(__name__)
 ALBUM_ACCEPT_THRESHOLD = 0.20
 MIN_MAPPED_FRACTION = 0.6
 ARTIST_ACCEPT_FLOOR = 0.6
+
+# Winner-margin floor between the two best ACCEPTED candidates in identify(): a gap
+# smaller than this means a silent min-distance pick is a coin flip, so the matcher
+# reports unresolved (None) and the drop importer routes the folder to review. Mirrors
+# the native scan lane's CANDIDATE_MARGIN_FLOOR (album_evidence_engine.py). Owner
+# sign-off: EditionsEtc S-4, .dev-notes/EditionsEtc/PLAN.md §2 Phase 3 / §3.
+WINNER_MARGIN_FLOOR = 0.05
 
 _WEIGHTS = {
     "artist": 3.0,
@@ -346,7 +356,8 @@ class AlbumIdentifier:
     async def identify(
         self, locals_: list[LocalTrack], *, seed_release_groups: list[str] | None = None
     ) -> AlbumMatch | None:
-        """Identify a folder's release, or None if nothing clears the gate.
+        """Identify a folder's release, or None if nothing clears the gate or the
+        best two accepted candidates sit closer together than ``WINNER_MARGIN_FLOOR``.
 
         ``seed_release_groups`` are scored first and unconditionally: the scanner passes
         the release groups its AUDIO FINGERPRINTS resolved to, so a folder whose tags are
@@ -357,7 +368,9 @@ class AlbumIdentifier:
             return None
         target_count = len(locals_)
         rg_ids = await self._candidate_release_groups(locals_, seed_release_groups)
-        best: AlbumMatch | None = None
+        # Score every candidate before deciding: breaking early on a 0.0-distance hit
+        # could hide a runner-up inside the margin floor.
+        accepted: list[AlbumMatch] = []
         for rg_id in rg_ids:
             release = await self._best_release(rg_id, target_count)
             if release is None:
@@ -369,13 +382,21 @@ class AlbumIdentifier:
             # Choose among ACCEPTED candidates only, by ranking distance (which now favours
             # a studio Album over a compilation/live for the same recordings). This stops a
             # type-preferred-but-poorly-matching album from shadowing a well-matching one.
-            if not match.accepted:
-                continue
-            if best is None or match.distance < best.distance:
-                best = match
-            if best.distance == 0.0:
-                break
-        return best
+            if match.accepted:
+                accepted.append(match)
+        if not accepted:
+            return None
+        accepted.sort(key=lambda m: m.distance)  # stable: earlier candidate wins ties
+        if (
+            len(accepted) > 1
+            and accepted[1].distance - accepted[0].distance < WINNER_MARGIN_FLOOR
+        ):
+            # Owner sign-off EditionsEtc S-4 (.dev-notes/EditionsEtc/PLAN.md §2 Phase 3,
+            # §3): between two near-tie accepted candidates a silent min-distance pick
+            # is a coin flip - report unresolved so the drop importer routes the folder
+            # to review, mirroring the native lane's CANDIDATE_MARGIN_FLOOR.
+            return None
+        return accepted[0]
 
     async def release_group_type(
         self, release_group_mbid: str
@@ -517,29 +538,11 @@ class AlbumIdentifier:
             rg_artist_mbid = rg_artist_mbid or resolved_mbid
         is_various = self._is_various(detail, rg_artist_mbid, rg_artist)
 
-        scored: list[tuple[int, int, str, str]] = []
-        fallback_id: str | None = None
-        for rel in detail.get("releases") or []:
-            rel_id = rel.get("id")
-            if not rel_id:
-                continue
-            if fallback_id is None:
-                fallback_id = rel_id
-            count = sum(
-                int(m.get("track-count") or 0) for m in (rel.get("media") or [])
-            )
-            if count <= 0:
-                continue
-            official = 0 if rel.get("status") == "Official" else 1
-            scored.append(
-                (abs(count - target_count), official, rel.get("date") or "9999", rel_id)
-            )
-        if scored:
-            scored.sort()
-            release_id = scored[0][3]
-        elif fallback_id is not None:
-            release_id = fallback_id
-        else:
+        # F-062: shared best-edition policy - identical ranking to the native
+        # identification lane, including the consistent zero-track-count skip
+        # (the old first-listed fallback is what made lanes drift).
+        release_id = select_edition(detail.get("releases") or [], target_count)
+        if release_id is None:
             return None
 
         try:

@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
-import httpx
+import math
+import threading
 import time
 from typing import Any, Awaitable, Callable
+
+import httpx
 
 import msgspec
 from core.exceptions import (
@@ -15,7 +18,11 @@ from infrastructure.cache.cache_keys import (
     listenbrainz_management_genres_key,
 )
 from infrastructure.cache.memory_cache import CacheInterface
-from infrastructure.resilience.retry import with_retry, CircuitBreaker
+from infrastructure.observability.provider_counters import (
+    record_provider_call,
+    record_rate_limit_headers,
+)
+from infrastructure.resilience.retry import CircuitOpenError, CircuitBreaker, with_retry
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from repositories.listenbrainz_models import (
     ListenBrainzArtist,
@@ -38,6 +45,7 @@ from repositories.listenbrainz_models import (
     parse_recommendation_track,
 )
 from models.library_management_genres import GenreCandidate
+from infrastructure.service_health import report_breaker_health
 from repositories.listenbrainz_management_models import (
     LbManagementReleaseGroupMetadata,
 )
@@ -54,18 +62,253 @@ def _record_degradation(msg: str) -> None:
         ctx.record(IntegrationResult.error(source=_SOURCE, msg=msg))
 
 
+_RATE_LIMIT_SAFETY_MARGIN_SECONDS = 0.5
+_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = 2.0
+_RATE_LIMIT_MAX_DELAY_SECONDS = 3600.0
+_RATE_LIMIT_HEALTH_MESSAGE = (
+    "ListenBrainz is temporarily rate-limiting this server. Try again shortly."
+)
+
+
+def _parse_nonnegative_header(headers: Any, name: str) -> float | None:
+    try:
+        value = headers.get(name)
+        if value is None:
+            value = headers.get(name.lower())
+    except Exception:  # noqa: BLE001 - malformed test/provider headers are ignored
+        return None
+    if value is None:
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
 def _parse_retry_after(response: httpx.Response) -> float:
     """Extract retry delay from ListenBrainz 429 response headers."""
+    headers = response.headers
     for header in ("X-RateLimit-Reset-In", "Retry-After"):
-        value = response.headers.get(header)
-        if value is not None:
-            try:
-                seconds = float(value)
-                if seconds > 0:
-                    return min(seconds, 10.0)
-            except (TypeError, ValueError):
-                continue
-    return 2.0
+        seconds = _parse_nonnegative_header(headers, header)
+        if seconds is not None and seconds > 0:
+            return min(seconds, _RATE_LIMIT_MAX_DELAY_SECONDS)
+    return _RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+
+
+def _mark_rate_limit_degraded(ttl_seconds: float) -> None:
+    from infrastructure.service_health import service_health
+
+    service_health.mark_degraded(
+        "listenbrainz",
+        "rate limit",
+        message=_RATE_LIMIT_HEALTH_MESSAGE,
+        severity="degraded",
+        ttl_seconds=max(1.0, ttl_seconds + _RATE_LIMIT_SAFETY_MARGIN_SECONDS),
+    )
+
+
+def _heal_rate_limit() -> None:
+    from infrastructure.service_health import service_health
+
+    service_health.heal("listenbrainz", "rate limit")
+
+
+class _ListenBrainzRateLimitState:
+    """Process-global response-window reservation and cooldown state."""
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._lock = threading.Lock()
+        self._clock = clock or (lambda: time.monotonic())
+        self._window_reset_at: float | None = None
+        self._remaining: float | None = None
+        self._cooldown_until = 0.0
+        self._unknown_in_flight = 0
+
+    def _release_unknown_locked(self) -> None:
+        if self._unknown_in_flight > 0:
+            self._unknown_in_flight -= 1
+
+    def _reserve_with_tracking(self) -> tuple[float | None, bool]:
+        """Reserve an upstream slot and report whether its window is unknown."""
+        now = self._clock()
+        with self._lock:
+            self._expire_locked(now)
+            blocked_delay = self._blocked_delay_locked(now)
+            if blocked_delay is not None:
+                return blocked_delay, False
+            if self._remaining is None:
+                self._unknown_in_flight += 1
+                return None, True
+            self._remaining = max(0.0, self._remaining - 1.0)
+            return None, False
+
+    def _expire_locked(self, now: float) -> None:
+        cooldown_expired = False
+        if self._cooldown_until and self._cooldown_until <= now:
+            self._cooldown_until = 0.0
+            cooldown_expired = True
+
+        window_expired = (
+            self._window_reset_at is not None and self._window_reset_at <= now
+        )
+        if window_expired:
+            self._window_reset_at = None
+            self._remaining = None
+        elif cooldown_expired and self._window_reset_at is None:
+            # A fallback cooldown without a known upstream window has no
+            # remaining budget to carry into the next admission.
+            self._remaining = None
+
+        if cooldown_expired and (
+            window_expired
+            or self._window_reset_at is None
+            or (self._remaining is not None and self._remaining > 0)
+        ):
+            _heal_rate_limit()
+
+    def _activate_cooldown_locked(self, now: float, seconds: float) -> None:
+        if not math.isfinite(seconds) or seconds < 0:
+            seconds = _RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+        seconds = min(seconds, _RATE_LIMIT_MAX_DELAY_SECONDS)
+        until = now + seconds + _RATE_LIMIT_SAFETY_MARGIN_SECONDS
+        if until > self._cooldown_until:
+            self._cooldown_until = until
+            _mark_rate_limit_degraded(until - now)
+
+    def _reset_delay_locked(self, now: float) -> float:
+        return max(
+            0.0,
+            self._window_reset_at - now
+            if self._window_reset_at is not None
+            else _RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS,
+        )
+
+    def _blocked_delay_locked(self, now: float) -> float | None:
+        if self._cooldown_until > now:
+            return self._cooldown_until - now
+        if self._remaining is None or self._remaining > 0:
+            return None
+        self._activate_cooldown_locked(now, self._reset_delay_locked(now))
+        return max(self._cooldown_until - now, _RATE_LIMIT_SAFETY_MARGIN_SECONDS)
+
+    def admission_delay(self) -> float | None:
+        """Return a retry delay before pacing if the upstream window is exhausted."""
+        now = self._clock()
+        with self._lock:
+            self._expire_locked(now)
+            return self._blocked_delay_locked(now)
+
+    def reserve(self) -> float | None:
+        """Reserve an upstream slot, returning a safe retry delay if blocked."""
+        blocked_delay, _unknown = self._reserve_with_tracking()
+        return blocked_delay
+
+    def release_unknown(self) -> None:
+        """Release an unknown-window reservation after a transport failure."""
+        with self._lock:
+            self._release_unknown_locked()
+
+    def observe(self, headers: Any, reservation_unknown: bool | None = None) -> None:
+        """Merge a response's finite window headers conservatively.
+
+        A response completes its own unknown-window reservation before the
+        observed budget is merged.  Other unknown requests remain reserved so
+        the first learned budget cannot be double-consumed.
+        """
+        remaining = _parse_nonnegative_header(headers, "X-RateLimit-Remaining")
+        reset_in = _parse_nonnegative_header(headers, "X-RateLimit-Reset-In")
+        if reset_in is not None and reset_in <= 0:
+            reset_in = None
+
+        now = self._clock()
+        with self._lock:
+            self._expire_locked(now)
+            if reservation_unknown is None:
+                reservation_unknown = self._unknown_in_flight > 0
+            if reservation_unknown:
+                self._release_unknown_locked()
+            if remaining is None:
+                return
+
+            candidate_reset_at = (
+                now + min(reset_in, _RATE_LIMIT_MAX_DELAY_SECONDS)
+                if reset_in is not None
+                else None
+            )
+
+            if candidate_reset_at is not None:
+                if self._window_reset_at is None:
+                    self._window_reset_at = candidate_reset_at
+                else:
+                    # Never let a delayed response from an older window shorten the
+                    # active reset deadline.
+                    self._window_reset_at = max(
+                        self._window_reset_at, candidate_reset_at
+                    )
+
+            # Unknown requests are conservatively treated as consuming slots until
+            # their own response or transport failure settles them.
+            adjusted_remaining = max(0.0, remaining - self._unknown_in_flight)
+            if self._remaining is None:
+                self._remaining = adjusted_remaining
+            else:
+                # Retain local reservations as well as the lowest observed budget;
+                # an incomplete earlier header must not regain slots later.
+                self._remaining = min(self._remaining, adjusted_remaining)
+
+            if adjusted_remaining <= 0:
+                reset_delay = (
+                    max(0.0, self._window_reset_at - now)
+                    if self._window_reset_at is not None
+                    else _RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+                )
+                self._activate_cooldown_locked(now, reset_delay)
+
+    def activate_cooldown(self, seconds: float) -> float:
+        now = self._clock()
+        with self._lock:
+            self._expire_locked(now)
+            self._activate_cooldown_locked(now, seconds)
+            return max(self._cooldown_until - now, _RATE_LIMIT_SAFETY_MARGIN_SECONDS)
+
+    def cooldown_active(self) -> bool:
+        now = self._clock()
+        with self._lock:
+            self._expire_locked(now)
+            # Use the same admission predicate so retained exhausted windows
+            # re-establish their cooldown and health state before callers gate
+            # work on this exported helper.
+            return self._blocked_delay_locked(now) is not None
+
+    def cooldown_remaining(self) -> float:
+        now = self._clock()
+        with self._lock:
+            self._expire_locked(now)
+            return max(0.0, self._cooldown_until - now)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._window_reset_at = None
+            self._remaining = None
+            self._cooldown_until = 0.0
+            self._unknown_in_flight = 0
+            self._clock = lambda: time.monotonic()
+            _heal_rate_limit()
+
+
+_listenbrainz_rate_limit_state = _ListenBrainzRateLimitState()
+
+
+def listenbrainz_rate_limit_cooldown_active() -> bool:
+    """Return whether the process-wide ListenBrainz cooldown is active."""
+    return _listenbrainz_rate_limit_state.cooldown_active()
+
+
+def _reset_listenbrainz_rate_limit_state() -> None:
+    _listenbrainz_rate_limit_state.reset()
 
 
 # LB popularity outages last hours; a short TTL would expire during any idle gap (no calls
@@ -127,11 +370,63 @@ def _is_upstream_policy_block(response: httpx.Response) -> bool:
     return False
 
 
+class _ListenBrainzAuthenticationError(ExternalServiceError):
+    """Deterministic credential rejection that must never be retried."""
+
+
+class _ListenBrainzValidationOutcome(Exception):
+    """A validator's expected negative status, neutral to retry and breaker state."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"ListenBrainz validation outcome ({status_code})")
+
+
+_MAX_LISTENBRAINZ_TOKEN_LENGTH = 1024
+
+
+def _is_header_safe_listenbrainz_token(token: object) -> bool:
+    if not isinstance(token, str) or not token:
+        return False
+    if len(token) > _MAX_LISTENBRAINZ_TOKEN_LENGTH:
+        return False
+    return all(0x21 <= ord(character) <= 0x7E for character in token)
+
+
+def _listenbrainz_endpoint_category(endpoint: str) -> str:
+    path = endpoint.split("?", 1)[0]
+    categories = (
+        ("/validate-token", "token validation"),
+        ("/popularity/", "popularity"),
+        ("/metadata/", "metadata"),
+        ("/feedback/", "feedback"),
+        ("/submit-listens", "listen submission"),
+        ("/playing-now", "now-playing"),
+        ("/stats/", "statistics"),
+        ("/user/", "user data"),
+    )
+    for marker, category in categories:
+        if marker in path:
+            return category
+    return "request"
+
+
 _listenbrainz_circuit_breaker = CircuitBreaker(
-    failure_threshold=10, success_threshold=2, timeout=60.0, name="listenbrainz"
+    failure_threshold=10,
+    success_threshold=2,
+    timeout=60.0,
+    name="listenbrainz",
+    on_state_change=report_breaker_health(
+        "listenbrainz",
+        "music data",
+        message="ListenBrainz music data is temporarily unavailable.",
+    ),
 )
 
-_listenbrainz_rate_limiter = TokenBucketRateLimiter(rate=5.0, capacity=10)
+# Live edge evidence (2026-08-26): 30 requests/10 seconds. LB's API docs
+# (https://listenbrainz.readthedocs.io/en/latest/users/api/#rate-limiting) make
+# X-RateLimit-* dynamic, so keep the local baseline evenly paced with no burst.
+_listenbrainz_rate_limiter = TokenBucketRateLimiter(rate=2.5, capacity=1)
 _metadata_deduplicator = RequestDeduplicator()
 
 LISTENBRAINZ_API_URL = "https://api.listenbrainz.org"
@@ -160,6 +455,8 @@ class ListenBrainzRepository:
         self._client = http_client
         self._cache = cache
         self._username = username
+        # Keep the configured token separate from any token borrowed for a public
+        # read.  ``require_auth`` must only ever accept this repository's own token.
         self._user_token = user_token
         self._base_url = LISTENBRAINZ_API_URL
         self._request_semaphore = asyncio.Semaphore(2)
@@ -168,10 +465,16 @@ class ListenBrainzRepository:
         # Resolved once, lazily, and NEVER used for require_auth writes.
         self._fallback_token_provider = fallback_token_provider
         self._fallback_resolved = False
+        self._borrowed_read_token: str | None = None
+        self._fallback_token_lock = asyncio.Lock()
+        self._fallback_generation = 0
 
     def configure(self, username: str, user_token: str = "") -> None:
         self._username = username
         self._user_token = user_token
+        self._fallback_generation += 1
+        self._fallback_resolved = False
+        self._borrowed_read_token = None
 
     async def _ensure_read_token(self) -> None:
         if (
@@ -180,13 +483,29 @@ class ListenBrainzRepository:
             or self._fallback_resolved
         ):
             return
-        self._fallback_resolved = True
-        try:
-            token = await self._fallback_token_provider()
-        except Exception:  # noqa: BLE001 - a missing borrowed token just means anonymous
-            token = None
-        if token:
-            self._user_token = token
+
+        while True:
+            generation = self._fallback_generation
+            async with self._fallback_token_lock:
+                if (
+                    self._user_token
+                    or self._fallback_token_provider is None
+                    or self._fallback_resolved
+                ):
+                    return
+                try:
+                    token = await self._fallback_token_provider()
+                except Exception:  # noqa: BLE001 - a missing borrowed token means anonymous
+                    token = None
+                if generation != self._fallback_generation:
+                    # A synchronous configure() replaced the credentials while the
+                    # provider was running; never publish its stale result.
+                    continue
+                self._borrowed_read_token = token if token else None
+                # Publish only after the provider call has completed.  A provider
+                # failure is a completed anonymous resolution, not a leaked race.
+                self._fallback_resolved = True
+                return
 
     @staticmethod
     def reset_circuit_breaker() -> None:
@@ -197,17 +516,48 @@ class ListenBrainzRepository:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        if self._user_token:
-            headers["Authorization"] = f"Token {self._user_token}"
+        token = self._user_token or self._borrowed_read_token
+        if token:
+            if not _is_header_safe_listenbrainz_token(token):
+                raise _ListenBrainzAuthenticationError(
+                    "ListenBrainz credentials rejected"
+                )
+            headers["Authorization"] = f"Token {token}"
         return headers
+
+    def _require_own_token(self) -> None:
+        if not self._user_token:
+            raise _ListenBrainzAuthenticationError(
+                "ListenBrainz user token required for this request"
+            )
+        if not _is_header_safe_listenbrainz_token(self._user_token):
+            raise _ListenBrainzAuthenticationError("ListenBrainz credentials rejected")
+
+    def _validate_read_token(self) -> None:
+        token = self._user_token or self._borrowed_read_token
+        if token and not _is_header_safe_listenbrainz_token(token):
+            raise _ListenBrainzAuthenticationError("ListenBrainz credentials rejected")
 
     @with_retry(
         max_attempts=3,
         base_delay=1.0,
         max_delay=3.0,
         circuit_breaker=_listenbrainz_circuit_breaker,
-        retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
-        non_breaking_exceptions=(RateLimitedError,),
+        retriable_exceptions=(
+            httpx.HTTPError,
+            ExternalServiceError,
+            _ListenBrainzValidationOutcome,
+        ),
+        non_breaking_exceptions=(
+            RateLimitedError,
+            _ListenBrainzAuthenticationError,
+            _ListenBrainzValidationOutcome,
+        ),
+        non_retriable_exceptions=(
+            RateLimitedError,
+            _ListenBrainzAuthenticationError,
+            _ListenBrainzValidationOutcome,
+        ),
     )
     async def _request(
         self,
@@ -216,22 +566,48 @@ class ListenBrainzRepository:
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
         require_auth: bool = False,
+        accepted_statuses: tuple[int, ...] = (),
     ) -> Any:
         url = f"{self._base_url}{endpoint}"
 
-        # a borrowed fallback token authenticates public reads only; writes must use
-        # this repo's own (real user) token, never someone else's
-        if not require_auth:
-            await self._ensure_read_token()
+        # Credential preparation belongs to the _get/_post boundaries.  Those
+        # helpers run before this retry/circuit-breaker wrapper is entered, so
+        # malformed read tokens cannot consult or affect breaker state.
+        if require_auth:
+            # Keep this as a defensive guard for any future internal caller;
+            # normal require_auth calls are already rejected by their boundary.
+            self._require_own_token()
 
-        if require_auth and not self._user_token:
-            raise ExternalServiceError(
-                "ListenBrainz user token required for this request"
+        # A borrowed fallback token authenticates public reads only; writes must
+        # use this repo's own (real user) token, never someone else's.
+        # _get/_post perform the read-token resolution and validation before
+        # entering this decorated method.
+
+        admission_delay = _listenbrainz_rate_limit_state.admission_delay()
+        if admission_delay is not None:
+            raise RateLimitedError(
+                _RATE_LIMIT_HEALTH_MESSAGE,
+                retry_after_seconds=admission_delay,
             )
 
-        await _listenbrainz_rate_limiter.acquire()
-
         async with self._request_semaphore:
+            # Pace only requests that have won a wire-attempt slot.  Waiting for
+            # this semaphore must not consume the capacity-1 pacing token.
+            await _listenbrainz_rate_limiter.acquire()
+
+            # Reserve immediately before the wire attempt.  A request can wait
+            # for this semaphore while another request observes a 429 and opens
+            # the shared cooldown; checking here prevents it from bypassing that
+            # newly activated window.
+            cooldown_remaining, reservation_unknown = (
+                _listenbrainz_rate_limit_state._reserve_with_tracking()
+            )
+            if cooldown_remaining is not None:
+                raise RateLimitedError(
+                    _RATE_LIMIT_HEALTH_MESSAGE,
+                    retry_after_seconds=cooldown_remaining,
+                )
+
             try:
                 response = await self._client.request(
                     method,
@@ -241,36 +617,55 @@ class ListenBrainzRepository:
                     json=json_data,
                     timeout=15.0,
                 )
+                # Complete this request's reservation before merging headers so
+                # only other unknown in-flight requests are subtracted.
+                _listenbrainz_rate_limit_state.observe(
+                    response.headers,
+                    reservation_unknown=reservation_unknown,
+                )
+                reservation_unknown = False
+                record_rate_limit_headers("listenbrainz", response.headers)
 
+                # QW9 Part 3: one increment per wire attempt, classified from
+                # the status; this funnel has no priority lane -> "unlaned"
+                record_provider_call("listenbrainz", None, response.status_code)
                 if response.status_code == 204:
                     return None
 
-                if response.status_code == 404:
-                    return None
-
                 if response.status_code == 429:
-                    retry_after = _parse_retry_after(response)
+                    retry_after = _listenbrainz_rate_limit_state.activate_cooldown(
+                        _parse_retry_after(response)
+                    )
                     raise RateLimitedError(
-                        f"ListenBrainz rate limited ({method} {endpoint})",
-                        response.text,
+                        _RATE_LIMIT_HEALTH_MESSAGE,
                         retry_after_seconds=retry_after,
                     )
 
                 if response.status_code != 200:
+                    # Validators explicitly classify a few deterministic statuses
+                    # as ordinary validation results.  Keep those statuses out of
+                    # retry/breaker handling, even if a provider error body happens
+                    # to contain policy-block wording.
+                    if response.status_code in accepted_statuses:
+                        raise _ListenBrainzValidationOutcome(response.status_code)
                     # deterministic upstream policy blocks (disabled-under-load 500,
-                    # anti-scraper 401): fail fast, outside the retriable set and outside
-                    # ExternalServiceError, so with_retry doesn't storm and the shared LB
-                    # breaker stays closed for endpoints that still work
+                    # anti-scraper 401): fail fast and keep the shared LB breaker
+                    # closed for endpoints that still work
                     if _is_upstream_policy_block(response):
                         _mark_popularity_degraded()
+                        category = _listenbrainz_endpoint_category(endpoint)
                         raise ServiceDisabledUpstreamError(
-                            f"ListenBrainz {method} {endpoint} unavailable upstream "
-                            f"({response.status_code})",
-                            response.text,
+                            f"ListenBrainz {method} {category} endpoint unavailable "
+                            f"upstream ({response.status_code})"
                         )
+                    if response.status_code in (401, 403):
+                        raise _ListenBrainzAuthenticationError(
+                            f"ListenBrainz credentials rejected ({response.status_code})"
+                        )
+                    category = _listenbrainz_endpoint_category(endpoint)
                     raise ExternalServiceError(
-                        f"ListenBrainz {method} failed ({response.status_code})",
-                        response.text,
+                        f"ListenBrainz {method} {category} request failed "
+                        f"({response.status_code})"
                     )
 
                 # a 200 from a popularity endpoint means LB popularity recovered - heal now
@@ -282,26 +677,53 @@ class ListenBrainzRepository:
                     return _decode_json_response(response)
                 except (msgspec.DecodeError, ValueError, TypeError):
                     _record_degradation(
-                        f"ListenBrainz returned invalid JSON for {method} {endpoint}"
+                        f"ListenBrainz returned invalid JSON for {method} "
+                        f"{_listenbrainz_endpoint_category(endpoint)}"
                     )
                     return None
 
-            except httpx.HTTPError as e:
-                raise ExternalServiceError(f"ListenBrainz request failed: {str(e)}")
+            except httpx.HTTPError:
+                record_provider_call("listenbrainz", None, None)
+                category = _listenbrainz_endpoint_category(endpoint)
+                raise ExternalServiceError(
+                    f"ListenBrainz {method} {category} request failed during transport"
+                ) from None
+            finally:
+                if reservation_unknown:
+                    # A transport failure has no response to complete the
+                    # reservation.  Release only its in-flight marker; the
+                    # consumed budget remains conservative because the request
+                    # may have reached ListenBrainz.
+                    _listenbrainz_rate_limit_state.release_unknown()
 
     async def _get(
         self,
         endpoint: str,
         params: dict[str, Any] | None = None,
         require_auth: bool = False,
+        accepted_statuses: tuple[int, ...] = (),
     ) -> Any:
+        if require_auth:
+            self._require_own_token()
+        else:
+            await self._ensure_read_token()
+            self._validate_read_token()
         return await self._request(
-            "GET", endpoint, params=params, require_auth=require_auth
+            "GET",
+            endpoint,
+            params=params,
+            require_auth=require_auth,
+            accepted_statuses=accepted_statuses,
         )
 
     async def _post(
         self, endpoint: str, data: dict[str, Any], require_auth: bool = False
     ) -> Any:
+        if require_auth:
+            self._require_own_token()
+        else:
+            await self._ensure_read_token()
+            self._validate_read_token()
         return await self._request(
             "POST", endpoint, json_data=data, require_auth=require_auth
         )
@@ -312,60 +734,64 @@ class ListenBrainzRepository:
             return False, "No username provided"
 
         try:
-            url = f"{self._base_url}/1/user/{user}/listen-count"
-            response = await self._client.request(
-                "GET",
-                url,
-                headers=self._get_headers(),
-                timeout=10.0,
+            result = await self._get(
+                f"/1/user/{user}/listen-count",
+                accepted_statuses=(404,),
             )
-
-            if response.status_code == 404:
+            if result is None:
                 return False, f"User '{user}' not found"
-
-            if response.status_code != 200:
-                return False, f"Validation failed (HTTP {response.status_code})"
-
-            result = _decode_json_response(response)
-            if result and "payload" in result:
-                count = result.get("payload", {}).get("count", 0)
-                return True, f"User found with {count:,} listens"
+            if isinstance(result, dict) and "payload" in result:
+                payload = result.get("payload")
+                if isinstance(payload, dict):
+                    count = payload.get("count", 0)
+                    return True, f"User found with {count:,} listens"
             return False, "User not found"
+        except _ListenBrainzValidationOutcome:
+            return False, f"User '{user}' not found"
+        except RateLimitedError:
+            return False, _RATE_LIMIT_HEALTH_MESSAGE
+        except CircuitOpenError:
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
+        except _ListenBrainzAuthenticationError:
+            return False, "ListenBrainz could not validate this username."
+        except (ServiceDisabledUpstreamError, ExternalServiceError):
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
         except httpx.TimeoutException:
             return False, "Connection timed out"
         except httpx.ConnectError:
             return False, "Could not connect to ListenBrainz"
-        except Exception as e:  # noqa: BLE001
-            return False, f"Validation failed: {str(e)}"
+        except Exception:  # noqa: BLE001 - validation must not leak provider details
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
 
     async def validate_token(self) -> tuple[bool, str]:
         if not self._user_token:
             return False, "No token provided"
 
         try:
-            url = f"{self._base_url}/1/validate-token"
-            headers = self._get_headers()
-            response = await self._client.request(
-                "GET",
-                url,
-                headers=headers,
-                timeout=10.0,
+            result = await self._get(
+                "/1/validate-token",
+                accepted_statuses=(401, 403),
             )
-
-            if response.status_code != 200:
-                return False, "Token invalid or expired"
-
-            result = _decode_json_response(response)
-            if result and result.get("valid"):
+            if isinstance(result, dict) and result.get("valid"):
                 username = result.get("user_name", self._username)
                 return True, f"Successfully connected as '{username}'"
-            return False, "Token invalid"
+            return False, "Token invalid or expired"
+        except _ListenBrainzValidationOutcome:
+            return False, "Token invalid or expired"
+        except RateLimitedError:
+            return False, _RATE_LIMIT_HEALTH_MESSAGE
+        except CircuitOpenError:
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
+        except _ListenBrainzAuthenticationError:
+            return False, "Token invalid or expired"
+        except (ServiceDisabledUpstreamError, ExternalServiceError):
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
         except httpx.TimeoutException:
             return False, "Connection timed out"
         except httpx.ConnectError:
             return False, "Could not connect to ListenBrainz"
-        except Exception as e:  # noqa: BLE001
-            return False, f"Validation failed: {str(e)}"
+        except Exception:  # noqa: BLE001 - validation must not leak provider details
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
 
     async def get_user_listens(
         self,
@@ -520,6 +946,26 @@ class ListenBrainzRepository:
             for item in result.get("payload", {}).get("recordings", [])
         ]
 
+    async def _stale_chart(self, cache_key: str, label: str) -> list:
+        """QW11 Part 3: breaker-open fallback for chart/stats getters.
+
+        Serves the expired entry past its TTL (peek reads without TTL
+        enforcement) so home/discover render last-known-good rankings instead
+        of empty sections during an LB outage. AGENTS.md Errors rule: a
+        fallback WITHOUT a degradation record is the anti-pattern, so the
+        staleness is always recorded. When no stale entry exists either the
+        original CircuitOpenError propagates - callers keep their current
+        empty-render behavior.
+        """
+        stale = await self._cache.peek(cache_key)
+        if stale:
+            _record_degradation(f"Circuit open: serving stale ListenBrainz {label}")
+            return stale
+        raise CircuitOpenError(
+            f"Circuit breaker 'listenbrainz' is OPEN and no stale data for {label}",
+            breaker_name="listenbrainz",
+        )
+
     async def get_user_genre_activity(
         self, username: str | None = None
     ) -> list[ListenBrainzGenreActivity]:
@@ -532,7 +978,10 @@ class ListenBrainzRepository:
         if cached:
             return cached
 
-        result = await self._get(f"/1/stats/user/{user}/genre-activity")
+        try:
+            result = await self._get(f"/1/stats/user/{user}/genre-activity")
+        except CircuitOpenError:
+            return await self._stale_chart(cache_key, f"user genre activity ({user})")
 
         if not result:
             return []
@@ -564,7 +1013,12 @@ class ListenBrainzRepository:
             return cached
 
         params = {"count": min(count, 100), "offset": offset, "range": range_}
-        result = await self._get("/1/stats/sitewide/artists", params=params)
+        try:
+            result = await self._get("/1/stats/sitewide/artists", params=params)
+        except CircuitOpenError:
+            return await self._stale_chart(
+                cache_key, f"sitewide top artists ({range_})"
+            )
         if not result:
             return []
         artists = [
@@ -586,7 +1040,12 @@ class ListenBrainzRepository:
             return cached
 
         params = {"count": min(count, 100), "offset": offset, "range": range_}
-        result = await self._get("/1/stats/sitewide/release-groups", params=params)
+        try:
+            result = await self._get("/1/stats/sitewide/release-groups", params=params)
+        except CircuitOpenError:
+            return await self._stale_chart(
+                cache_key, f"sitewide top release-groups ({range_})"
+            )
         if not result:
             return []
         groups = [
@@ -609,7 +1068,12 @@ class ListenBrainzRepository:
             return cached
 
         params = {"count": min(count, 100), "offset": offset, "range": range_}
-        result = await self._get("/1/stats/sitewide/recordings", params=params)
+        try:
+            result = await self._get("/1/stats/sitewide/recordings", params=params)
+        except CircuitOpenError:
+            return await self._stale_chart(
+                cache_key, f"sitewide top recordings ({range_})"
+            )
         if not result:
             return []
         recordings = [
@@ -914,27 +1378,78 @@ class ListenBrainzRepository:
     ) -> dict[str, int]:
         """Get listen counts for multiple release groups in a single call.
 
-        Returns a dict mapping mbid -> total_listen_count.
+        B4 Change 2: per-MBID cache-aside in front of the popularity POST.
+        Keys ``{LB_PREFIX}rg_popularity:{mbid}`` join listenbrainz_prefixes()
+        sweeps with zero new wiring. TTL 3600 s mirrors the sibling artist
+        popularity cache; MBIDs absent from a successful response are
+        negative-cached with the house False sentinel at 300 s so obscure
+        release groups don't re-POST on every view.
+
+        Poisoning guards - an outage must never read as "zero listens":
+        nothing is written when lb_popularity_degraded() short-circuits,
+        when the POST raises, or when the response is not a well-formed list.
+        Concurrent identical batches share one leader via
+        _metadata_deduplicator (recording-metadata precedent).
         """
         if not release_group_mbids:
             return {}
+
+        unique_mbids = list(dict.fromkeys(release_group_mbids))
+        keys = {mbid: f"{LB_PREFIX}rg_popularity:{mbid}" for mbid in unique_mbids}
+
+        cached_values = await asyncio.gather(
+            *(self._cache.get(key) for key in keys.values())
+        )
+        counts: dict[str, int] = {}
+        misses: list[str] = []
+        for mbid, cached in zip(unique_mbids, cached_values):
+            if cached is None:
+                misses.append(mbid)
+            elif isinstance(cached, int) and not isinstance(cached, bool):
+                counts[mbid] = cached
+            # False sentinel: known-absent within its short TTL - no value,
+            # and no reason to hit the wire again yet.
+
+        if not misses:
+            return counts
 
         if lb_popularity_degraded():
             _record_degradation("ListenBrainz popularity is temporarily unavailable")
             return {}
 
-        result = await self._post(
-            "/1/popularity/release-group", {"release_group_mbids": release_group_mbids}
+        sorted_misses = sorted(misses)
+        dedupe_key = "listenbrainz:rg-popularity:" + ",".join(sorted_misses)
+        result = await _metadata_deduplicator.dedupe(
+            dedupe_key,
+            lambda: self._post(
+                "/1/popularity/release-group", {"release_group_mbids": sorted_misses}
+            ),
         )
-        if not result or not isinstance(result, list):
-            return {}
+        if result is None or not isinstance(result, list):
+            # Malformed/absent payload = outage signal, never "zero listens":
+            # write nothing. A well-formed empty LIST is legitimate - it
+            # negative-caches all misses below.
+            return counts
 
-        counts: dict[str, int] = {}
+        found: list[str] = []
         for item in result:
             mbid = item.get("release_group_mbid")
             count = item.get("total_listen_count")
             if mbid and count is not None:
                 counts[mbid] = count
+                found.append(mbid)
+
+        await asyncio.gather(
+            *(
+                self._cache.set(keys[mbid], counts[mbid], ttl_seconds=3600)
+                for mbid in found
+            ),
+            *(
+                self._cache.set(keys[mbid], False, ttl_seconds=300)
+                for mbid in sorted_misses
+                if mbid not in counts
+            ),
+        )
         return counts
 
     def is_configured(self) -> bool:
@@ -1004,7 +1519,14 @@ class ListenBrainzRepository:
         if cached is not None:
             return cached
 
-        result = await self._get(f"/1/user/{user}/playlists/recommendations")
+        # 404 means the user has no recommendation playlists yet: absence, not
+        # failure (same accepted_statuses pattern as validate_username).
+        try:
+            result = await self._get(
+                f"/1/user/{user}/playlists/recommendations", accepted_statuses=(404,)
+            )
+        except _ListenBrainzValidationOutcome:
+            return []
         if not result or not isinstance(result, dict):
             return []
 
@@ -1049,7 +1571,14 @@ class ListenBrainzRepository:
         if cached is not None:
             return cached
 
-        result = await self._get(f"/1/playlist/{playlist_id}")
+        # 404 means the playlist no longer exists upstream: absence, not
+        # failure (same accepted_statuses pattern as validate_username).
+        try:
+            result = await self._get(
+                f"/1/playlist/{playlist_id}", accepted_statuses=(404,)
+            )
+        except _ListenBrainzValidationOutcome:
+            return None
         if not result or not isinstance(result, dict):
             return None
 

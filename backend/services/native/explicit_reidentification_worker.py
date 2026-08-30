@@ -8,7 +8,10 @@ import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import (
+    ExternalServiceError,
+    InvalidExternalPayloadError,
+)
 from infrastructure.degradation import (
     clear_degradation_context,
     init_degradation_context,
@@ -42,6 +45,20 @@ from services.native.identification_revisions import (
 from services.native.library_operation_service import LibraryOperationService
 
 logger = logging.getLogger(__name__)
+
+# F-IDENT-03 owner-signed retry policy: transient explicit failures defer for
+# 120 seconds and stop at this finite, durable attempt bound. The bound is a
+# named constant so tests and operators can observe it.
+# F-055: outages that surface as swallowed-empty recall plus degradation flags
+# (breaker open, transient 5xx) defer exactly like raised ones; only
+# deterministic payload failures stay terminal on the first pass.
+REIDENTIFICATION_RETRY_SECONDS = 120.0
+MAX_REIDENTIFICATION_ATTEMPTS = 5
+
+
+class _LocalFingerprintFailure(ExternalServiceError):
+    """F-MATCH-04: a failed LOCAL fingerprint outcome (fpcalc/file), distinct
+    from a provider outage so its honest reason survives defer and attention."""
 
 
 class ExplicitReidentificationWorker:
@@ -187,8 +204,10 @@ class ExplicitReidentificationWorker:
                         and cached.recording_mbid
                     ):
                         track.recording_mbid = cached.recording_mbid
+            provider_recall_used = False
             release_decision = _embedded_release_decision(tracks)
             if requested_release_mbid is not None:
+                provider_recall_used = True
                 candidates = await self._candidates.recall(
                     tracks,
                     exact_release_mbid=str(requested_release_mbid),
@@ -243,6 +262,7 @@ class ExplicitReidentificationWorker:
                 candidates = []
                 decision = embedded_decision
             else:
+                provider_recall_used = True
                 candidates = await self._candidates.recall(
                     tracks,
                     cached_fingerprint_release_groups=list(
@@ -268,9 +288,20 @@ class ExplicitReidentificationWorker:
             ):
                 new_release_groups: list[str] = []
                 requested = 0
+                cached_outcomes: dict[str, object] = {}
                 for track, row in zip(tracks, raw_tracks, strict=True):
-                    if requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT:
-                        break
+                    cached = await self._store.get_fingerprint_outcome(
+                        track.local_track_id,
+                        str(row["stat_revision"]),
+                        FINGERPRINTER_VERSION,
+                    )
+                    if (
+                        cached is not None
+                        and getattr(cached, "state", "")
+                        in ("matched", "no_match", "skipped")
+                    ):
+                        cached_outcomes[track.local_track_id] = cached
+                for track, row in zip(tracks, raw_tracks, strict=True):
                     supported_recordings = {
                         item.recording_mbid
                         for candidate in decision.candidates
@@ -280,6 +311,16 @@ class ExplicitReidentificationWorker:
                         and item.recording_mbid
                     }
                     needed = not track.recording_mbid and len(supported_recordings) != 1
+                    if not needed:
+                        continue
+                    # F-042: a disabled row regenerates once the key returns,
+                    # so it stays budget-consuming; matched/no_match/skipped
+                    # cache hits are free.
+                    cache_hit = track.local_track_id in cached_outcomes
+                    if not cache_hit and (
+                        requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT
+                    ):
+                        break
                     outcome = await self._fingerprints.fingerprint_if_needed(
                         local_track_id=track.local_track_id,
                         path=Path(str(row["file_path"])),
@@ -288,12 +329,20 @@ class ExplicitReidentificationWorker:
                         now=timestamp,
                         checkpoint=checkpoint,
                     )
-                    if not needed:
-                        continue
-                    requested += 1
+                    # F-042: terminal cache hits did no fpcalc/lookup work and
+                    # must not starve later tracks of the budget slots.
+                    if not cache_hit:
+                        requested += 1
                     if not await checkpoint():
                         return await halt()
                     if outcome is not None and outcome.state == "failed":
+                        if outcome.failure_code == "FINGERPRINT_LOCAL_FAILURE":
+                            # F-MATCH-04: fpcalc/file failures are LOCAL
+                            # transients - carry the honest reason instead of
+                            # entering the generic provider-outage path.
+                            raise _LocalFingerprintFailure(
+                                "Fingerprint evidence is temporarily unavailable."
+                            )
                         raise ExternalServiceError(
                             "Fingerprint evidence is temporarily unavailable."
                         )
@@ -314,18 +363,71 @@ class ExplicitReidentificationWorker:
                     decision = self._evidence.decide(tracks, candidates)
             _enforce_raw_track_identities(decision, raw_tracks)
             _enforce_existing_album_identity(decision, album_identity, raw_tracks)
-            attempt_id = str(uuid.uuid4())
+            degraded = degradation.degraded_summary()
             records = [
                 IdentificationEvidenceRecord(
                     id=str(uuid.uuid4()),
-                    attempt_id=attempt_id,
+                    attempt_id="",
                     candidate_key=_candidate_key(candidate),
                     evidence=candidate,
                     created_at=timestamp,
                 )
                 for candidate in decision.candidates
             ]
-            degraded = degradation.degraded_summary()
+            if (
+                degraded
+                and not records
+                and provider_recall_used
+                and stored_identity_decision is None
+                and release_decision is None
+                and not degradation.has_deterministic_failure()
+            ):
+                # F-055: a fully-degraded provider pass surfaces as swallowed
+                # empty recall plus degradation flags, not an exception. Route
+                # it through the same bounded F-IDENT-03 defer as raised
+                # outages instead of terminalizing on the first pass.
+                raise ExternalServiceError(
+                    "Provider recall returned nothing while MusicBrainz was "
+                    "degraded."
+                )
+            if (
+                degraded
+                and not records
+                and provider_recall_used
+                and stored_identity_decision is None
+                and release_decision is None
+                and degradation.has_deterministic_failure()
+            ):
+                # F-IDENT-02 companion to F-055: a DETERMINISTIC empty payload
+                # stays terminal on the first pass under its honest code.
+                attempt = IdentificationAttempt(
+                    id=str(uuid.uuid4()),
+                    local_album_id=str(work["local_album_id"]),
+                    trigger="explicit_reidentification",
+                    requested_by_user_id=job["requested_by_user_id"],
+                    input_tag_revision=revisions[0],
+                    input_file_revision=revisions[1],
+                    input_policy_revision=revisions[2],
+                    input_identity_revision=identity_revision,
+                    matcher_version=MATCHER_VERSION,
+                    state="provider_deferred",
+                    terminal_reason_code="UNMAPPABLE_PROVIDER_PAYLOAD",
+                    started_at=timestamp,
+                    completed_at=timestamp,
+                )
+                return await self._store.finish_reidentification_evaluation(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    expected_work_revision=int(work["row_revision"]),
+                    expected_album_revision=int(context["album"]["row_revision"]),
+                    attempt=attempt,
+                    evidence=[],
+                    now=timestamp,
+                )
+            attempt_id = str(uuid.uuid4())
+            for record in records:
+                record.attempt_id = attempt_id
             attempt = IdentificationAttempt(
                 id=attempt_id,
                 local_album_id=str(work["local_album_id"]),
@@ -359,7 +461,88 @@ class ExplicitReidentificationWorker:
                 evidence=records,
                 now=timestamp,
             )
+        except InvalidExternalPayloadError:
+            # F-MATCH-03 policy: a deterministic payload-shape failure is not a
+            # provider outage and must not consume transient retry slots. It
+            # stays terminal under its own honest code.
+            attempt = IdentificationAttempt(
+                id=str(uuid.uuid4()),
+                local_album_id=str(work["local_album_id"]),
+                trigger="explicit_reidentification",
+                requested_by_user_id=job["requested_by_user_id"],
+                input_tag_revision=revisions[0],
+                input_file_revision=revisions[1],
+                input_policy_revision=revisions[2],
+                input_identity_revision=identity_revision,
+                matcher_version=MATCHER_VERSION,
+                state="provider_deferred",
+                terminal_reason_code="UNMAPPABLE_PROVIDER_PAYLOAD",
+                started_at=timestamp,
+                completed_at=timestamp,
+            )
+            return await self._store.finish_reidentification_evaluation(
+                str(job["id"]),
+                int(work["ordinal"]),
+                worker_id=worker_id,
+                expected_work_revision=int(work["row_revision"]),
+                expected_album_revision=int(context["album"]["row_revision"]),
+                attempt=attempt,
+                evidence=[],
+                now=timestamp,
+            )
+        except _LocalFingerprintFailure:
+            # F-MATCH-04: the local fingerprint cause survives both the bounded
+            # F-IDENT-03 defer and terminal attention - never rewritten to a
+            # provider outage, never eligible for provider resurrection.
+            attempts_used = int(job.get("reidentification_attempt_count", 0) or 0)
+            if attempts_used < MAX_REIDENTIFICATION_ATTEMPTS:
+                return await self._store.defer_reidentification_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    reason_code="FINGERPRINT_LOCAL_FAILURE",
+                    now=timestamp,
+                    retry_not_before=timestamp + REIDENTIFICATION_RETRY_SECONDS,
+                )
+            attempt = IdentificationAttempt(
+                id=str(uuid.uuid4()),
+                local_album_id=str(work["local_album_id"]),
+                trigger="explicit_reidentification",
+                requested_by_user_id=job["requested_by_user_id"],
+                input_tag_revision=revisions[0],
+                input_file_revision=revisions[1],
+                input_policy_revision=revisions[2],
+                input_identity_revision=identity_revision,
+                matcher_version=MATCHER_VERSION,
+                state="provider_deferred",
+                terminal_reason_code="FINGERPRINT_LOCAL_FAILURE",
+                started_at=timestamp,
+                completed_at=timestamp,
+            )
+            return await self._store.finish_reidentification_evaluation(
+                str(job["id"]),
+                int(work["ordinal"]),
+                worker_id=worker_id,
+                expected_work_revision=int(work["row_revision"]),
+                expected_album_revision=int(context["album"]["row_revision"]),
+                attempt=attempt,
+                evidence=[],
+                now=timestamp,
+            )
         except ExternalServiceError:
+            # F-IDENT-03: transient provider or fingerprint interruptions defer
+            # durably (queued job, pending work, next_attempt_at = now + 120)
+            # instead of terminalizing the operation, until the finite bound.
+            attempts_used = int(job.get("reidentification_attempt_count", 0) or 0)
+            if attempts_used < MAX_REIDENTIFICATION_ATTEMPTS:
+                return await self._store.defer_reidentification_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    reason_code="PROVIDER_TEMPORARILY_UNAVAILABLE",
+                    now=timestamp,
+                    retry_not_before=timestamp + REIDENTIFICATION_RETRY_SECONDS,
+                )
             attempt = IdentificationAttempt(
                 id=str(uuid.uuid4()),
                 local_album_id=str(work["local_album_id"]),
@@ -434,6 +617,11 @@ class ExplicitReidentificationWorker:
                 "Automatic scan-discovered management scheduling failed",
                 exc_info=True,
             )
+            # F-061: durable marker instead of a silent log-only gap.
+            try:
+                await self._store.mark_management_schedule_pending(local_album_id)
+            except Exception:  # noqa: BLE001 - never mask the original failure
+                logger.exception("Failed to record management_schedule_pending")
 
     @staticmethod
     def response(row: dict):

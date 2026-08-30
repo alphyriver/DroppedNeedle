@@ -7,6 +7,7 @@ request -> a curator imports -> they get notified.
 
 import asyncio
 import logging
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -25,7 +26,7 @@ from core.dependencies import get_drop_import_service
 from core.exceptions import ValidationError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentCuratorDep
-from services.native.library_manager import _AUDIO_SUFFIXES
+from infrastructure.audio.metadata_engine import AUDIO_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,20 @@ def _copy_to(src, dest: Path) -> None:  # noqa: ANN001 - SpooledTemporaryFile
     # rewind this would stage zero-byte files
     src.seek(0)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(src, out)
+    # Atomic-temp convention (mirrors the publisher's _write_temp_bytes): copy
+    # into a sibling .part file, then rename into place, so a crash can never
+    # leave a half-written upload that looks like a real staged file.
+    part = dest.with_suffix(".part")
+    try:
+        with open(part, "wb") as out:
+            shutil.copyfileobj(src, out)
+        os.replace(part, dest)
+    except OSError:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove partial upload %s", part)
+        raise
 
 
 @router.post("/uploads", response_model=DropImportJobResponse, status_code=202)
@@ -49,8 +62,8 @@ async def upload_drop(
     files: list[UploadFile] = File(...),
     service=Depends(get_drop_import_service),
 ):
-    """Accept zips and/or audio files as one import job. Files are validated by
-    extension up front so nothing is staged for a drop that would be rejected."""
+    """Extensions are validated before staging so nothing lands on disk
+    for a drop that would be rejected."""
     if not files:
         raise ValidationError("No files were uploaded")
     if len(files) > _MAX_FILES_PER_DROP:
@@ -58,7 +71,7 @@ async def upload_drop(
     for upload in files:
         name = upload.filename or ""
         suffix = Path(name).suffix.lower()
-        if suffix != ".zip" and suffix not in _AUDIO_SUFFIXES:
+        if suffix != ".zip" and suffix not in AUDIO_SUFFIXES:
             raise ValidationError(f"Unsupported file type: {name or 'unnamed file'}")
 
     staged: list[tuple[str, Path]] = []

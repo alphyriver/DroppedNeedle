@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Optional, TypeVar, Type
 from typing import Any
+from urllib.parse import urlsplit
 
 import msgspec
 from api.v1.schemas.settings import (
@@ -71,6 +72,7 @@ from core.exceptions import (
     ConfigurationError,
     ScriptValidationError,
     StaleRevisionError,
+    ValidationError,
 )
 from infrastructure.crypto import decrypt, encrypt
 from infrastructure.file_utils import atomic_write_json, read_json
@@ -79,6 +81,7 @@ from infrastructure.serialization import to_jsonable
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=msgspec.Struct)
+SPOTIFY_CALLBACK_PATH = "/api/v1/me/connections/spotify/auth/callback"
 
 
 class PreferencesService:
@@ -87,6 +90,10 @@ class PreferencesService:
         self._config_path = settings.config_file_path
         self._config_cache: Optional[dict] = None
         self._cache_lock = threading.RLock()
+        # Owner decision #1/#2 (Acquisition plan): a FRESH config seeds the
+        # Balanced preset before any normalization reads it. Existing
+        # installs (config file present) never receive these values.
+        self._seed_initial_acquisition_defaults()
         self._normalize_get_it_settings()
         self._migrate_musicbrainz_settings()
         self._ensure_instance_id()
@@ -276,8 +283,6 @@ class PreferencesService:
             logger.error("Failed to save download client settings: %s", e)
             raise ConfigurationError(f"Failed to save download client settings: {e}")
 
-    # --- Shared download policy (M5) - source-agnostic, migrated from slskd struct ---
-
     def get_download_policy(self) -> DownloadPolicySettings:
         """The source-agnostic acquisition policy. Reads ``download_policy`` if present;
         otherwise derives it (migration-on-read, COPY-not-delete) from the legacy
@@ -316,10 +321,67 @@ class PreferencesService:
 
     def save_download_policy(self, policy: DownloadPolicySettings) -> None:
         try:
-            self._save_section("download_policy", policy)
+            config = self._load_config().copy()
+            section = to_jsonable(policy)
+            # Legacy rollback mirrors (Acquisition plan): after every new-policy
+            # save, keep the closest legacy-representable values populated so a
+            # down-level image still loads a sane policy. Range/codec/wait keys
+            # are identity; Free Music's preferred_format tracks whether the
+            # accepted range includes lossless.
+            section["quality_min"] = policy.quality_min
+            section["quality_max"] = policy.quality_max
+            section["flac_mp3_only"] = policy.flac_mp3_only
+            section["preferred_quality_wait_minutes"] = (
+                policy.preferred_quality_wait_minutes
+            )
+            config["download_policy"] = section
+            free_music = config.get("free_music")
+            if not isinstance(free_music, dict):
+                free_music = {}
+            free_music["preferred_format"] = (
+                "flac" if "lossless" in policy.quality_preference_order else "mp3"
+            )
+            config["free_music"] = free_music
+            self._save_config(config)
+            logger.info("Saved download policy to %s", self._config_path)
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to save download policy: %s", e)
             raise ConfigurationError(f"Failed to save download policy: {e}")
+
+    def _seed_initial_acquisition_defaults(self) -> None:
+        """First-boot seeding of ``download_policy`` for NEW installs only
+        (owner decisions 2026-08-27): Balanced preset - lossless→320→256→192,
+        lossy target 320, CD-quality lossless preferred and capped at
+        16-bit/48 kHz, unknown evidence parked for review, source-first."""
+        if self._config_path.exists():
+            return
+        try:
+            self._save_config(
+                {
+                    "download_policy": {
+                        "quality_min": "mp3_192",
+                        "quality_max": "lossless",
+                        "flac_mp3_only": True,
+                        "quality_preference_order": [
+                            "lossless",
+                            "mp3_320",
+                            "mp3_256",
+                            "mp3_192",
+                        ],
+                        "preferred_lossy_bitrate_kbps": 320,
+                        "lossless_preference": "cd",
+                        "lossless_max_bit_depth": 16,
+                        "lossless_max_sample_rate_hz": 48000,
+                        "unknown_quality_behavior": "review",
+                        "source_selection_mode": "source_first",
+                    }
+                }
+            )
+            logger.info(
+                "Seeded new-install acquisition defaults (Balanced preset)"
+            )
+        except Exception as exc:  # noqa: BLE001 - seeding must not block startup
+            logger.error("Failed to seed acquisition defaults: %s", exc)
 
     # --- Wanted watcher (Wanted plan §5.4) - mask-free, no secrets -------------------
 
@@ -1040,6 +1102,7 @@ class PreferencesService:
             client_id=data.get("client_id", ""),
             client_secret=SPOTIFY_SECRET_MASK if client_secret else "",
             enabled=data.get("enabled", False),
+            spotify_redirect_origin=data.get("spotify_redirect_origin", ""),
         )
 
     def get_spotify_settings_raw(self) -> SpotifySettings:
@@ -1052,9 +1115,27 @@ class PreferencesService:
             client_id=data.get("client_id", ""),
             client_secret=client_secret,
             enabled=data.get("enabled", False),
+            spotify_redirect_origin=data.get("spotify_redirect_origin", ""),
         )
 
     def save_spotify_settings(self, settings: SpotifySettings) -> None:
+        # GH-298: an explicit redirect origin must be a bare http(s) origin -
+        # a path/query/fragment here would silently corrupt the value admins
+        # register in the Spotify dashboard. Empty string = dynamic fallback.
+        origin = settings.spotify_redirect_origin.strip()
+        if origin:
+            parts = urlsplit(origin)
+            if (
+                parts.scheme not in ("http", "https")
+                or not parts.netloc
+                or parts.path not in ("", "/")
+                or parts.query
+                or parts.fragment
+            ):
+                raise ValidationError(
+                    "Spotify redirect origin must be an absolute http(s) URL"
+                    " with no path, query, or fragment"
+                )
         try:
             current_raw = self.get_spotify_settings_raw()
             client_secret = settings.client_secret
@@ -1065,6 +1146,7 @@ class PreferencesService:
                 "client_id": settings.client_id.strip(),
                 "client_secret": encrypt(client_secret) if client_secret else "",
                 "enabled": settings.enabled,
+                "spotify_redirect_origin": origin.rstrip("/"),
             }
             self._save_config(config)
         except Exception as e:  # noqa: BLE001
@@ -1074,6 +1156,38 @@ class PreferencesService:
     def is_spotify_enabled(self) -> bool:
         raw = self.get_spotify_settings_raw()
         return raw.enabled and bool(raw.client_id) and bool(raw.client_secret)
+
+    def spotify_redirect_uri(self, request_base_url: str) -> str:
+        """Build the Spotify OAuth redirect_uri - the single source of truth (GH-298).
+
+        OAuth requires the authorize-time and token-exchange values to match
+        byte-for-byte what is registered in the Spotify dashboard, so the
+        authorize route, the callback's token exchange, and the admin display
+        endpoint all derive through this one method. An admin-configured
+        ``spotify_redirect_origin`` wins; empty keeps the historical
+        request-derived base (which collapses to localhost behind untrusted
+        proxies). The deployment base path (``Settings.base_path``, always
+        canonical via its validator) goes between the origin and the callback
+        path, exactly once - an effective origin that already ends with it
+        (the mounted app's request-derived base, or a stored origin baked in
+        with the prefix) is not doubled.
+        """
+        origin = self.get_spotify_settings_raw().spotify_redirect_origin.strip()
+        base = (origin or request_base_url).rstrip("/")
+        prefix = self._settings.base_path
+        if prefix and not base.endswith(prefix):
+            base += prefix
+        return base + SPOTIFY_CALLBACK_PATH
+
+    def with_base_path(self, target_path: str) -> str:
+        """Prefix an app-relative browser redirect target with the base path.
+
+        Same-site redirects (profile success/error pages after OAuth flows)
+        must stay relative so browsers resolve them against the page they are
+        issued from, while still carrying the deployment base path once.
+        ``target_path`` must start with "/" and must never already include it.
+        """
+        return self._settings.base_path + target_path
 
     def get_get_it_settings(self) -> GetItSettings:
         """Return the regional storefront used by purchase-link fallbacks."""

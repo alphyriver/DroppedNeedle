@@ -11,16 +11,19 @@ auth-passed. This test owns the auth posture; route unit tests own body behaviou
 
 Service providers are overridden with non-raising mocks so dependency resolution
 never 500s before the auth dependency is evaluated (which would mask a 401).
-SSE stream endpoints are covered separately in ``test_sse_auth.py`` (their infinite
-generators can't be driven through ``TestClient`` for the admitted case).
+The two library scan SSE stream endpoints ARE inventoried: an autouse fixture
+swaps their generator for a one-event fake, so admitted requests end after the
+status/headers instead of hanging TestClient on the infinite poll loop.
 """
 
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 
-from api.v1.routes import connect_apps_routes
+from api.v1.routes import requests as requests_routes
 from api.v1.routes import auth as auth_routes
+from api.v1.routes import connect_apps_routes
 from api.v1.routes import download_client as download_client_routes
 from api.v1.routes import download_clients as download_clients_routes
 from api.v1.routes import downloads as downloads_routes
@@ -29,7 +32,6 @@ from api.v1.routes import following as following_routes
 from api.v1.routes import free_music as free_music_routes
 from api.v1.routes import import_drop as import_drop_routes
 from api.v1.routes import plugins as plugins_routes
-from api.v1.routes import library as library_routes
 from api.v1.routes import library_contributions as library_contribution_routes
 from api.v1.routes import library_management as library_management_routes
 from api.v1.routes import library_operations_target as library_operations_target_routes
@@ -39,7 +41,6 @@ from api.v1.routes import library_scan_target as target_library_scan_routes
 from api.v1.routes import library_target as target_library_routes
 from api.v1.routes import lidarr_import as lidarr_import_routes
 from api.v1.routes import discovery_batches as discovery_batches_routes
-from api.v1.routes import library_scan as library_scan_routes
 from api.v1.routes import me_connections as me_routes
 from api.v1.routes import navidrome_preferences as navidrome_preferences_routes
 from api.v1.routes import playlists as playlists_routes
@@ -70,7 +71,6 @@ from core.dependencies import (
     get_library_management_profile_service,
     get_library_contribution_service,
     get_library_policy_service,
-    get_library_scanner,
     get_library_service,
     get_local_files_service,
     get_drop_import_service,
@@ -90,7 +90,6 @@ from core.dependencies import (
     get_preferences_service,
     get_request_service,
     get_requests_page_service,
-    get_scan_state_store,
     get_settings_service,
     get_spotify_import_service,
     get_sse_publisher,
@@ -137,7 +136,6 @@ _SERVICE_PROVIDERS = (
     get_library_management_profile_service,
     get_library_policy_service,
     get_target_library_policy_service,
-    get_library_scanner,
     get_library_service,
     get_local_files_service,
     get_drop_import_service,
@@ -157,7 +155,6 @@ _SERVICE_PROVIDERS = (
     get_preferences_service,
     get_request_service,
     get_requests_page_service,
-    get_scan_state_store,
     get_settings_service,
     get_spotify_import_service,
     get_sse_publisher,
@@ -255,9 +252,6 @@ _ADMIN_ENDPOINTS = [
     # Connect Apps admin oversight: see/revoke every user's app-passwords.
     ("GET", "/api/v1/connect-apps/admin/app-passwords", None),
     ("DELETE", "/api/v1/connect-apps/admin/app-passwords/ap-1", None),
-    ("POST", "/api/v1/library/scan/start", None),
-    ("POST", "/api/v1/library/scan/cancel", None),
-    ("GET", "/api/v1/library/scan/unmatched", None),
     ("GET", "/api/v1/settings/library/roots", None),
     ("PUT", "/api/v1/settings/library/roots", {"library_roots": []}),
     ("GET", "/api/v1/settings/library/policy-tree", None),
@@ -398,12 +392,6 @@ _ADMIN_ENDPOINTS = [
         "/api/v1/settings/library/policy-apply-preview",
         {"scope_ids": [], "expected_policy_revision": "policy"},
     ),
-    ("POST", "/api/v1/library/scan/unmatched/1/resolve", {"resolution": "reject"}),
-    (
-        "POST",
-        "/api/v1/library/scan/unmatched/resolve-batch",
-        {"release_group_mbid": "rg-1", "items": []},
-    ),
     ("GET", "/api/v1/download-client/config", None),
     ("PUT", "/api/v1/download-client/config", {}),
     ("POST", "/api/v1/download-client/test", {}),
@@ -420,6 +408,8 @@ _ADMIN_ENDPOINTS = [
     # Wanted watcher settings (admin, download-clients router)
     ("GET", "/api/v1/download-clients/wanted", None),
     ("PUT", "/api/v1/download-clients/wanted", {}),
+    # Acquisition-quality policy routes (Acquisition plan) - admin preview
+    ("POST", "/api/v1/download-clients/policy/impact", {}),
     # Free Music settings (admin, settings router)
     ("GET", "/api/v1/settings/free-music", None),
     (
@@ -463,6 +453,28 @@ _ADMIN_ENDPOINTS = [
     ("GET", "/api/v1/requests/auto-download-approval-batches", None),
     ("POST", "/api/v1/requests/auto-download-approval-batches/batch-1/approve", None),
     ("POST", "/api/v1/requests/auto-download-approval-batches/batch-1/reject", None),
+    ("GET", "/api/v1/requests/pending-approvals", None),
+    ("GET", "/api/v1/requests/pending-approvals/count", None),
+    (
+        "POST",
+        "/api/v1/requests/approve/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa?request_kind=album",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/approve/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/reject/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa?request_kind=album",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/reject/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
     # Feedback Fixes target-only surfaces. The router remains unmounted in production
     # until the separately authorized offline replacement, but its auth contract is
     # complete and testable in isolation.
@@ -526,6 +538,11 @@ _ADMIN_ENDPOINTS = [
     ("POST", "/api/v1/library/operations/job-1/pause", {"expected_row_revision": 1}),
     ("POST", "/api/v1/library/operations/job-1/resume", {"expected_row_revision": 1}),
     ("POST", "/api/v1/library/operations/job-1/stop", {"expected_row_revision": 1}),
+    (
+        "POST",
+        "/api/v1/library/albums/album-1/undo-automatic-edition",
+        {"expected_album_revision": 1, "expected_identity_revision": 2},
+    ),
     (
         "POST",
         "/api/v1/library/albums/album-1/reidentify",
@@ -757,11 +774,76 @@ _ADMIN_ENDPOINTS = [
         "/api/v1/library/scan-runs/run-1/stop",
         {"expected_revision": 1},
     ),
+    # Library scan SSE streams: CurrentAdminDep (admin-only) and CurrentUserDep
+    # respectively; the autouse SSE fixture ends admitted responses after the
+    # headers, so status-only assertions hold here like everywhere else.
+    ("GET", "/api/v1/library/operations/stream", None),
     ("POST", "/api/v1/downloads/held/management/task-1/retry", None),
     ("POST", "/api/v1/downloads/held/management/task-1/discard", None),
 ]
-
 _USER_ENDPOINTS = [
+    # Request submission surfaces: both album and exact-track asks are user
+    # scoped and must remain behind the CurrentUser dependency.
+    (
+        "POST",
+        "/api/v1/requests/new",
+        {
+            "musicbrainz_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "artist": "A",
+            "album": "B",
+        },
+    ),
+    (
+        "POST",
+        "/api/v1/requests/batch",
+        {
+            "items": [
+                {
+                    "musicbrainz_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "artist_name": "A",
+                    "album_title": "B",
+                }
+            ]
+        },
+    ),
+    (
+        "POST",
+        "/api/v1/requests/batch/cancel",
+        {"musicbrainz_ids": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]},
+    ),
+    ("GET", "/api/v1/requests/active", None),
+    ("GET", "/api/v1/requests/active/count", None),
+    ("GET", "/api/v1/requests/history", None),
+    (
+        "DELETE",
+        "/api/v1/requests/active/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/active/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/retry/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/retry/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/history/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
     ("GET", "/api/v1/library/contributions/contribution-1", None),
     ("GET", "/api/v1/me/navidrome/music-folder-preferences", None),
     (
@@ -769,9 +851,14 @@ _USER_ENDPOINTS = [
         "/api/v1/me/navidrome/music-folder-preferences",
         {"mode": "all", "selected_folder_ids": []},
     ),
-    ("GET", "/api/v1/library/scan/status", None),
     ("GET", "/api/v1/download-client/status", None),
     ("GET", "/api/v1/downloads", None),
+    # Acquisition-quality user surfaces (Acquisition plan): safe summary for any
+    # signed-in user; owner-or-admin restart (non-owner gets 404/403, never 500).
+    ("GET", "/api/v1/download-clients/policy-summary", None),
+    ("POST",
+     "/api/v1/downloads/task-1/restart-with-current-policy",
+     {"expected_snapshot_hash": None}),
     ("GET", "/api/v1/downloads/activity-summary", None),
     ("GET", "/api/v1/downloads/task-1/files", None),
     ("POST", "/api/v1/downloads/task-1/cancel", None),
@@ -791,8 +878,11 @@ _USER_ENDPOINTS = [
     ("POST", "/api/v1/downloads/search/job-1/pick", {"candidate_index": 0}),
     ("POST", "/api/v1/downloads/search/job-1/dismiss", None),
     ("POST", "/api/v1/downloads/search/job-1/cancel", None),
-    ("POST", "/api/v1/tracks/rec-1/request", {"artist_name": "A", "track_title": "T"}),
-    ("GET", "/api/v1/library/artists", None),
+    (
+        "POST",
+        "/api/v1/tracks/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/request",
+        {"artist_name": "A", "track_title": "T"},
+    ),
     ("GET", "/api/v1/library/albums", None),
     ("GET", "/api/v1/library/tracks", None),
     ("GET", "/api/v1/library/stats", None),
@@ -801,13 +891,14 @@ _USER_ENDPOINTS = [
     ("GET", "/api/v1/library/mbids", None),
     ("GET", "/api/v1/library/recently-added", None),
     ("GET", "/api/v1/library/artists/artist-1", None),
+    ("GET", "/api/v1/library/artists", None),
     ("GET", "/api/v1/library/artists/artist-1/albums", None),
     ("GET", "/api/v1/library/artists/artist-1/appearances", None),
     ("GET", "/api/v1/library/albums/album-1", None),
     ("GET", "/api/v1/library/albums/album-1/artwork/cached?v=1", None),
     ("POST", "/api/v1/library/resolve-tracks", {"items": []}),
     ("GET", "/api/v1/library/activity", None),
-    ("GET", "/api/v1/me/section-prefs", None),
+    ("GET", "/api/v1/library/activity/stream", None),
     ("POST", "/api/v1/me/personal-mix/refresh", None),
     ("PUT", "/api/v1/me/section-prefs", {"page": "home", "sections": []}),
     ("GET", "/api/v1/discover/batches", None),
@@ -891,6 +982,22 @@ _USER_ENDPOINTS = [
 _ALL_ENDPOINTS = _ADMIN_ENDPOINTS + _USER_ENDPOINTS
 
 
+@pytest.fixture(autouse=True)
+def finite_sse_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap the library scan SSE generators for a one-event fake.
+
+    The real generator polls forever; TestClient buffers a response to
+    completion, so admitted requests must end after the status/headers for the
+    inventory loops above to assert on them.
+    """
+
+    async def one_event(source):
+        await source.stream_revisions()
+        yield "id: activity:test\nevent: activity.changed\ndata: {}\n\n"
+
+    monkeypatch.setattr(target_library_scan_routes, "activity_events", one_event)
+
+
 def _deny_admin():
     raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -903,7 +1010,6 @@ def _client(scenario: str):
     # routers MUST precede the /downloads/{task_id} catch-all.
     for router in (
         auth_routes.router,
-        library_scan_routes.router,
         download_client_routes.router,
         download_clients_routes.router,
         quarantine_routes.router,
@@ -915,7 +1021,6 @@ def _client(scenario: str):
         target_library_routes.router,
         library_contribution_routes.router,
         target_library_scan_routes.router,
-        library_routes.router,
         target_library_policy_routes.router,
         library_management_routes.router,
         library_policy_routes.router,
@@ -925,6 +1030,7 @@ def _client(scenario: str):
         discovery_batches_routes.router,
         system_routes.router,
         playlists_routes.router,
+        requests_routes.router,
         requests_page_routes.router,
         lidarr_import_routes.router,
         import_drop_routes.router,

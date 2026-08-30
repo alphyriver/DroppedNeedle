@@ -178,6 +178,7 @@ function activity(
 		failed_count: 0,
 		deferred_count: 2,
 		deferred_reason_counts: {},
+		deferred_jobs: [],
 		attention_count: 0,
 		priority_band: kind === 'identification' ? 'New and changed albums' : null,
 		oldest_backlog_at: kind === 'identification' ? 1 : null,
@@ -426,6 +427,72 @@ describe('LibraryScanningPanel', () => {
 		await expect.element(page.getByText(/provider temporarily unavailable: 2/)).toBeVisible();
 		await expect.element(page.getByText(/album no longer available: 1/)).toBeVisible();
 		expect(page.getByText(/need attention/).query()).toBeNull();
+		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
+	});
+
+	it('lists deferred album summaries inside the deferred alert', async () => {
+		h.activity = {
+			data: {
+				items: [
+					activity('identification', {
+						deferred_count: 2,
+						deferred_reason_counts: { UNEXPECTED_ERROR: 2 },
+						deferred_jobs: [
+							{
+								job_id: 'job-1',
+								local_album_id: 'album-1',
+								album_title: 'Stuck Album',
+								artist_name: 'Stuck Artist',
+								last_failure_code: 'UNEXPECTED_ERROR',
+								attempt_count: 3,
+								not_before: 100,
+								updated_at: 90
+							},
+							{
+								job_id: 'job-2',
+								local_album_id: null,
+								album_title: null,
+								artist_name: null,
+								last_failure_code: 'UNEXPECTED_ERROR',
+								attempt_count: 1,
+								not_before: null,
+								updated_at: 80
+							}
+						]
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryScanningPanel);
+		await expect.element(page.getByText('Stuck Album')).toBeVisible();
+		await expect.element(page.getByText(/- Stuck Artist/)).toBeVisible();
+		await expect.element(page.getByText(/unexpected error · attempt 3/)).toBeVisible();
+		await expect.element(page.getByText('Track-level work')).toBeVisible();
+	});
+
+	it('labels unmappable provider payloads honestly without an outage warning', async () => {
+		h.activity = {
+			data: {
+				items: [
+					activity('identification', {
+						deferred_count: 1,
+						deferred_reason_counts: { UNMAPPABLE_PROVIDER_PAYLOAD: 1 },
+						provider_unavailable: false
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryScanningPanel);
+		await expect.element(page.getByText(/1\s+metadata\s+check is deferred/)).toBeVisible();
+		await expect
+			.element(
+				page.getByText(/provider response could not be mapped \(data problem, not an outage\): 1/)
+			)
+			.toBeVisible();
 		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
 	});
 

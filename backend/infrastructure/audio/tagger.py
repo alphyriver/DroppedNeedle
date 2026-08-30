@@ -2,8 +2,8 @@
 
 Reads tag metadata and cover art across the legacy scan formats:
 MP3 (ID3v2), FLAC/OGG (Vorbis comments), and M4A (MP4 atoms). The MusicBrainz
-fields use the Picard tag names. All writes now go through the staged management
-metadata engine and its tested per-format adapters.
+fields use the Picard tag names. All writes go through the staged management
+metadata engine and its per-format adapters.
 
 This is the mock seam for the scanner: tests mock ``AudioTagger`` (or
 ``mutagen.File``), never mutagen's per-format classes directly.
@@ -71,9 +71,25 @@ _SUFFIX_FORMATS = {
     ".mp4": "m4a",
 }
 
-# Only these report a meaningful bit depth. MP4Info.bits_per_sample is 16 even
-# for lossy AAC, so bit_depth must be suppressed for lossy formats.
-_LOSSLESS_FORMATS = {"flac"}
+# Only these containers report a meaningful bit depth. MP4Info.bits_per_sample
+# is 16 even for lossy AAC, so bit_depth must be suppressed for lossy formats.
+_LOSSLESS_FORMATS = {"flac", "wav"}
+_MP4_ALAC_CODECS = {"alac"}
+
+
+def _bit_depth_for(fmt: str, info: Any) -> int | None:
+    """Meaningful bit depth, or None when the container/codec proves nothing.
+
+    F-EDITION-04: an MP4-family file (m4a/mp4/mov) is ALAC - and therefore
+    lossless with a real bit depth - only when Mutagen's codec evidence says
+    so. AAC's synthetic 16-bit value stays suppressed."""
+    if fmt in _LOSSLESS_FORMATS:
+        return getattr(info, "bits_per_sample", None) or None
+    if fmt in {"m4a", "mp4", "mov"}:
+        codec = str(getattr(info, "codec", "") or "").lower()
+        if codec in _MP4_ALAC_CODECS:
+            return getattr(info, "bits_per_sample", None) or None
+    return None
 
 
 def _first(value: Any) -> str | None:
@@ -231,8 +247,6 @@ class AudioTagger:
                 return bytes(frame.data)
         return None
 
-    # -- ID3v2 (MP3) --
-
     def _read_id3(self, audio: Any) -> AudioTag:
         tags = audio.tags
         if tags is None:
@@ -292,8 +306,6 @@ class AudioTagger:
         )
         return out
 
-    # -- Vorbis (FLAC/OGG) --
-
     def _read_vorbis(self, audio: Any) -> AudioTag:
         def g(key: str) -> Any:
             return audio.get(key)
@@ -337,8 +349,6 @@ class AudioTagger:
             musicbrainz_album_artist_ids=album_artist_ids,
             **mb,
         )
-
-    # -- MP4 (M4A) --
 
     def _read_mp4(self, audio: Any) -> AudioTag:
         tags = audio.tags or {}
@@ -415,15 +425,9 @@ class AudioTagger:
             **mb,
         )
 
-    # -- technical info --
-
     def _read_info(self, audio: Any, path: Path, fmt: str) -> AudioInfo:
         info = audio.info
-        bit_depth = (
-            (getattr(info, "bits_per_sample", None) or None)
-            if fmt in _LOSSLESS_FORMATS
-            else None
-        )
+        bit_depth = _bit_depth_for(fmt, info)
         return AudioInfo(
             duration_seconds=float(getattr(info, "length", 0.0) or 0.0),
             bitrate=int(getattr(info, "bitrate", 0) or 0) // 1000,

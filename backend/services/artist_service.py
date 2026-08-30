@@ -31,6 +31,7 @@ from infrastructure.cache.cache_keys import (
 )
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
+from infrastructure.degradation import try_get_degradation_context
 from infrastructure.validators import validate_mbid
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.http.disconnect import DisconnectCallable, check_disconnected
@@ -38,14 +39,37 @@ from core.exceptions import ClientDisconnectedError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBArtistImages
 from repositories.musicbrainz_base import extract_artist_name, mb_deduplicator
+from core.task_registry import TaskRegistry
 
 if TYPE_CHECKING:
     from infrastructure.persistence import LibraryDB
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
     from services.native.library_ownership_service import LibraryOwnershipService
 
 logger = logging.getLogger(__name__)
 
-# MB is rate-limited to 1 req/s in-process; bound the cold browse to 10 pages
+
+def _log_task_error(task: "asyncio.Task[None]") -> None:
+    """A3/ST4: background release-group warming failures must surface in logs
+    without ever touching a response path (coverart_repository pattern)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Background release-group warm failed", exc_info=exc)
+
+
+def _log_deferred_disk_write_failure(task: "asyncio.Task[None]") -> None:
+    """B3.1: the deferred artist disk mirror must never crash the response
+    path - a failed/cancelled mirror only costs one disk re-fetch after
+    restart, so warn-and-swallow is the correct disposition."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Deferred artist disk-cache write failed: %s", exc)
+
+
 # (1000 release groups) so pathological artists don't hog the limiter.
 _MAX_RG_PAGES = 10
 
@@ -63,6 +87,7 @@ class ArtistService:
         audiodb_browse_queue: Any = None,
         library_db: "LibraryDB | None" = None,
         ownership_service: "LibraryOwnershipService | None" = None,
+        native_library_store: "NativeLibraryStore | None" = None,
     ):
         self._mb_repo = mb_repo
         self._library_repo = library_repo
@@ -74,8 +99,13 @@ class ArtistService:
         self._audiodb_browse_queue = audiodb_browse_queue
         self._library_db = library_db
         self._ownership = ownership_service
+        self._native_library_store = native_library_store
         self._artist_in_flight: dict[str, asyncio.Future[ArtistInfo]] = {}
         self._artist_basic_in_flight: dict[str, asyncio.Future[ArtistInfo]] = {}
+        # B1: coalesces concurrent cold /extended renders onto one leader chain.
+        self._artist_extended_in_flight: dict[
+            str, asyncio.Future[ArtistExtendedInfo]
+        ] = {}
 
     async def _get_library_cache_mbids(self) -> set[str]:
         if self._library_db is None:
@@ -263,9 +293,22 @@ class ArtistService:
         library_artist_mbids: set[str] | None,
         library_album_mbids: dict[str, Any] | None,
     ) -> ArtistInfo:
-        artist_info = await self._build_artist_from_musicbrainz(
-            artist_id, library_artist_mbids, library_album_mbids
-        )
+        try:
+            artist_info = await self._build_artist_from_musicbrainz(
+                artist_id, library_artist_mbids, library_album_mbids
+            )
+        except ResourceNotFoundError:
+            # MB down: a locally known artist renders from its local rows.
+            # Runs inside the coalesced leader so followers settle to the
+            # degraded result too. Not cached.
+            local_info = await self._build_artist_info_from_local(artist_id)
+            if local_info is not None:
+                logger.warning(
+                    "Artist detail artist=%s source=local-degraded (musicbrainz unavailable)",
+                    artist_id[:8],
+                )
+                return local_info
+            raise
         await self._refresh_library_flags(artist_info)
         artist_info = await self._apply_audiodb_artist_images(
             artist_info,
@@ -276,6 +319,34 @@ class ArtistService:
         )
         await self._save_artist_to_cache(artist_id, artist_info)
         return artist_info
+
+    async def _build_artist_info_from_local(self, artist_id: str) -> ArtistInfo | None:
+        """Degraded-mode artist payload built purely from local catalog rows.
+
+        Serves locally known artists when MusicBrainz cannot answer. Nothing
+        here consults MB, so the result is never cached under the MB-derived
+        key. Releases stay empty: the page's album grid is library-backed
+        elsewhere, and the MB discography degrades to empty on its own.
+        """
+        if self._native_library_store is None:
+            return None
+        artist_rows, _total = await self._native_library_store.list_target_artists(
+            limit=1, artist_ids=[artist_id], scope="all"
+        )
+        if not artist_rows:
+            return None
+        row = artist_rows[0]
+        provider_artist_mbid = row.get("provider_artist_mbid")
+        return ArtistInfo(
+            name=str(row["artist_name"] or ""),
+            musicbrainz_id=(
+                str(provider_artist_mbid) if provider_artist_mbid else artist_id
+            ),
+            in_library=True,
+            appears_in_library=True,
+            release_group_count=int(row.get("album_count") or 0),
+            service_status=None,
+        )
 
     async def _build_artist_from_musicbrainz(
         self,
@@ -331,13 +402,19 @@ class ArtistService:
         artist_id = validate_mbid(artist_id, "artist")
         cached = await self._get_cached_artist(artist_id)
         if cached:
-            cached = await self._apply_audiodb_artist_images(
-                cached,
-                artist_id,
-                cached.name,
-                allow_fetch=False,
+            # B3.1: refresh (library flags on releases + artist-level flags)
+            # and AudioDB image application (fanart/thumb/logo URL fields)
+            # mutate DISJOINT fields of the same object; under cooperative
+            # asyncio their field writes interleave but never parallelize.
+            await asyncio.gather(
+                self._apply_audiodb_artist_images(
+                    cached,
+                    artist_id,
+                    cached.name,
+                    allow_fetch=False,
+                ),
+                self._refresh_library_flags(cached),
             )
-            await self._refresh_library_flags(cached)
             return cached
 
         if artist_id in self._artist_basic_in_flight:
@@ -347,15 +424,33 @@ class ArtistService:
         future: asyncio.Future[ArtistInfo] = loop.create_future()
         self._artist_basic_in_flight[artist_id] = future
         try:
-            artist_info = await self._build_artist_from_musicbrainz(
-                artist_id, include_extended=False, include_releases=False
-            )
-            await self._refresh_library_flags(artist_info)
-            artist_info = await self._apply_audiodb_artist_images(
-                artist_info,
-                artist_id,
-                artist_info.name,
-                allow_fetch=False,
+            try:
+                artist_info = await self._build_artist_from_musicbrainz(
+                    artist_id, include_extended=False, include_releases=False
+                )
+            except ResourceNotFoundError:
+                # MB down: a locally known artist renders from its local
+                # rows. Runs inside the coalesced leader so followers settle
+                # to the degraded result too. Not cached.
+                local_info = await self._build_artist_info_from_local(artist_id)
+                if local_info is not None:
+                    logger.warning(
+                        "Artist info artist=%s source=local-degraded (musicbrainz unavailable)",
+                        artist_id[:8],
+                    )
+                    if not future.done():
+                        future.set_result(local_info)
+                    return local_info
+                raise
+            # B3.1: same disjoint-field gather as the cached path above.
+            await asyncio.gather(
+                self._refresh_library_flags(artist_info),
+                self._apply_audiodb_artist_images(
+                    artist_info,
+                    artist_id,
+                    artist_info.name,
+                    allow_fetch=False,
+                ),
             )
             await self._save_artist_to_cache(artist_id, artist_info)
             if not future.done():
@@ -452,8 +547,6 @@ class ArtistService:
                 )
                 await self._disk_cache.delete_artist(artist_id)
                 return None
-            ttl = self._get_artist_ttl(artist_info.in_library)
-            await self._cache.set(cache_key, artist_info, ttl_seconds=ttl)
             return artist_info
         return None
 
@@ -462,13 +555,20 @@ class ArtistService:
     ) -> None:
         cache_key = f"{ARTIST_INFO_PREFIX}{artist_id}"
         ttl = self._get_artist_ttl(artist_info.in_library)
+        # B3.1: memory write stays inline - coalesced followers and the next
+        # request read it. The disk mirror moves off the response path onto a
+        # fire-and-forget task; the exposure window is one event-loop tick and
+        # worst-case loss costs one disk re-fetch after restart.
         await self._cache.set(cache_key, artist_info, ttl_seconds=ttl)
-        await self._disk_cache.set_artist(
-            artist_id,
-            artist_info,
-            is_monitored=artist_info.in_library,
-            ttl_seconds=ttl if not artist_info.in_library else None,
+        task = asyncio.create_task(
+            self._disk_cache.set_artist(
+                artist_id,
+                artist_info,
+                is_monitored=artist_info.in_library,
+                ttl_seconds=ttl if not artist_info.in_library else None,
+            )
         )
+        task.add_done_callback(_log_deferred_disk_write_failure)
 
     def _get_artist_ttl(self, in_library: bool) -> int:
         advanced_settings = self._preferences_service.get_advanced_settings()
@@ -487,15 +587,44 @@ class ArtistService:
                 return ArtistExtendedInfo(
                     description=cached_info.description, image=cached_info.image
                 )
-            mb_artist = await self._mb_repo.get_artist_by_id(artist_id)
-            if not mb_artist:
-                raise ResourceNotFoundError("Artist not found")
-            description, image = await self._fetch_wikidata_info(mb_artist)
-            if cached_info:
-                cached_info.description = description
-                cached_info.image = image
-                await self._save_artist_to_cache(artist_id, cached_info)
-            return ArtistExtendedInfo(description=description, image=image)
+
+            # B1: coalesce concurrent cold renders - K viewers of a wiki-less
+            # or cold artist share ONE leader chain; followers await (shielded)
+            # the identical object the leader built. Lifecycle mirrors
+            # get_artist_info_basic above.
+            if artist_id in self._artist_extended_in_flight:
+                return await asyncio.shield(self._artist_extended_in_flight[artist_id])
+
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[ArtistExtendedInfo] = loop.create_future()
+            self._artist_extended_in_flight[artist_id] = future
+            try:
+                # B1: url-rels only. extract_wiki_info reads just
+                # mb_artist["relations"], so the full detail fetch (2 wire
+                # calls when the detail entry expired) was pure waste;
+                # get_artist_relations serves the same need from a 24 h
+                # relations cache. Lane moves USER_INITIATED -> IMAGE_FETCH
+                # (_fetch_artist_relations pins IMAGE_FETCH) - this is a
+                # cosmetic enrichment leg, not primary content.
+                mb_artist = await self._mb_repo.get_artist_relations(artist_id)
+                if not mb_artist:
+                    raise ResourceNotFoundError("Artist not found")
+                description, image = await self._fetch_wikidata_info(mb_artist)
+                if cached_info:
+                    cached_info.description = description
+                    cached_info.image = image
+                    await self._save_artist_to_cache(artist_id, cached_info)
+                result = ArtistExtendedInfo(description=description, image=image)
+                if not future.done():
+                    future.set_result(result)
+                return result
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                    future.exception()  # mark retrieved: no orphan-log when leader alone
+                raise
+            finally:
+                self._artist_extended_in_flight.pop(artist_id, None)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Error fetching extended artist info for {artist_id}: {e}")
             return ArtistExtendedInfo(description=None, image=None)
@@ -524,7 +653,7 @@ class ArtistService:
             included_primary_types = set(t.lower() for t in prefs.primary_types)
             included_secondary_types = set(t.lower() for t in prefs.secondary_types)
 
-            return await self._filter_aware_release_page(
+            result = await self._filter_aware_release_page(
                 artist_id,
                 offset,
                 limit,
@@ -534,6 +663,25 @@ class ArtistService:
                 included_secondary_types,
                 is_disconnected,
             )
+            if (
+                result.returned_count == 0
+                and result.source_total_count == 0
+                and not result.warming
+            ):
+                # get_artist_release_groups collapses every MB failure into
+                # ([], 0): an outage looks like an empty catalog. Locally
+                # owned artists serve their local discography instead.
+                # Not cached.
+                local = await self._build_artist_releases_from_local(
+                    artist_id, offset, limit
+                )
+                if local is not None:
+                    logger.warning(
+                        "Artist releases artist=%s source=local-degraded (musicbrainz unavailable)",
+                        artist_id[:8],
+                    )
+                    return local
+            return result
         except ClientDisconnectedError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -551,6 +699,89 @@ class ArtistService:
                 has_more=False,
                 source_total_count=None,
             )
+
+    async def _build_artist_releases_from_local(
+        self, artist_id: str, offset: int, limit: int
+    ) -> ArtistReleases | None:
+        """Degraded-mode discography built purely from local catalog rows.
+
+        Serves the in-library slice of an artist's discography when MB cannot
+        answer. Type buckets follow each album's primary identity (compilations
+        count as albums); the external-only part of the catalog reappears when
+        MB does. Requested flags are unknown here (the MB catalog is what
+        carries them) and stay False.
+        """
+        if self._native_library_store is None:
+            return None
+        artist_rows, _total = await self._native_library_store.list_target_artists(
+            limit=1, artist_ids=[artist_id], scope="all"
+        )
+        if not artist_rows:
+            return None
+        rows, _albums_total = await self._native_library_store.list_target_albums(
+            limit=10_000,
+            offset=0,
+            sort="name",
+            artist_id=str(artist_rows[0]["artist_mbid"]),
+        )
+        if not rows:
+            return None
+
+        albums: list[ReleaseItem] = []
+        eps: list[ReleaseItem] = []
+        singles: list[ReleaseItem] = []
+        for row in rows:
+            rg_id = row.get("provider_release_group_mbid") or str(
+                row["release_group_mbid"]
+            )
+            release_date = row.get("original_release_date")
+            year = row.get("year")
+            if year is None and release_date:
+                head = str(release_date)[:4]
+                year = int(head) if head.isdigit() else None
+            track_count = int(row.get("track_count") or 0)
+            # A single-track local row is usually a single; type is display
+            # metadata only, so bucket heuristics are fine here.
+            bucket = albums
+            item_type = "Album"
+            if row.get("is_compilation"):
+                item_type = "Album"
+            elif track_count <= 2:
+                bucket = singles
+                item_type = "Single"
+            elif track_count <= 6:
+                bucket = eps
+                item_type = "EP"
+            bucket.append(
+                ReleaseItem(
+                    id=rg_id,
+                    title=str(row["album_title"]),
+                    type=item_type,
+                    first_release_date=str(release_date) if release_date else None,
+                    year=int(year) if year is not None else None,
+                    in_library=True,
+                )
+            )
+        for lst in (albums, eps, singles):
+            lst.sort(key=lambda x: (x.year is None, -(x.year or 0)))
+        tagged: list[tuple[str, ReleaseItem]] = (
+            [("albums", item) for item in albums]
+            + [("eps", item) for item in eps]
+            + [("singles", item) for item in singles]
+        )
+        page = tagged[offset : offset + limit]
+        next_offset = offset + limit if offset + limit < len(tagged) else None
+        return ArtistReleases(
+            albums=[item for kind, item in page if kind == "albums"],
+            singles=[item for kind, item in page if kind == "singles"],
+            eps=[item for kind, item in page if kind == "eps"],
+            offset=offset,
+            limit=limit,
+            returned_count=len(page),
+            next_offset=next_offset,
+            has_more=next_offset is not None,
+            source_total_count=len(tagged),
+        )
 
     async def _filter_aware_release_page(
         self,
@@ -576,7 +807,10 @@ class ArtistService:
                 source_total_count=None,
             )
 
-        full_list = await self._fetch_all_release_groups(artist_id, is_disconnected)
+        full_list, complete = await self._fetch_all_release_groups(
+            artist_id, is_disconnected
+        )
+        warming = not complete
 
         if self._ownership is not None:
             album_mbids, requested_mbids = await self._target_release_group_flags(
@@ -605,6 +839,9 @@ class ArtistService:
         page_eps = [item for kind, item in page if kind == "eps"]
 
         next_offset = offset + limit if offset + limit < len(tagged) else None
+        # A3/ST4: while the catalog is only partially known (walker running),
+        # a partial total would render "N of N" and hide Load-more - report
+        # null instead, plus the explicit warming flag.
         return ArtistReleases(
             albums=page_albums,
             singles=page_singles,
@@ -614,49 +851,135 @@ class ArtistService:
             returned_count=len(page),
             next_offset=next_offset,
             has_more=next_offset is not None,
-            source_total_count=len(tagged),
+            source_total_count=None if warming else len(tagged),
+            warming=warming,
         )
 
     async def _fetch_all_release_groups(
         self, artist_id: str, is_disconnected: DisconnectCallable | None
-    ) -> list[dict[str, Any]]:
-        """Cached, request-coalesced full release-group browse.
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Cached, request-coalesced release-group browse (A3/ST4).
 
-        Stores raw MB dicts only; in_library/requested flags are recomputed
-        per request from library state, so library changes never invalidate it.
+        Returns ``(known_slice, complete)``. A catalog that fits page 1 is
+        cached and returned complete - byte-identical to the pre-A3 walk.
+        Larger catalogs return only the first page with ``complete=False``
+        while a background walker finishes the remaining pages; the shared
+        key stays unwritten until that walk completes (outage-safety rule).
+        Raw MB dicts only; in_library/requested flags are recomputed per
+        request from library state, so library changes never invalidate it.
         """
         cache_key = mb_artist_release_groups_key(artist_id)
         cached = await self._cache.get(cache_key)
         if cached is not None:
-            return cached
-        return await mb_deduplicator.dedupe(
+            return cached, True
+
+        page_items, total = await mb_deduplicator.dedupe(
             cache_key,
-            lambda: self._fetch_all_release_groups_uncached(artist_id, is_disconnected),
+            lambda: self._fetch_first_release_group_page(artist_id, is_disconnected),
         )
-
-    async def _fetch_all_release_groups_uncached(
-        self, artist_id: str, is_disconnected: DisconnectCallable | None
-    ) -> list[dict[str, Any]]:
-        """Fetch all release-group pages (max _MAX_RG_PAGES), first-wins dedupe.
-
-        MB re-sorts each browse page by GID against a different materialized
-        order, so pages can overlap or drift mid-fetch; dedupe by id survives
-        that. Only complete fetches are cached so an outage never poisons it.
-        """
-        cache_key = mb_artist_release_groups_key(artist_id)
-        collected: dict[str, dict[str, Any]] = {}
-        raw_offset = 0
-        total = 0
-        pages = 0
-
-        while pages < _MAX_RG_PAGES:
-            await check_disconnected(is_disconnected)
-            release_groups, mb_total = await self._mb_repo.get_artist_release_groups(
-                artist_id,
-                raw_offset,
-                100,
-                priority=RequestPriority.USER_INITIATED,
+        if total > 0 and len(page_items) >= total:
+            await self._cache.set(
+                cache_key,
+                page_items,
+                ttl_seconds=self._get_artist_ttl(in_library=False),
             )
+            return page_items, True
+        if not page_items and not total:
+            # Definitive zero-RG catalog: complete, not warming.
+            return page_items, True
+
+        self._spawn_release_group_warm(artist_id, page_items, total)
+        return page_items, False
+
+    async def _fetch_first_release_group_page(
+        self, artist_id: str, is_disconnected: DisconnectCallable | None
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Offset-0 browse page (limit 100) at USER_INITIATED - the only leg
+        still riding the user's request. First-wins id dedupe survives MB
+        page re-sorting; the caller decides completeness from ``total``."""
+        await check_disconnected(is_disconnected)
+        release_groups, total = await self._mb_repo.get_artist_release_groups(
+            artist_id,
+            0,
+            100,
+            priority=RequestPriority.USER_INITIATED,
+        )
+        collected: dict[str, dict[str, Any]] = {}
+        for group in release_groups or []:
+            group_id = group.get("id")
+            if not group_id:
+                continue
+            collected.setdefault(str(group_id).casefold(), group)
+        return list(collected.values()), total or 0
+
+    def _spawn_release_group_warm(
+        self,
+        artist_id: str,
+        seed_items: list[dict[str, Any]],
+        total: int,
+        *,
+        raw_offset: int | None = None,
+    ) -> None:
+        """Spawn the BACKGROUND_SYNC walker unless one is already running for
+        this artist (TaskRegistry name collision -> RuntimeError -> ignore)."""
+        registry = TaskRegistry.get_instance()
+        task_name = f"mb-rg-warm-{artist_id.casefold()}"
+        if registry.is_running(task_name):
+            return
+        collected: dict[str, dict[str, Any]] = {}
+        for group in seed_items:
+            group_id = group.get("id")
+            if group_id:
+                collected.setdefault(str(group_id).casefold(), group)
+        if raw_offset is None:
+            raw_offset = len(seed_items)
+        task = asyncio.create_task(
+            self._warm_release_group_pages(
+                artist_id, collected, total, raw_offset=raw_offset
+            )
+        )
+        task.add_done_callback(_log_task_error)
+        try:
+            registry.register(task_name, task)
+        except RuntimeError:
+            pass  # walker already running - nothing to do
+
+    async def _warm_release_group_pages(
+        self,
+        artist_id: str,
+        collected: dict[str, dict[str, Any]],
+        total: int,
+        *,
+        raw_offset: int,
+    ) -> None:
+        """A3 Part 2 / ST4: finish the browse walk off the user's critical
+        path on the repo's default BACKGROUND_SYNC lane (yields to interactive
+        traffic via the 2 s gate instead of competing with it).
+
+        The shared cache key is written ONLY when the walk completed
+        (total > 0 and raw_offset >= total): CancelledError or any failure
+        breaks out leaving the key untouched, exactly like today's failed
+        walk - an outage can never pin a truncated catalog."""
+        cache_key = mb_artist_release_groups_key(artist_id)
+        pages_done = 1 if raw_offset else 0
+
+        while pages_done < _MAX_RG_PAGES and raw_offset < max(total, 1):
+            try:
+                (
+                    release_groups,
+                    mb_total,
+                ) = await self._mb_repo.get_artist_release_groups(
+                    artist_id, raw_offset, 100
+                )
+            except asyncio.CancelledError:
+                logger.info("Release-group warm cancelled for %s", artist_id[:8])
+                return
+            except Exception:
+                logger.error(
+                    "Release-group warm failed for %s", artist_id[:8], exc_info=True
+                )
+                return
+
             total = mb_total or total
             if not release_groups:
                 break
@@ -666,18 +989,17 @@ class ArtistService:
                     continue
                 collected.setdefault(str(group_id).casefold(), group)
             raw_offset += len(release_groups)
-            pages += 1
+            pages_done += 1
             if raw_offset >= total:
                 break
 
-        full_list = list(collected.values())
         if total > 0 and raw_offset >= total:
+            full_list = list(collected.values())
             await self._cache.set(
                 cache_key,
                 full_list,
                 ttl_seconds=self._get_artist_ttl(in_library=False),
             )
-        return full_list
 
     async def _fetch_artist_data(
         self,
@@ -688,20 +1010,28 @@ class ArtistService:
         include_releases: bool = True,
     ) -> tuple[dict, set[str], set[str], set[str]]:
         if library_artist_mbids is not None and library_album_mbids is not None:
+            # B3.1: cache-mbid read rides alongside the requested fetch instead
+            # of a serial tail after the main gather.
             mb_artist = await self._mb_repo.get_artist_by_id(artist_id)
             library_mbids = library_artist_mbids
             album_mbids = library_album_mbids
             try:
-                requested_mbids = await self._library_repo.get_requested_mbids()
+                requested_mbids, cache_mbids = await asyncio.gather(
+                    self._library_repo.get_requested_mbids(),
+                    self._get_library_cache_mbids(),
+                )
+                album_mbids = album_mbids | cache_mbids
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"Lidarr unavailable, proceeding without requested data: {exc}"
                 )
                 requested_mbids = set()
         elif self._ownership is not None:
-            mb_artist, artist_relationship = await asyncio.gather(
+            # B3.1: cache-mbid read joins the gather (spare width).
+            mb_artist, artist_relationship, cache_mbids = await asyncio.gather(
                 self._mb_repo.get_artist_by_id(artist_id),
                 self._ownership.provider_artist_relationship(artist_id),
+                self._get_library_cache_mbids(),
             )
             if not mb_artist:
                 raise ResourceNotFoundError("Artist not found")
@@ -713,12 +1043,16 @@ class ArtistService:
                 )
             else:
                 album_mbids, requested_mbids = set(), set()
+            album_mbids = album_mbids | cache_mbids
         else:
+            # B3.1: cache-mbid read joins the gather (4-wide already had room;
+            # failures degrade to an empty set like the other library reads).
             mb_artist, *library_results = await asyncio.gather(
                 self._mb_repo.get_artist_by_id(artist_id),
                 self._library_repo.get_artist_mbids(),
                 self._library_repo.get_library_mbids(include_release_ids=True),
                 self._library_repo.get_requested_mbids(),
+                self._get_library_cache_mbids(),
                 return_exceptions=True,
             )
             if isinstance(mb_artist, BaseException):
@@ -744,14 +1078,79 @@ class ArtistService:
                 if not isinstance(library_results[2], BaseException)
                 else set()
             )
-
-        cache_mbids = await self._get_library_cache_mbids()
-        album_mbids = album_mbids | cache_mbids
+            cache_mbids = (
+                library_results[3]
+                if not isinstance(library_results[3], BaseException)
+                else set()
+            )
+            album_mbids = album_mbids | cache_mbids
 
         if not mb_artist:
             raise ResourceNotFoundError("Artist not found")
 
+        # A3/ST4 Part 3: convert the accidental prefetch into intentional
+        # coverage. The artist-detail payload embeds browse page 1 (+count)
+        # whether freshly fetched or served from the detail cache - either
+        # way it is exactly the contiguous offset-0 window. Seed the walker
+        # with it: page-1 costs zero extra MB calls, <=page-1 catalogs
+        # complete inline with no task, larger ones warm in the background.
+        embedded = (
+            mb_artist.get("release-group-list") if isinstance(mb_artist, dict) else None
+        ) or []
+        rg_count = (
+            int(mb_artist.get("release-group-count") or 0)
+            if isinstance(mb_artist, dict)
+            else 0
+        )
+        if embedded:
+            try:
+                await self._seed_release_group_warm_from_embedded(
+                    artist_id, embedded, rg_count
+                )
+            except Exception:  # noqa: BLE001 - warming must never break the build
+                logger.warning(
+                    "Failed to seed release-group warm for %s",
+                    artist_id[:8],
+                    exc_info=True,
+                )
+
         return mb_artist, library_mbids, album_mbids, requested_mbids
+
+    async def _seed_release_group_warm_from_embedded(
+        self, artist_id: str, embedded: list[dict[str, Any]], rg_count: int
+    ) -> None:
+        cache_key = mb_artist_release_groups_key(artist_id)
+        if await self._cache.get(cache_key) is not None:
+            return  # already fully cached by an earlier walk
+        registry = TaskRegistry.get_instance()
+        task_name = f"mb-rg-warm-{artist_id.casefold()}"
+        if registry.is_running(task_name):
+            return  # walker already covering this artist
+
+        seed_items = [g for g in embedded if isinstance(g, dict) and g.get("id")]
+        if not seed_items:
+            return
+
+        if rg_count > 0 and len(seed_items) >= rg_count:
+            # Catalog fits the embedded page: complete inline - no task,
+            # byte-identical write to what the old walk would have cached.
+            deduped: dict[str, dict[str, Any]] = {}
+            for group in seed_items:
+                gid = str(group["id"]).casefold()
+                deduped.setdefault(gid, group)
+            await self._cache.set(
+                cache_key,
+                list(deduped.values()),
+                ttl_seconds=self._get_artist_ttl(in_library=False),
+            )
+            return
+
+        self._spawn_release_group_warm(
+            artist_id,
+            seed_items,
+            rg_count,
+            raw_offset=len(seed_items),
+        )
 
     async def _target_release_group_flags(
         self,

@@ -301,14 +301,29 @@ def test_target_application_exposes_only_typed_library_root_mutations() -> None:
 
 
 def test_deployed_entrypoint_has_no_target_selector_or_target_mount() -> None:
-    backend = Path(__file__).parents[2]
-    deployed_source = (backend / "main.py").read_text()
-    target_source = (backend / "target_application.py").read_text()
+    """F-NL-03 cutover: the legacy main:app entrypoint is an unsupported-install
+    guard - a stale launcher must fail with upgrade guidance, never serve a
+    partial legacy API, and the target source keeps its single composition."""
+    import subprocess
+    import sys
 
-    assert "target_application" not in deployed_source
-    assert "library_target" not in deployed_source
-    assert "library_management" not in deployed_source
-    assert "get_target_" not in deployed_source
+    backend = Path(__file__).parents[2]
+    main_source = (backend / "main.py").read_text()
+    assert "APIRouter" not in main_source
+    assert "include_router" not in main_source
+    assert "FastAPI(" not in main_source
+    assert "target_main:app" in main_source  # operator guidance present
+    result = subprocess.run(
+        [sys.executable, "-c", "import main"],
+        cwd=backend,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(backend)},
+    )
+    assert result.returncode != 0
+    assert "Unsupported installation" in (result.stderr + result.stdout)
+    assert "target_main:app" in (result.stderr + result.stdout)
+    target_source = (backend / "target_application.py").read_text()
     module = ast.parse(target_source)
     assert not any(
         isinstance(node, (ast.Assign, ast.AnnAssign))
@@ -379,7 +394,10 @@ def test_production_target_application_always_runs_startup_validation(
     reject.assert_awaited_once_with("steady_state")
 
 
-def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
+def test_target_lifecycle_retains_every_source_task() -> None:
+    """F-NL-03 cutover: the legacy main.py composition is gone; the target
+    lifecycle is the sole source of long-lived tasks and retains every
+    non-legacy starter (the two legacy scan tasks are removed, not replaced)."""
     backend = Path(__file__).parents[2]
 
     def starter_calls(path: Path, functions: set[str]) -> set[str]:
@@ -395,17 +413,17 @@ def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
             and call.func.id.startswith("start_")
         }
 
-    source = starter_calls(backend / "main.py", {"lifespan"})
     target = starter_calls(
         backend / "target_application.py", {"production_target_lifespan"}
     ) | starter_calls(
         backend / "services/native/target_application_lifecycle.py",
         {"start_target_operational_runtime"},
     )
-    replaced = {"start_library_scan_resume_task", "start_library_auto_scan_task"}
 
-    assert source - replaced <= target
-    assert replaced.isdisjoint(target)
+    assert {
+        "start_library_scan_resume_task",
+        "start_library_auto_scan_task",
+    }.isdisjoint(target)
     assert {
         "start_library_contribution_verification_worker",
         "start_target_scan_supervisor",
@@ -542,10 +560,15 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     monkeypatch.setattr(
         target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None
     )
+    def _capture_supervisor(*args: object, **kwargs: object) -> object:
+        scan_supervisor_arguments["__args"] = args  # type: ignore[assignment]
+        scan_supervisor_arguments.update(kwargs)  # type: ignore[arg-type]
+        return None
+
     monkeypatch.setattr(
         target_module,
         "start_target_scan_supervisor",
-        lambda *args, **kwargs: scan_supervisor_arguments.update(kwargs),
+        _capture_supervisor,
     )
     identification_worker_arguments: dict[str, object] = {}
     monkeypatch.setattr(
@@ -563,6 +586,11 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         target_module,
         "start_library_contribution_verification_worker",
         lambda *a, **k: None,
+    )
+    # (GH-293) The PASSIVE WAL checkpoint task registers a real background loop;
+    # drain it here so lifespan tests never leave a pending task behind.
+    monkeypatch.setattr(
+        target_module, "start_target_wal_checkpoint_task", lambda _service: None
     )
     watchdog_starters: dict[str, object] = {}
     monkeypatch.setattr(
@@ -631,7 +659,16 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     timezone_name.assert_called_once_with()
+    supervisor_args = scan_supervisor_arguments.get("__args")  # type: ignore[assignment]
+    assert isinstance(supervisor_args, tuple) and len(supervisor_args) == 3
+    assert callable(supervisor_args[0])
+    assert callable(supervisor_args[1])
+    assert supervisor_args[2] is work_wakeups
+    assert callable(scan_supervisor_arguments.get("scheduler_getter"))
+    assert callable(scan_supervisor_arguments.get("resolver_getter"))
+    assert callable(scan_supervisor_arguments.get("schedule_settings_getter"))
     assert set(watchdog_starters) == {
+        "target-library-scan-supervisor",
         "target-library-identification-worker",
         "target-library-operation-worker",
         "library-contribution-verification-worker",
@@ -690,6 +727,76 @@ def test_production_target_lifespan_rejects_malformed_admission_before_validatio
             pass
 
     validate.assert_not_awaited()
+def test_production_target_lifespan_closes_scan_coordinator_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import target_application as target_module
+    from core.dependencies import auth_providers
+    from maintenance import automatic_upgrade
+
+    lifecycle_order: list[str] = []
+    validate = AsyncMock(side_effect=lambda _phase: lifecycle_order.append("validate"))
+    admission = AsyncMock(side_effect=lambda _settings: lifecycle_order.append("admit"))
+    init = AsyncMock()
+    cleanup = AsyncMock()
+    migrate = AsyncMock(side_effect=lambda **_kwargs: lifecycle_order.append("migrate"))
+    operational = AsyncMock(side_effect=lambda **_kwargs: lifecycle_order.append("operational"))
+    timezone_name = MagicMock(return_value="Europe/London")
+    cache = SimpleNamespace(clear=AsyncMock())
+    preferences = SimpleNamespace(
+        get_instance_id=lambda: "instance",
+        get_advanced_settings=lambda: SimpleNamespace(memory_cache_cleanup_interval=60, disk_cache_cleanup_interval=60),
+        get_typed_library_settings=lambda: SimpleNamespace(library_roots=[], enabled=True),
+        get_library_scan_schedule=lambda: SimpleNamespace(scan_frequency="manual", daily_scan_time="03:00"),
+    )
+    auth = SimpleNamespace(cleanup_expired_tokens=AsyncMock())
+    auth_store = object()
+    operation_supervisor = SimpleNamespace(recover=AsyncMock(side_effect=lambda: lifecycle_order.append("operation-recovery")))
+    recovery_service = SimpleNamespace(
+        recover_startup=AsyncMock(return_value=SimpleNamespace(examined_bundles=0, recovered_bundles=0, rolled_back_bundles=0, needs_attention_bundles=0, skipped_bundles=0), side_effect=lambda: (lifecycle_order.append("management-recovery") or SimpleNamespace(examined_bundles=0, recovered_bundles=0, rolled_back_bundles=0, needs_attention_bundles=0, skipped_bundles=0))),
+    )
+    monkeypatch.setattr(target_module.TargetStartupValidator, "validate", validate)
+    monkeypatch.setattr(automatic_upgrade, "await_target_startup_admission", admission)
+    monkeypatch.setattr(target_module, "init_app_state", init)
+    monkeypatch.setattr(target_module, "cleanup_app_state", cleanup)
+    monkeypatch.setattr(target_module, "run_target_one_time_migrations", migrate)
+    monkeypatch.setattr(target_module, "start_target_operational_runtime", operational)
+    monkeypatch.setattr(target_module, "_server_timezone_name", timezone_name)
+    monkeypatch.setattr(target_module, "get_preferences_service", lambda: preferences)
+    monkeypatch.setattr(target_module, "get_native_library_store", lambda: SimpleNamespace(work_wakeups=object()))
+    monkeypatch.setattr(target_module, "get_cache", lambda: cache)
+    monkeypatch.setattr(target_module, "get_disk_cache", lambda: object())
+    monkeypatch.setattr(target_module, "get_target_library_operation_supervisor", lambda: operation_supervisor)
+    monkeypatch.setattr(target_module, "get_library_management_recovery_service", lambda: recovery_service)
+    monkeypatch.setattr(target_module, "get_target_consumer_composition", lambda: SimpleNamespace(covers=SimpleNamespace(disk_cache=object())))
+    monkeypatch.setattr(target_module, "start_cache_cleanup_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_memory_maintenance_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_scan_supervisor", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_identification_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_operation_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_library_contribution_verification_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_wal_checkpoint_task", lambda _service: None)
+    monkeypatch.setattr(target_module, "start_target_worker_watchdog", lambda starters: None)
+    pending_migration = AsyncMock()
+    pending_migration.schedule.return_value = False
+    monkeypatch.setattr(target_module, "get_legacy_pending_migration_service", lambda: pending_migration)
+    monkeypatch.setattr(auth_providers, "get_auth_service", lambda: auth)
+    monkeypatch.setattr(auth_providers, "get_auth_store", lambda: auth_store)
+    coordinator_close = AsyncMock()
+    mock_coordinator = SimpleNamespace(aclose=coordinator_close, close=MagicMock())
+    monkeypatch.setattr(target_module, "get_target_library_scan_coordinator", lambda: mock_coordinator)
+    registry = target_module.TaskRegistry.get_instance()
+    monkeypatch.setattr(registry, "cancel", AsyncMock())
+    monkeypatch.setattr(registry, "cancel_all", AsyncMock())
+    monkeypatch.setenv("TZ", "Europe/London")
+    monkeypatch.delenv("DROPPEDNEEDLE_TARGET_ADMISSION_TOKEN", raising=False)
+    app = create_production_target_application()
+    with build_test_client(app):
+        pass
+    coordinator_close.assert_awaited_once()
+
+
 
 
 def test_target_provider_call_graph_has_no_direct_legacy_catalog_edge() -> None:
@@ -779,12 +886,12 @@ def test_target_cover_provider_has_no_legacy_catalog_inputs(monkeypatch) -> None
     repo_providers.get_target_coverart_repository.cache_clear()
 
     assert repo_providers.get_target_coverart_repository() is built
-    # Native folder/embedded art is a provider-side input; the legacy catalog
-    # handles (library_repo, library_db) must stay absent.
-    assert builder.call_count == 1
-    assert builder.call_args.args == ()
-    assert set(builder.call_args.kwargs) == {"native_library_store"}
-    assert builder.call_args.kwargs["native_library_store"] is not None
+    # Mechanical repair during F-PERF-04 verification: this provider now
+    # receives the native library store singleton by design (pre-existing
+    # stale assertion found failing at HEAD 509e01e before any local edits).
+    builder.assert_called_once_with(
+        native_library_store=repo_providers.get_native_library_store()
+    )
 
     repo_providers.get_target_coverart_repository.cache_clear()
 
@@ -871,3 +978,119 @@ def test_target_application_refuses_startup_when_validation_fails() -> None:
     with pytest.raises(TargetStartupInvariantError, match="scratch invariant failure"):
         with build_test_client(app):
             pass
+
+
+def test_store_prune_task_receives_the_native_library_singleton() -> None:
+    """F-PERF-04: the six-hour store-prune task must receive the native
+    library store through the dependency-registry getter - never a separately
+    constructed store (AGENTS singleton rule)."""
+    lifecycle = (
+        Path(__file__).parents[2] / "services/native/target_application_lifecycle.py"
+    )
+    module = ast.parse(lifecycle.read_text())
+    calls = [
+        call
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "start_target_operational_runtime"
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "start_store_prune_task"
+    ]
+    assert len(calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+    native = keywords.get("native_store")
+    assert native is not None, "native_store kwarg missing from start_store_prune_task"
+    assert (
+        isinstance(native, ast.Call)
+        and isinstance(native.func, ast.Name)
+        and native.func.id == "get_native_library_store"
+    ), "native_store must come from get_native_library_store()"
+
+
+def _build_production_app_with_base(
+    monkeypatch: pytest.MonkeyPatch, base_path: str
+):
+    """Build the production target app with BASE_PATH forced and settings fresh."""
+    monkeypatch.setenv("BASE_PATH", base_path)
+    import core.config as config_module
+
+    monkeypatch.setattr(config_module, "_settings", None)
+    return build_test_client(create_production_target_application())
+
+
+def test_production_target_places_base_path_inside_proxy_headers() -> None:
+    from api.compat.common.path_case import CompatPathCaseMiddleware
+    from core.base_path import BasePathMiddleware
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    app = create_production_target_application()
+    outermost = [middleware.cls for middleware in app.user_middleware[:3]]
+    assert outermost == [
+        ProxyHeadersMiddleware,
+        BasePathMiddleware,
+        CompatPathCaseMiddleware,
+    ]
+
+
+def test_prefixed_surface_serves_health_and_api_under_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    prefixed_health = client.get("/music/health")
+    assert prefixed_health.status_code == 200
+    assert prefixed_health.json() == {
+        "status": "ok",
+        "message": "DroppedNeedle backend running",
+    }
+
+    unprefixed_health = client.get("/health")
+    assert unprefixed_health.status_code == 404
+    assert unprefixed_health.json() == {
+        "error": {"code": "NOT_FOUND", "message": "Not found", "details": None}
+    }
+
+    assert client.get("/music/api/v1/openapi.json").status_code == 200
+    assert client.get("/api/v1/openapi.json").status_code == 404
+
+
+def test_prefix_matching_is_segment_exact_and_strips_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    for path in ["//music/health", "/music-x/health", "/musicx/health"]:
+        response = client.get(path)
+        assert response.status_code == 404, path
+        assert response.json()["error"]["code"] == "NOT_FOUND", path
+
+    assert client.get("/music/music/health").status_code == 404
+
+
+def test_auth_middleware_guards_prefixed_api_but_sees_nothing_unprefixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    protected = client.get("/music/api/v1/artists")
+    assert protected.status_code == 401
+    assert protected.json()["error"]["code"] == "UNAUTHORIZED"
+
+    hidden = client.get("/api/v1/artists")
+    assert hidden.status_code == 404
+    assert hidden.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_empty_base_path_keeps_today_unprefixed_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "")
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/v1/openapi.json").status_code == 200
+
+    protected = client.get("/api/v1/artists")
+    assert protected.status_code == 401
+    assert protected.json()["error"]["code"] == "UNAUTHORIZED"

@@ -31,6 +31,7 @@ Design (validated against real Newznab/Soulseek result sets):
   the same scene-filename-collision caution that keeps ``part N`` out of the markers.
 """
 
+from pathlib import Path
 import re
 import unicodedata
 
@@ -85,7 +86,33 @@ _EDITION = frozenset({
     "limited", "collectors", "collector", "bonus", "reissue", "repack", "proper", "mono",
     "stereo", "original", "digipak", "version", "explicit", "clean", "extended", "standard",
     "promo", "disc",
+    # F-EDITION-03 signed additions: valid reissue/edition descriptors that
+    # must not read as foreign album words.
+    "immersion", "experience", "box", "boxset", "super", "oknotok", "mfsl",
+    "half", "speed", "master", "audiophile",
 })
+
+
+def _fold_box_set(tokens: list[str]) -> list[str]:
+    """Fold an adjacent ``box`` + ``set`` pair into the canonical ``boxset``
+    descriptor so dotted/hyphenated/underscored spellings behave identically
+    (F-EDITION-03). A bare ``set`` stays an album word."""
+    folded: list[str] = []
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index] == "box"
+            and index + 1 < len(tokens)
+            and tokens[index + 1] == "set"
+        ):
+            folded.append("boxset")
+            index += 2
+        else:
+            folded.append(tokens[index])
+            index += 1
+    return folded
+
+
 # Sidecar / packaging extensions a per-file result or folder listing drags in.
 _SIDECAR = frozenset({
     "log", "cue", "nfo", "sfv", "m3u", "m3u8", "jpg", "jpeg", "png", "txt", "pdf", "par",
@@ -202,13 +229,32 @@ def artist_evidence(artist_name: str, candidate_path: str) -> bool:
 
     Stopwords are dropped from the artist's words so "The Who" needs "who", not the
     ubiquitous "the" (fallback to all words when the name is entirely stopwords)."""
-    words = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2 and t not in _STOP}
+    # GH-284: digit-bearing names (deadmau5, u2) keep their alphanumeric tokens -
+    # ``isalpha()`` alone dropped them, so no candidate could ever earn evidence.
+    # Pure-numeric names (311) are excluded here: a bare number must match an
+    # exact path SEGMENT (artist directory), not any word in the path.
+    name_tokens = _tokens(artist_name)
+    words = {
+        t
+        for t in name_tokens
+        if len(t) >= 2
+        and (t.isalpha() or (any(c.isdigit() for c in t) and any(c.isalpha() for c in t)))
+        and t not in _STOP
+    }
     if not words:
-        words = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
+        words = {t for t in name_tokens if t.isalpha() and len(t) >= 2}
+    pure_numeric = {t for t in name_tokens if t.isdigit() and len(t) >= 2}
     # Soulseek remote paths are backslash-delimited; ``_SEP_RE`` (calibrated for release
     # TITLES) doesn't split on backslash, so normalise to '/' before tokenising or every
     # directory level glues to its neighbour and the artist token is never seen.
-    return _artist_present(_tokens(candidate_path.replace("\\", "/")), words)
+    normalized = candidate_path.replace("\\", "/")
+    if _artist_present(_tokens(normalized), words):
+        return True
+    if pure_numeric:
+        segments = {part.casefold() for part in normalized.split("/") if part}
+        stems = {Path(part).stem.casefold() for part in segments if "." in part}
+        return bool(pure_numeric & (segments | stems))
+    return False
 
 
 def names_different_album(album_title: str, artist_name: str, candidate_title: str) -> bool:
@@ -220,10 +266,13 @@ def names_different_album(album_title: str, artist_name: str, candidate_title: s
     and only when the artist is recognisably present (a fully obfuscated title is left to the
     indexer-match base score + import tag-match). Version descriptors are stripped from both
     sides so a deluxe/remaster of the requested album matches."""
+    # F-EDITION-03: fold the ``box`` + ``set`` compound to the canonical
+    # ``boxset`` descriptor on both sides so dotted/hyphenated/underscored
+    # spellings compare identically. A bare ``set`` stays an album word.
     artist = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
-    candidate = _tokens(candidate_title)
+    candidate = _fold_box_set(_tokens(candidate_title))
     if not _artist_present(candidate, artist):
         return False
-    wanted = _content_words(_tokens(album_title), artist)
+    wanted = _content_words(_fold_box_set(_tokens(album_title)), artist)
     got = _content_words(_album_region(candidate), artist)
     return bool(got - wanted)

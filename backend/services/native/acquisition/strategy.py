@@ -3,22 +3,18 @@
 Each acquisition source (Soulseek via slskd, Usenet via Newznab+SABnzbd) differs in
 search, identity, enqueue, poll→status, completed-file enumeration and cleanup. Lidarr
 sprinkles ``if protocol == usenet`` across its download flow; we collapse those branches
-behind a ``SourceStrategy`` so the orchestrator never branches on source.
-
-Extracted in behaviour-preserving slices (each verbatim + suite-green):
-- slice 1: ``search_and_score`` (find candidates for this source).
-- slice 2a: ``import_files`` (per-file slskd import vs unpacked-folder Usenet import).
-- slice 2b: ``enqueue`` (build + persist the manifest, hand off to the client).
-Source-enablement stays on the orchestrator (it reads the live enable toggles). Later
-slices fold in identity + blocklist-on-failure and the failover-loop source branches.
+behind a ``SourceStrategy`` so the orchestrator never branches on source. Source
+enablement stays on the orchestrator (it reads the live enable toggles).
 """
 
 import asyncio
+from contextlib import suppress
 import logging
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from models.acquisition_quality import AcquisitionQualitySnapshot
 from models.download import ScoredCandidate, TargetAlbum, TargetTrack
 from models.download_identity import soulseek_identity, usenet_identity
 from models.download_manifest import DownloadManifest, ExpectedFile, ExpectedTrack
@@ -33,7 +29,9 @@ from services.native.file_processor import (
     QUARANTINE_REASONS,
     FileFailure,
     ProcessResult,
+    _TAG_TITLE_WEAK,
 )
+from services.native.title_match import title_containment_score
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +141,84 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
     return selected_release, expected
 
 
+def _file_serves_expected(value, tracks) -> bool:  # noqa: ANN001
+    """Whether one search-result file plausibly serves any of ``tracks`` - the
+    per-file failover filter (#292). Search-side evidence only (filename stem +
+    advertised duration), judged by the SAME thresholds the post-download matcher
+    applies (coverage's ``row_covers_track`` rules): containment-strong title,
+    duration within max(15s, 10%). Evidence is tri-state per track: a disagreeing
+    title only excludes when duration cannot rescue it (peer paths like ``02.flac``
+    carry no title signal), a hard duration miss always excludes, and a track with
+    no usable signal cannot be discriminated - its files pass rather than strand
+    the position on every candidate."""
+    stem = value.filename.replace("\\", "/").rsplit("/", 1)[-1]
+    base, dot, _ext = stem.rpartition(".")
+    if dot and base:
+        stem = base
+    for track in tracks:
+        title_ok = None
+        if track.title and stem:
+            title_ok = title_containment_score(track.title, stem) >= _TAG_TITLE_WEAK
+        duration_ok = None
+        if track.duration_seconds and value.duration:
+            duration_ok = (
+                abs(value.duration - track.duration_seconds)
+                <= max(15.0, 0.10 * track.duration_seconds)
+            )
+        if duration_ok is False:
+            continue
+        if title_ok is False and duration_ok is not True:
+            continue
+        return True
+    return False
+
+
+def pre_publication_quality_check(
+    task,
+    candidate,
+    files,
+    tagger,
+):  # noqa: ANN001
+    """UNCONDITIONAL local verification before publication (Acquisition plan):
+    probe the downloaded bytes through the codec-aware tagger and re-run the
+    task's STORED snapshot evaluation on measured facts. Returns a mismatch
+    dict, or None when the quality is acceptable / cannot be judged (no stored
+    snapshot, no tagger wired - tests - or unreadable files)."""
+    if tagger is None or not files:
+        return None
+    raw = getattr(task, "quality_snapshot_json", None)
+    if not raw:
+        return None
+    from models.acquisition_quality import AcquisitionQualitySnapshot
+
+    import msgspec as _ms
+
+    try:
+        snapshot = _ms.json.decode(raw, type=AcquisitionQualitySnapshot)
+    except ValueError:
+        return None
+
+    from services.native.acquisition import quality as acq_quality
+    from services.native.acquisition.local_probe import (
+        expected_vs_actual_copy,
+        probe_files_sync,
+        quality_mismatch,
+    )
+
+    try:
+        probed = probe_files_sync(files, tagger)
+    except Exception:  # noqa: BLE001 - an unreadable byte never blocks publication
+        return None
+    decision = getattr(candidate, "quality_decision", None)
+    if quality_mismatch(snapshot, decision, probed):
+        return {
+            "reason": "post_download_quality_mismatch",
+            "detail": expected_vs_actual_copy(decision, probed),
+        }
+    return None
+
+
+
 @runtime_checkable
 class SourceStrategy(Protocol):
     """One acquisition source's behaviour. The orchestrator holds a ``{name: strategy}``
@@ -190,8 +266,10 @@ class SourceStrategy(Protocol):
         timeout: float,
         auto: float,
         manual: float,  # noqa: ANN001
+        snapshot: AcquisitionQualitySnapshot,
     ) -> list[ScoredCandidate]:
-        """Search this source for ``task`` and return its scored candidates (best first)."""
+        """Search this source for ``task`` and return its scored candidates
+        ranked under the task's immutable quality snapshot (best first)."""
         ...
 
     async def enqueue(
@@ -201,10 +279,14 @@ class SourceStrategy(Protocol):
         *,
         strict_track_duration: bool,
         hold_on_wrong_track: bool = False,  # noqa: ANN001
+        remaining_positions: "frozenset[tuple[int, int]] | None" = None,
     ) -> None:
         """Build + persist the crash-recovery manifest, then hand the pick to the client.
         ``hold_on_wrong_track`` (the last-resort track re-pull, D9): a canonical-duration
-        failure at import then holds the file for review instead of failing it."""
+        failure at import then holds the file for review instead of failing it.
+        ``remaining_positions`` (per-file failover, #292): when given, ask ONLY for the
+        still-missing (disc, track) positions instead of the whole album; Usenet ignores
+        it (an NZB is the smallest addressable unit)."""
         ...
 
     async def import_files(
@@ -241,6 +323,8 @@ class SoulseekStrategy:
         naming_template,
         library=None,
         album_service=None,
+        policy_extras=None,  # Callable[[], SpecPolicy | None]: live NON-quality gates
+        probe_tagger=None,  # AudioTagger for the pre-publication quality probe
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -254,6 +338,8 @@ class SoulseekStrategy:
         # Resolves the held tier an origin='upgrade' run must beat (upgrade-floor, D12).
         self._library = library
         self._album_service = album_service
+        self._policy_extras = policy_extras
+        self._probe_tagger = probe_tagger
 
     @property
     def client(self):  # noqa: ANN201
@@ -261,6 +347,9 @@ class SoulseekStrategy:
 
     def candidate_identity(self, candidate) -> str:  # noqa: ANN001
         return candidate.username
+
+    def _extras(self):
+        return self._policy_extras() if self._policy_extras is not None else None
 
     def local_fault_message(self, attempt_mount: bool) -> str:  # noqa: ARG002
         # slskd's only local fault is an unreachable downloads mount (attempt_mount is True here).
@@ -273,8 +362,11 @@ class SoulseekStrategy:
         # there's no release-level blocklist to apply at failover time.
         return
 
-    async def search_and_score(self, task, *, timeout, auto, manual):  # noqa: ANN001, ANN201
+    async def search_and_score(
+        self, task, *, timeout, auto, manual, snapshot
+    ):  # noqa: ANN001, ANN201
         held_tier = await _upgrade_held_tier(self._library, task)
+        extras = self._extras()
         if task.download_type == "track":
             target = TargetTrack(
                 artist_name=task.artist_name,
@@ -293,6 +385,7 @@ class SoulseekStrategy:
             return await self._track_matcher.rank(
                 target,
                 results,
+                snapshot=snapshot,
                 auto_accept_threshold=auto,
                 manual_threshold=manual,
                 held_tier=held_tier,
@@ -324,6 +417,7 @@ class SoulseekStrategy:
             return await self._track_matcher.rank(
                 target,
                 results,
+                snapshot=snapshot,
                 auto_accept_threshold=auto,
                 manual_threshold=manual,
                 held_tier=held_tier,
@@ -346,13 +440,21 @@ class SoulseekStrategy:
         return await self._scorer.rank(
             target,
             results,
+            snapshot=snapshot,
+            spec_extras=extras,
             auto_accept_threshold=auto,
             manual_threshold=manual,
             held_tier=held_tier,
         )
 
     async def enqueue(
-        self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False
+        self,
+        task,
+        candidate,
+        *,
+        strict_track_duration,
+        hold_on_wrong_track=False,
+        remaining_positions=None,
     ):  # noqa: ANN001, ANN201
         # For a per-track download - or a 1-track album (a single, whose identity was
         # threaded at request time) - verify the imported file against the CANONICAL
@@ -374,13 +476,33 @@ class SoulseekStrategy:
         ):
             raise OrchestrationError("could not resolve the exact album tracklist")
 
+        # Per-file failover (#292): when the orchestrator says only some (disc, track)
+        # positions are still missing, ask this peer for JUST those - expected_tracks
+        # shrinks to them, and only files that plausibly serve one get enqueued. slskd
+        # keeps partial bytes per file, so re-requesting a missing track RESUMES its
+        # earlier errored attempt instead of starting over.
+        serving = candidate.files
+        if remaining_positions is not None:
+            expected_tracks = [
+                value
+                for value in expected_tracks
+                if (value.disc_number or 1, value.track_number) in remaining_positions
+            ]
+            if not expected_tracks:
+                raise OrchestrationError("nothing left to acquire from this source")
+            serving = [
+                value
+                for value in candidate.files
+                if _file_serves_expected(value, expected_tracks)
+            ]
+
         files = [
             DownloadFileRef(
                 username=candidate.username, filename=f.filename, size=f.size
             )
-            for f in candidate.files
+            for f in serving
         ]
-        total_size = sum(f.size for f in candidate.files)
+        total_size = sum(f.size for f in serving)
         await self._store.update_status(
             task.id,
             "downloading",
@@ -397,7 +519,7 @@ class SoulseekStrategy:
         initial_handle = TaskHandle(
             source="soulseek",
             username=candidate.username,
-            filenames=[f.filename for f in candidate.files],
+            filenames=[f.filename for f in serving],
         )
         attempt = await self._store.create_download_attempt(
             task_id=task.id,
@@ -428,7 +550,7 @@ class SoulseekStrategy:
                     if use_canonical
                     else f.duration,
                 )
-                for f in candidate.files
+                for f in serving
             ],
             # Complete selected-edition map. Transfer filenames remain the correlation
             # keys; import maps each audio file to one exact release position and then
@@ -476,17 +598,50 @@ class SoulseekStrategy:
             "download.processing",
             extra={"task_id": task.id, "files_total": len(manifest.target_files)},
         )
+        # UNCONDITIONAL local quality probe before publication handoff.
+        if self._probe_tagger is not None:
+            local_paths: list = []
+            for target_file in manifest.target_files:
+                with suppress(Exception):
+                    resolved = await self._client.get_file_path(
+                        getattr(manifest, "handle", None), target_file.filename
+                    )
+                    if resolved is not None:
+                        local_paths.append(resolved)
+            candidate = await self._current_candidate(task)
+            mismatch = pre_publication_quality_check(
+                task, candidate, local_paths, self._probe_tagger
+            )
+            if mismatch is not None:
+                logger.info(
+                    "download.quality_mismatch",
+                    extra={"task_id": task.id, **{k: v for k, v in mismatch.items() if k != "probed"}},
+                )
+                failed = [
+                    FileFailure(filename=f.filename, reason=mismatch["reason"])
+                    for f in manifest.target_files
+                ]
+                return ProcessResult(succeeded=[], failed=failed), len(failed)
+
         result = await self._file_processor.process_downloaded(
             manifest, only_filenames=only_filenames
         )
         for failure in result.failed:
-            if failure.reason in QUARANTINE_REASONS:
+            # ``tag_mismatch`` is intentionally kept on the returned ProcessResult so
+            # callers can report the truthful content-verification outcome. The
+            # quarantine table's existing CHECK vocabulary predates this reason, so
+            # persist it as the equivalent ``verify_failed`` source exclusion without
+            # changing the failure surfaced to the orchestrator or held-import UI.
+            quarantine_reason = (
+                "verify_failed" if failure.reason == "tag_mismatch" else failure.reason
+            )
+            if quarantine_reason in QUARANTINE_REASONS:
                 await self._store.record_quarantine(
                     source="soulseek",
                     identity=soulseek_identity(
                         task.source_username or "", failure.filename
                     ),
-                    reason=failure.reason,
+                    reason=quarantine_reason,
                     release_group_mbid=task.release_group_mbid,
                 )
                 logger.info(
@@ -502,6 +657,20 @@ class SoulseekStrategy:
                 task.id, str(Path(result.succeeded[0]).parent)
             )
         return result, len(result.succeeded) + len(result.failed)
+
+    async def _current_candidate(self, task):  # noqa: ANN001
+        """The selected candidate blob for this task (None when unlinked)."""
+        try:
+            if task.search_job_id is None or task.candidate_index is None:
+                return None
+            candidates = await self._store.get_search_job_candidates(
+                task.search_job_id
+            )
+            if 0 <= task.candidate_index < len(candidates):
+                return candidates[task.candidate_index]
+        except Exception:  # noqa: BLE001 - probe path must fail open
+            return None
+        return None
 
 
 class UsenetStrategy:
@@ -532,6 +701,8 @@ class UsenetStrategy:
         post_processing,
         min_release_age_seconds,
         library=None,
+        policy_extras=None,
+        probe_tagger=None,
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -549,6 +720,8 @@ class UsenetStrategy:
         self._priority = priority
         self._post_processing = post_processing
         self._min_release_age = min_release_age_seconds
+        self._policy_extras = policy_extras
+        self._probe_tagger = probe_tagger
 
     @property
     def client(self):  # noqa: ANN201
@@ -632,10 +805,13 @@ class UsenetStrategy:
             },
         )
 
-    async def search_and_score(self, task, *, timeout, auto, manual):  # noqa: ANN001, ANN201
+    async def search_and_score(
+        self, task, *, timeout, auto, manual, snapshot
+    ):  # noqa: ANN001, ANN201
         # A track upgrade still fetches the album NZB (D4), but its floor is the
         # RECORDING's held tier - _upgrade_held_tier scopes by download_type.
         held_tier = await _upgrade_held_tier(self._library, task)
+        extras = self._policy_extras() if self._policy_extras else None
         target = TargetAlbum(
             artist_name=task.artist_name,
             album_title=task.album_title,
@@ -654,6 +830,8 @@ class UsenetStrategy:
         return await self._scorer.rank(
             target,
             releases,
+            snapshot=snapshot,
+            spec_extras=extras,
             auto_accept_threshold=auto,
             manual_threshold=manual,
             track_count=task.track_count,
@@ -661,13 +839,23 @@ class UsenetStrategy:
         )
 
     async def enqueue(
-        self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False
+        self,
+        task,
+        candidate,
+        *,
+        strict_track_duration,
+        hold_on_wrong_track=False,
+        remaining_positions=None,
     ):  # noqa: ANN001, ANN201, ARG002
         # Hand the chosen album NZB to SABnzbd. The manifest carries the expected MB
         # tracklist (not pre-known filenames) - the folder import matches the unpacked files
         # to it (D18). For a per-track grab (D4) the tracklist is the single track.
         # hold_on_wrong_track is a slskd re-pull concern; the folder import has its own
         # per-track matcher, so it is accepted for protocol conformance and unused.
+        # remaining_positions is likewise accepted-and-ignored (#292): an NZB is the
+        # smallest addressable Usenet unit, so failover stays whole-album here; the
+        # release-level blocklist above already stops re-grabbing an under-delivering
+        # release.
         release = candidate.usenet_release
         if release is None:
             raise OrchestrationError("usenet candidate has no release")
@@ -788,6 +976,41 @@ class UsenetStrategy:
                         FileFailure(filename="", reason=DOWNLOADS_MOUNT_UNAVAILABLE)
                     ],
                 ), enumerated
+        # UNCONDITIONAL local quality probe before publication handoff.
+        if self._probe_tagger is not None:
+            candidate = None
+            try:
+                if task.search_job_id is not None and task.candidate_index is not None:
+                    candidates = await self._store.get_search_job_candidates(
+                        task.search_job_id
+                    )
+                    if 0 <= task.candidate_index < len(candidates):
+                        candidate = candidates[task.candidate_index]
+            except Exception:  # noqa: BLE001 - probe fails open
+                candidate = None
+            mismatch = pre_publication_quality_check(
+                task, candidate, list(files), self._probe_tagger
+            )
+            if mismatch is not None:
+                logger.info(
+                    "download.quality_mismatch",
+                    extra={"task_id": task.id,
+                           "detail": mismatch.get("detail", "")[:200]},
+                )
+                return (
+                    ProcessResult(
+                        succeeded=[],
+                        failed=[
+                            FileFailure(
+                                filename=str(f),
+                                reason=mismatch["reason"],
+                            )
+                            for f in files
+                        ],
+                    ),
+                    enumerated,
+                )
+
         result = await self._file_processor.process_downloaded_folder(manifest, files)
         if result.succeeded:
             await self._store.set_final_path(
@@ -831,6 +1054,8 @@ class TorrentStrategy:
     def __init__(  # noqa: ANN001
         self, *, indexer, scorer, client, store, file_processor, import_settle_seconds,
         staging, manifest_codec, naming_template, album_service, library=None,
+        policy_extras=None,  # Callable[[], SpecPolicy | None]: live NON-quality gates
+        probe_tagger=None,  # AudioTagger for the pre-publication quality probe
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -843,6 +1068,8 @@ class TorrentStrategy:
         self._naming_template = naming_template
         self._album_service = album_service
         self._library = library
+        self._policy_extras = policy_extras
+        self._probe_tagger = probe_tagger
 
     @property
     def client(self):  # noqa: ANN201
@@ -887,8 +1114,9 @@ class TorrentStrategy:
             },
         )
 
-    async def search_and_score(self, task, *, timeout, auto, manual):  # noqa: ANN001, ANN201
+    async def search_and_score(self, task, *, timeout, auto, manual, snapshot):  # noqa: ANN001, ANN201
         held_tier = await _upgrade_held_tier(self._library, task)
+        extras = self._policy_extras() if self._policy_extras else None
         target = TargetAlbum(
             artist_name=task.artist_name, album_title=task.album_title,
             year=task.year, track_count=task.track_count,
@@ -899,12 +1127,20 @@ class TorrentStrategy:
         )
         releases = [r.torrent for r in indexer_results if r.torrent is not None]
         return await self._scorer.rank(
-            target, releases, auto_accept_threshold=auto,
+            target, releases, snapshot=snapshot, spec_extras=extras,
+            auto_accept_threshold=auto,
             manual_threshold=manual, track_count=task.track_count,
             held_tier=held_tier,
         )
 
-    async def enqueue(self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False):  # noqa: ANN001, ANN201, ARG002
+    async def enqueue(  # noqa: ANN201
+        self, task, candidate, *, strict_track_duration,  # noqa: ANN001
+        hold_on_wrong_track=False, remaining_positions=None,  # noqa: ARG002
+    ):
+        # remaining_positions is accepted-and-ignored (#292), as on the Usenet arm:
+        # this path hands qBittorrent the whole torrent, so failover stays whole-release.
+        # (Per-file selection is possible via qBittorrent file priorities, but the
+        # import/manifest seam here is album-granular - out of scope for the sync.)
         release = candidate.torrent_release
         if release is None:
             raise OrchestrationError("torrent candidate has no release")
@@ -992,6 +1228,30 @@ class TorrentStrategy:
                     succeeded=[],
                     failed=[FileFailure(filename="", reason=DOWNLOADS_MOUNT_UNAVAILABLE)],
                 ), enumerated
+        # UNCONDITIONAL local quality probe before publication handoff. Runs BEFORE
+        # the seeding-safe copy: a mismatch then costs no scratch I/O, and the probe
+        # only READS the payload, so the torrent keeps seeding either way.
+        if self._probe_tagger is not None and files:
+            candidate = await self._current_candidate(task)
+            mismatch = pre_publication_quality_check(
+                task, candidate, list(files), self._probe_tagger
+            )
+            if mismatch is not None:
+                logger.info(
+                    "download.quality_mismatch",
+                    extra={"task_id": task.id, "source": "torrent",
+                           "detail": mismatch.get("detail", "")[:200]},
+                )
+                return (
+                    ProcessResult(
+                        succeeded=[],
+                        failed=[
+                            FileFailure(filename=str(f), reason=mismatch["reason"])
+                            for f in files
+                        ],
+                    ),
+                    enumerated,
+                )
         try:
             copies = await asyncio.to_thread(self._copy_for_import, task.id, files)
             result = await self._file_processor.process_downloaded_folder(manifest, copies)
@@ -1002,6 +1262,20 @@ class TorrentStrategy:
             return result, enumerated
         finally:
             await asyncio.to_thread(self._cleanup_scratch, task.id)
+
+    async def _current_candidate(self, task):  # noqa: ANN001
+        """The selected candidate blob for this task (None when unlinked)."""
+        try:
+            if task.search_job_id is None or task.candidate_index is None:
+                return None
+            candidates = await self._store.get_search_job_candidates(
+                task.search_job_id
+            )
+            if 0 <= task.candidate_index < len(candidates):
+                return candidates[task.candidate_index]
+        except Exception:  # noqa: BLE001 - probe path must fail open
+            return None
+        return None
 
     def _copy_for_import(self, task_id: str, files: "list[Path]") -> "list[Path]":
         """Copy the torrent's completed audio files into a per-task scratch dir under

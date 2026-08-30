@@ -10,16 +10,20 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 import maintenance.automatic_upgrade as automatic_upgrade
+
 from core.config import Settings
 from maintenance.automatic_upgrade import (
     AutomaticUpgradeError,
     UPGRADE_ID,
+    _target_ready,
     _upgrade_health_server,
     run_automatic_copy_upgrade,
     run_target_supervisor,
@@ -764,7 +768,7 @@ def test_docker_image_runs_automatic_upgrade_before_target_application() -> None
 def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:
     port = _free_port()
 
-    with _upgrade_health_server(port):
+    with _upgrade_health_server(port, ""):
         with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
             assert response.status == 200
             assert json.loads(response.read()) == {"status": "upgrading"}
@@ -772,6 +776,59 @@ def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:
             urlopen(f"http://127.0.0.1:{port}/api/v1/library", timeout=2)
 
     assert error.value.code == 503
+
+
+def test_upgrade_health_endpoint_serves_only_prefixed_health_under_base_path() -> None:
+    port = _free_port()
+
+    with _upgrade_health_server(port, "/music"):
+        with urlopen(f"http://127.0.0.1:{port}/music/health", timeout=2) as response:
+            assert response.status == 200
+            assert json.loads(response.read()) == {"status": "upgrading"}
+        for path in ("/health", "/music/api/v1/library"):
+            with pytest.raises(HTTPError) as error:
+                urlopen(f"http://127.0.0.1:{port}{path}", timeout=2)
+            assert error.value.code == 503
+
+
+@contextmanager
+def _operational_target(port: int, base_path: str):
+    """Serve an ok health payload exactly where the operational app would."""
+    health_path = f"{base_path}/health"
+
+    class OperationalHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            ready = self.path == health_path
+            body = b'{"status":"ok"}' if ready else b'{"error":"not found"}'
+            self.send_response(200 if ready else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), OperationalHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("base_path,other", [("", "/music"), ("/music", "")])
+def test_target_ready_requires_normalized_base_health(
+    base_path: str, other: str
+) -> None:
+    port = _free_port()
+
+    with _operational_target(port, base_path):
+        assert _target_ready(port, base_path)
+        assert not _target_ready(port, other)
 
 
 def test_copy_upgrade_promotes_only_after_the_working_database_passes(
@@ -989,7 +1046,9 @@ def test_target_clean_exit_before_readiness_is_still_a_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: False)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: False
+    )
 
     result = run_target_supervisor(
         settings,
@@ -1038,7 +1097,9 @@ def test_target_validation_commits_before_releasing_operational_startup(
         return FakeProcess()
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: True
+    )
 
     assert run_target_supervisor(settings, command=["target"]) == 0
     state = json.loads(
@@ -1189,7 +1250,7 @@ def test_target_startup_heartbeat_extends_idle_deadline_until_validation(
         return process
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    def target_ready(_port: int) -> bool:
+    def target_ready(_port: int, _base_path: str) -> bool:
         process.returncode = 0
         return True
 
@@ -1374,7 +1435,9 @@ def test_post_admission_readiness_timeout_records_failure_without_rollback(
         return StalledProcess()
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: False)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: False
+    )
 
     assert (
         run_target_supervisor(
@@ -1402,7 +1465,9 @@ def test_post_admission_readiness_timeout_records_failure_without_rollback(
         "Popen",
         lambda *_args, **_kwargs: StalledProcess(),
     )
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: True
+    )
     assert run_target_supervisor(settings, command=["target"]) == 0
     recovered_state = json.loads(
         (settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
@@ -1455,7 +1520,9 @@ def test_post_admission_clean_exit_records_failure_without_rollback(
         return ExitingProcess(admitted)
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: False)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: False
+    )
 
     assert run_target_supervisor(settings, command=["target"]) == 1
     state = json.loads(
@@ -1621,7 +1688,7 @@ def test_main_uses_the_container_port_for_upgrade_health(
     observed: list[int] = []
 
     @contextmanager
-    def fake_health(port: int):
+    def fake_health(port: int, base_path: str):
         observed.append(port)
         yield
 
@@ -1650,7 +1717,7 @@ def test_main_removes_default_config_when_fresh_upgrade_fails(
         return settings
 
     @contextmanager
-    def fake_health(_port: int):
+    def fake_health(_port: int, _base_path: str):
         yield
 
     def fail(_settings: Settings, **_kwargs: object) -> str:
@@ -1752,6 +1819,149 @@ def test_replace_database_raises_when_content_never_verifies(
     assert _source_value(destination) == "original"
 
 
+
+def _write_multi_page_database(path: Path, value: str = "original") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE source_value (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO source_value VALUES (?)", (value,))
+        connection.execute("CREATE TABLE bulk (payload TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO bulk VALUES (?)",
+            [(f"row-{index}-" + "x" * 120,) for index in range(2000)],
+        )
+
+
+def test_promote_rejects_working_copy_that_fails_quick_check(tmp_path: Path) -> None:
+    """F2/H2: page-level rot in the working copy fails promotion closed
+    before any live byte is swapped; the marker gate alone cannot see it."""
+    settings = _settings(tmp_path)
+    _write_multi_page_database(settings.library_db_path)
+    backup = automatic_upgrade.capture_upgrade_backup(settings)
+    working = automatic_upgrade.prepare_working_copy(settings, backup)
+    working_database = working / "cache" / "library.db"
+    with sqlite3.connect(working_database) as connection:
+        connection.execute("UPDATE source_value SET value = 'migrated'")
+    _mark_migrated(working_database)
+    # Empirically validated technique: flipping a leaf-page header trips
+    # PRAGMA quick_check while the completion-marker gate still passes.
+    with open(working_database, "r+b") as handle:
+        handle.seek(4096 * 3 + 8)
+        handle.write(b"\xde\xad\xbe\xef" * 4)
+    assert automatic_upgrade._database_has_marker(working_database)
+
+    live_before = automatic_upgrade._sha256(settings.library_db_path)
+    with pytest.raises(AutomaticUpgradeError, match="quick_check"):
+        automatic_upgrade.promote_working_copy(settings, working)
+
+    assert automatic_upgrade._sha256(settings.library_db_path) == live_before
+
+
+def test_promote_healthy_working_copy_installs_itself(tmp_path: Path) -> None:
+    """Positive companion for the quick_check gate: an intact working copy
+    promotes unchanged through the same code path."""
+    settings = _settings(tmp_path)
+    _write_unmigrated_database(settings.library_db_path)
+    backup = automatic_upgrade.capture_upgrade_backup(settings)
+    working = automatic_upgrade.prepare_working_copy(settings, backup)
+    working_database = working / "cache" / "library.db"
+    with sqlite3.connect(working_database) as connection:
+        connection.execute("UPDATE source_value SET value = 'migrated'")
+    _mark_migrated(working_database)
+
+    automatic_upgrade.promote_working_copy(settings, working)
+
+    assert automatic_upgrade._database_has_marker(settings.library_db_path)
+    assert _source_value(settings.library_db_path) == "migrated"
+
+
+def test_wal_quarantine_survives_crash_between_unlink_and_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F7/H7: a crash after the destination WAL is quarantined but before the
+    swap leaves the old WAL recoverable beside the database; the restart
+    restore path installs the manifest-verified backup bytes and sweeps the
+    quarantine siblings."""
+    settings = _settings(tmp_path)
+    settings.library_db_path.parent.mkdir(parents=True)
+    crash = {"armed": True}
+    real_replace = os.replace
+
+    class SimulatedPromotionCrash(BaseException):
+        pass
+
+    def crashing_replace(source: object, destination: object, **kwargs: object):
+        if crash["armed"] and Path(str(destination)) == settings.library_db_path:
+            raise SimulatedPromotionCrash
+        return real_replace(source, destination, **kwargs)
+
+    live_connection = sqlite3.connect(settings.library_db_path)
+    try:
+        assert (
+            live_connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        )
+        live_connection.execute("CREATE TABLE source_value (value TEXT NOT NULL)")
+        live_connection.execute("INSERT INTO source_value VALUES ('original')")
+        live_connection.execute("CREATE TABLE wal_value (value TEXT NOT NULL)")
+        live_connection.execute("INSERT INTO wal_value VALUES ('committed')")
+        live_connection.commit()
+        backup = automatic_upgrade.capture_upgrade_backup(settings)
+        manifest = json.loads(
+            (backup.directory / "manifest.json").read_text(encoding="utf-8")
+        )
+
+        working = automatic_upgrade.prepare_working_copy(settings, backup)
+        working_database = working / "cache" / "library.db"
+        with sqlite3.connect(working_database) as connection:
+            connection.execute("UPDATE source_value SET value = 'migrated'")
+        _mark_migrated(working_database)
+
+        # Committed frames that exist ONLY in the -wal file at promote time.
+        live_connection.execute("INSERT INTO wal_value VALUES ('late-wal-row')")
+        live_connection.commit()
+        assert Path(f"{settings.library_db_path}-wal").is_file()
+
+        monkeypatch.setattr(
+            automatic_upgrade.os, "replace", crashing_replace
+        )
+        with pytest.raises(SimulatedPromotionCrash):
+            automatic_upgrade.promote_working_copy(settings, working)
+    finally:
+        live_connection.close()
+
+    quarantined_wal = list(
+        settings.library_db_path.parent.glob(
+            f".{settings.library_db_path.name}-wal.upgrade-*.quarantine"
+        )
+    )
+    assert len(quarantined_wal) == 1
+    assert b"late-wal-row" in quarantined_wal[0].read_bytes()
+    assert not Path(f"{settings.library_db_path}-wal").exists()
+
+    crash["armed"] = False
+    restored = automatic_upgrade._load_upgrade_backup(
+        settings, str(backup.directory)
+    )
+    automatic_upgrade.restore_upgrade_backup(settings, restored)
+
+    assert automatic_upgrade._sha256(settings.library_db_path) == manifest[
+        "database_sha256"
+    ]
+    assert not list(settings.library_db_path.parent.glob("*.quarantine"))
+    recovered = sqlite3.connect(settings.library_db_path)
+    try:
+        assert (
+            recovered.execute("SELECT value FROM source_value").fetchone()[0]
+            == "original"
+        )
+        assert (
+            recovered.execute("SELECT value FROM wal_value").fetchone()[0]
+            == "committed"
+        )
+    finally:
+        recovered.close()
+
+
 def test_upgrade_completes_when_atomic_rename_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1796,3 +2006,351 @@ def test_write_state_falls_back_when_rename_unavailable(
     automatic_upgrade._write_state(path, payload)
 
     assert automatic_upgrade._read_state(path) == payload
+@pytest.mark.asyncio
+async def test_perform_target_migration_carries_probe_timeout_evidence_and_always_closes_reconciler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Use a historical root that will be probed and will timeout
+    historical_root = tmp_path / "Historical" / "Music"
+    historical_root.mkdir(parents=True)
+    (historical_root / "track.flac").write_bytes(b"a" * 100)
+    database = tmp_path / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    from tests.infrastructure.test_legacy_catalog_importer import _create_source
+
+    _create_source(database, historical_root)
+    # Mock Path.stat to block for Historical for longer than probe timeout (5s)
+    blocked = threading.Event()
+    orig_stat = Path.stat
+
+    def blocking_stat(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if "Historical" in str(self):
+            blocked.wait(timeout=10.0)
+        return orig_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", blocking_stat)
+    # Mock other expensive phases, but not the reconciler's reconcile (the behavior under assertion)
+    monkeypatch.setattr(automatic_upgrade, "migrate_legacy_config", lambda: None)
+    from core.config import Settings
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+    from api.v1.schemas.library_policies import LibraryRootSettings, TypedLibrarySettings
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+
+    settings = Settings(
+        root_app_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        library_db_path=database,
+        config_file_path=tmp_path / "config" / "config.json",
+    )
+    settings.config_file_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.config_file_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(automatic_upgrade, "get_settings", lambda: settings)
+    # Mock preferences to return a settings with Missing root (so Historical is outside)
+    from unittest.mock import MagicMock
+
+    mock_preferences = MagicMock()
+    mock_preferences.get_typed_library_settings.return_value = TypedLibrarySettings(
+        library_roots=[LibraryRootSettings(id="root", path=str(tmp_path / "Missing" / "Music"), label="Library", policy="automatic")],
+        staging_path=str(tmp_path / "Staging"),
+    )
+    mock_preferences.retarget_library_roots_for_upgrade = MagicMock()
+    monkeypatch.setattr("core.dependencies.cache_providers.get_preferences_service", lambda: mock_preferences)
+    test_store = NativeLibraryStore(database, threading.Lock())
+    monkeypatch.setattr("core.dependencies.cache_providers.get_native_library_store", lambda: test_store)
+    # Track reconciler aclose
+    from services.native.legacy_path_reconciler import LegacyPathReconciler
+
+    original_aclose = LegacyPathReconciler.aclose
+    aclose_called = []
+
+    async def tracked_aclose(self):  # type: ignore[no-untyped-def]
+        aclose_called.append(True)
+        await original_aclose(self)
+
+    monkeypatch.setattr(LegacyPathReconciler, "aclose", tracked_aclose)
+    # Mock migrator to capture projector and skip flag, and return lenient success
+    captured = {}
+
+    class FakeMigrator:
+        def __init__(self, store, resolver, emit_progress=None, path_projector=None, skip_unmappable_paths=False, **kwargs):  # type: ignore[no-untyped-def]
+            captured["path_projector"] = path_projector
+            captured["skip_unmappable"] = skip_unmappable_paths
+            self.store = store
+            self.resolver = resolver
+
+        async def migrate(self, migration_id, now=None):  # type: ignore[no-untyped-def]
+            from services.native.bounded_legacy_catalog_migrator import BoundedMigrationOutcome
+            from models.library_migration import MigrationDryRunReport
+
+            report = MigrationDryRunReport(
+                migration_id=migration_id,
+                source_revision="src",
+                root_revision="root",
+                state="applied",
+                identified_albums=0,
+                local_only_albums=0,
+                identified_tracks=0,
+                local_only_tracks=0,
+                artists=0,
+                reference_counts=[],
+                network_calls=0,
+                tag_reads=0,
+                fingerprints=0,
+                embedded_art_reads=0,
+            )
+            return BoundedMigrationOutcome(
+                report=report,
+                skipped_counts={"library_file": 2, "review_row": 4},
+                blocker_count=0,
+            )
+
+    monkeypatch.setattr("services.native.bounded_legacy_catalog_migrator.BoundedLegacyCatalogMigrator", FakeMigrator)
+
+    # Mock validator to avoid needing full DB
+    from services.native.target_startup_validator import TargetStartupValidator
+
+    monkeypatch.setattr(TargetStartupValidator, "validate", AsyncMock(return_value={"invariants": {}}))
+    # Mock get_library_policy_resolver to avoid cache
+    monkeypatch.setattr("core.dependencies.service_providers.get_library_policy_resolver", lambda: LibraryPolicyResolver(mock_preferences.get_typed_library_settings.return_value))
+    # GH-300 gate fix: _perform_target_migration imports the resolver from
+    # core.dependencies.service_providers at call time (NEW-MIG-02 refactor),
+    # so patch that binding; the old maintenance.automatic_upgrade attribute
+    # no longer exists.
+
+    try:
+        evidence = await automatic_upgrade._perform_target_migration()
+        assert aclose_called, "reconciler.aclose should be awaited even on timeout"
+        assert captured["path_projector"] is None
+        assert captured["skip_unmappable"] is True
+        assert "path_reconciliation" in evidence
+        assert evidence["path_reconciliation"]["failure_reason"] == "legacy_path_probe_timeout"
+        assert evidence["path_reconciliation"]["mode"] == "blocked"
+        # Sanitized: no raw historical path in evidence
+        import json
+
+        assert str(historical_root) not in json.dumps(evidence["path_reconciliation"])
+        assert evidence.get("skipped", {}).get("library_file", 0) >= 2
+    finally:
+        blocked.set()
+
+
+
+def _forbidden_work_settings(tmp_path: Path) -> tuple[Settings, Path]:
+    historical_root = tmp_path / "Historical" / "Music"
+    historical_root.mkdir(parents=True)
+    (historical_root / "track.flac").write_bytes(b"a" * 100)
+    database = tmp_path / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    from tests.infrastructure.test_legacy_catalog_importer import _create_source
+
+    _create_source(database, historical_root)
+    settings = Settings(
+        root_app_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        library_db_path=database,
+        config_file_path=tmp_path / "config" / "config.json",
+    )
+    settings.config_file_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.config_file_path.write_text("{}", encoding="utf-8")
+    return settings, database
+
+
+def _stub_child_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    database: Path,
+):
+    """Shared stubbing for in-process _perform_target_migration drives."""
+    import threading
+    from unittest.mock import MagicMock
+
+    from api.v1.schemas.library_policies import (
+        LibraryRootSettings,
+        TypedLibrarySettings,
+    )
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+
+    monkeypatch.setattr(automatic_upgrade, "get_settings", lambda: settings)
+    monkeypatch.setattr(automatic_upgrade, "migrate_legacy_config", lambda: None)
+    mock_preferences = MagicMock()
+    mock_preferences.get_typed_library_settings.return_value = TypedLibrarySettings(
+        library_roots=[
+            LibraryRootSettings(
+                id="root",
+                path=str(settings.root_app_dir / "Missing" / "Music"),
+                label="Library",
+                policy="automatic",
+            )
+        ],
+        staging_path=str(settings.root_app_dir / "Staging"),
+    )
+    mock_preferences.retarget_library_roots_for_upgrade = MagicMock()
+    monkeypatch.setattr(
+        "core.dependencies.cache_providers.get_preferences_service",
+        lambda: mock_preferences,
+    )
+    test_store = NativeLibraryStore(database, threading.Lock())
+    monkeypatch.setattr(
+        "core.dependencies.cache_providers.get_native_library_store",
+        lambda: test_store,
+    )
+    monkeypatch.setattr(
+        "core.dependencies.service_providers.get_library_policy_resolver",
+        lambda: LibraryPolicyResolver(
+            mock_preferences.get_typed_library_settings.return_value
+        ),
+    )
+    return test_store
+
+
+@pytest.mark.asyncio
+async def test_forbidden_work_abort_writes_failure_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3/H3a: the forbidden-work guard leaves the counters that name the
+    offending guard behind instead of raising bare."""
+    from models.library_migration import MigrationDryRunReport
+    from services.native.bounded_legacy_catalog_migrator import (
+        BoundedMigrationOutcome,
+    )
+
+    class FakeMigrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        async def migrate(self, migration_id: str, now: float | None = None):
+            report = MigrationDryRunReport(
+                migration_id=migration_id,
+                source_revision="src",
+                root_revision="root",
+                state="applied",
+                identified_albums=0,
+                local_only_albums=0,
+                identified_tracks=0,
+                local_only_tracks=0,
+                artists=0,
+                reference_counts=[],
+                network_calls=1,
+                tag_reads=0,
+                fingerprints=0,
+                embedded_art_reads=0,
+            )
+            return BoundedMigrationOutcome(report=report, blocker_count=0)
+
+    settings, database = _forbidden_work_settings(tmp_path)
+    _stub_child_providers(monkeypatch, settings, database)
+    monkeypatch.setattr(
+        "services.native.bounded_legacy_catalog_migrator.BoundedLegacyCatalogMigrator",
+        FakeMigrator,
+    )
+
+    with pytest.raises(AutomaticUpgradeError, match="not allowed during startup"):
+        await automatic_upgrade._perform_target_migration()
+
+    failure = json.loads(
+        (settings.cache_dir / automatic_upgrade._FAILURE_EVIDENCE_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failure["reason"] == "forbidden_work"
+    assert failure["network_calls"] == 1
+    assert failure["tag_reads"] == 0
+    assert "path_reconciliation" in failure
+
+
+def test_unrestorable_promotion_failure_is_recorded_truthfully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3/H3c: when the post-promotion restore itself fails, the state record
+    says so explicitly instead of leaving a bare `promoting` stage."""
+    settings = _settings(tmp_path)
+    _write_unmigrated_database(settings.library_db_path)
+
+    def runner(_working: Path) -> dict[str, object]:
+        return {"passed": True}
+
+    def broken_promote(_settings: Settings, _working: Path) -> None:
+        raise RuntimeError("simulated promotion crash")
+
+    def broken_restore(_settings: Settings, _backup: object) -> None:
+        raise OSError("restore volume unavailable")
+
+    monkeypatch.setattr(automatic_upgrade, "promote_working_copy", broken_promote)
+    monkeypatch.setattr(automatic_upgrade, "restore_upgrade_backup", broken_restore)
+
+    with pytest.raises(AutomaticUpgradeError) as error:
+        run_automatic_copy_upgrade(settings, runner=runner)
+
+    message = str(error.value)
+    assert "backup could not be restored" in message
+    assert "Do not start an older image" in message
+    state = json.loads(
+        (settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["stage"] == "promoting"
+    assert state["restore_failed"] is True
+    assert state["restore_error_type"] == "OSError"
+
+
+@pytest.mark.asyncio
+async def test_success_evidence_carries_breakdowns_timings_and_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4/H4: success evidence carries the per-kind provenance breakdown,
+    migrator phase timings, and source/config/image identities."""
+    from unittest.mock import AsyncMock
+
+    import services.native.legacy_path_reconciler as lpr_module
+    from api.v1.schemas.library_policies import (
+        LibraryRootSettings,
+        TypedLibrarySettings,
+    )
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+    from services.native.target_startup_validator import TargetStartupValidator
+
+    settings, database = _forbidden_work_settings(tmp_path)
+    resolvable_roots = TypedLibrarySettings(
+        library_roots=[
+            LibraryRootSettings(
+                id="root",
+                path=str(tmp_path / "Historical" / "Music"),
+                label="Library",
+                policy="automatic",
+            )
+        ],
+        staging_path=str(tmp_path / "Staging"),
+    )
+    # /tmp is a blocked probe prefix in production; relax it exactly like the
+    # reconciler tests so the real reconciler can prove the seeded files.
+    monkeypatch.setattr(lpr_module, "_BLOCKED_ROOTS", (Path("/"),))
+    test_store = _stub_child_providers(monkeypatch, settings, database)
+    monkeypatch.setattr(
+        "core.dependencies.service_providers.get_library_policy_resolver",
+        lambda: LibraryPolicyResolver(resolvable_roots),
+    )
+    monkeypatch.setattr(
+        TargetStartupValidator,
+        "validate",
+        AsyncMock(return_value={"invariants": {}}),
+    )
+    monkeypatch.setenv("COMMIT_TAG", "evidence-test")
+
+    evidence = await automatic_upgrade._perform_target_migration()
+
+    store_counts = await test_store.get_migration_provenance_counts(
+        automatic_upgrade.MIGRATION_ID
+    )
+    assert store_counts
+    assert evidence["reference_counts"] == dict(sorted(store_counts.items()))
+    timings = evidence["phase_timings_ms"]
+    assert timings and all(value >= 0 for value in timings.values())
+    assert "Migrating identified catalog tracks" in timings
+    assert evidence["source_sha256"] == automatic_upgrade._sha256(database)
+    assert evidence["config_sha256"] == automatic_upgrade._sha256(
+        settings.config_file_path
+    )
+    assert evidence["image_version"] == "evidence-test"
+    assert evidence["invariants"] == {}

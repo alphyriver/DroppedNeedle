@@ -1,12 +1,11 @@
 /**
- * Integration coverage: every native-engine backend route must have a corresponding
- * frontend surface in the central `API` endpoint registry (which the TanStack Query
- * queries/mutations consume). This both proves coverage and catches path drift between
- * the backend routes and the frontend builders.
+ * Every native-engine backend route must have a matching entry in the central
+ * `API` endpoint registry that queries/mutations consume; this proves coverage
+ * and catches path drift between backend routes and frontend builders.
  *
- * The download-task `GET /downloads/{id}/files` route has no dedicated builder by
- * design - the file list is delivered inside the task-detail response and the live
- * SSE stream, not fetched separately - so it is intentionally excluded below.
+ * `GET /downloads/{id}/files` has no dedicated builder by design - the file list
+ * ships inside the task-detail response and the live SSE stream - so it is
+ * intentionally excluded below.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -14,6 +13,7 @@ import { API } from '$lib/constants';
 
 // [description, actual path produced by the API builder, expected backend route]
 const COVERAGE: Array<[string, string, string]> = [
+	['device session', API.auth.deviceSessions(), '/api/v1/auth/device-sessions'],
 	// local password recovery
 	[
 		'password recovery reset',
@@ -36,6 +36,23 @@ const COVERAGE: Array<[string, string, string]> = [
 	['download next source', API.downloads.nextSource('T1'), '/api/v1/downloads/T1/next-source'],
 	['download retry', API.downloads.retry('T1'), '/api/v1/downloads/T1/retry'],
 	['download reimport', API.downloads.reimport('T1'), '/api/v1/downloads/T1/reimport'],
+	[
+		'download restart with policy',
+		API.downloads.restartWithPolicy('T1'),
+		'/api/v1/downloads/T1/restart-with-current-policy'
+	],
+	// download-clients policy (Acquisition plan)
+	[
+		'download-client policy summary',
+		API.downloadClients.policySummary(),
+		'/api/v1/download-clients/policy-summary'
+	],
+	[
+		'download-client policy impact',
+		API.downloadClients.policyImpact(),
+		'/api/v1/download-clients/policy/impact'
+	],
+
 	[
 		'management hold retry',
 		API.downloads.heldManagementRetry('T1'),
@@ -225,7 +242,6 @@ const COVERAGE: Array<[string, string, string]> = [
 	],
 	['remove library album', API.library.removeAlbum('M1'), '/api/v1/library/album/M1'],
 	['rescan album', API.library.rescanAlbum('M1'), '/api/v1/library/albums/M1/rescan'],
-	['scan cancel', API.library.scanCancel(), '/api/v1/library/scan/cancel'],
 	['library activity', API.library.activity(), '/api/v1/library/activity'],
 	['library activity stream', API.library.activityStream(), '/api/v1/library/activity/stream'],
 	[
@@ -555,11 +571,15 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/library/management/identity-preparations/J1/discard'
 	],
 	[
+		'undo automatic edition',
+		API.library.undoAutomaticEdition('A1'),
+		'/api/v1/library/albums/A1/undo-automatic-edition'
+	],
+	[
 		'scan diagnostics',
 		API.library.scanDiagnostics('R1'),
 		'/api/v1/library/scan-runs/R1/diagnostics'
 	],
-	['scan unmatched', API.library.unmatched(), '/api/v1/library/scan/unmatched'],
 	['typed library settings', API.library.typedSettings(), '/api/v1/settings/library/roots'],
 	['target library settings', API.library.settings(), '/api/v1/settings/library'],
 	['library policy tree', API.library.policyTree(), '/api/v1/settings/library/policy-tree'],
@@ -576,16 +596,6 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/settings/library/restorable-roots'
 	],
 	['library restore roots', API.library.restoreRoots(), '/api/v1/settings/library/restore-roots'],
-	[
-		'resolve unmatched',
-		API.library.resolveUnmatched(1),
-		'/api/v1/library/scan/unmatched/1/resolve'
-	],
-	[
-		'resolve unmatched batch',
-		API.library.resolveUnmatchedBatch(),
-		'/api/v1/library/scan/unmatched/resolve-batch'
-	],
 	// per-user section visibility (user-scoped)
 	['section prefs', API.me.sectionPrefs(), '/api/v1/me/section-prefs'],
 	['home integration status', API.homeIntegrationStatus(), '/api/v1/home/integration-status'],
@@ -596,6 +606,9 @@ const COVERAGE: Array<[string, string, string]> = [
 	],
 	// external-service health for the header status indicator
 	['system health', API.system.health(), '/api/v1/system/health'],
+	// QW9 runtime observability (admin diagnostics card)
+	['system queue stats', API.system.queueStats(), '/api/v1/system/queue-stats'],
+	['system provider stats', API.system.providerStats(), '/api/v1/system/provider-stats'],
 	// keyless 30s previews (user-scoped)
 	[
 		'track preview',
@@ -678,6 +691,64 @@ const COVERAGE: Array<[string, string, string]> = [
 		'Plex user playlist image',
 		API.plexLibrary.playlistImage('P1', 'I1', 300),
 		'/api/v1/plex/playlist-image/P1/I1?size=300'
+	],
+	// Request page reads and actions (album default plus exact-track variants)
+	['active requests', API.requests.active(), '/api/v1/requests/active'],
+	['request history', API.requests.history(), '/api/v1/requests/history?page=1&page_size=20'],
+	[
+		'pending request approvals',
+		API.requests.pendingApprovals(),
+		'/api/v1/requests/pending-approvals'
+	],
+	[
+		'cancel request (album)',
+		API.requests.cancel('M1'),
+		'/api/v1/requests/active/M1?request_kind=album'
+	],
+	[
+		'cancel request (track)',
+		API.requests.cancel('M/1', 'track'),
+		'/api/v1/requests/active/M%2F1?request_kind=track'
+	],
+	[
+		'retry request (album)',
+		API.requests.retry('M1'),
+		'/api/v1/requests/retry/M1?request_kind=album'
+	],
+	[
+		'retry request (track)',
+		API.requests.retry('M/1', 'track'),
+		'/api/v1/requests/retry/M%2F1?request_kind=track'
+	],
+	[
+		'clear request history (album)',
+		API.requests.clearHistoryItem('M1'),
+		'/api/v1/requests/history/M1?request_kind=album'
+	],
+	[
+		'clear request history (track)',
+		API.requests.clearHistoryItem('M/1', 'track'),
+		'/api/v1/requests/history/M%2F1?request_kind=track'
+	],
+	[
+		'approve request (album)',
+		API.requests.approve('M1'),
+		'/api/v1/requests/approve/M1?request_kind=album'
+	],
+	[
+		'approve request (track)',
+		API.requests.approve('M/1', 'track'),
+		'/api/v1/requests/approve/M%2F1?request_kind=track'
+	],
+	[
+		'reject request (album)',
+		API.requests.reject('M1'),
+		'/api/v1/requests/reject/M1?request_kind=album'
+	],
+	[
+		'reject request (track)',
+		API.requests.reject('M/1', 'track'),
+		'/api/v1/requests/reject/M%2F1?request_kind=track'
 	],
 	// Weekly Mix (user-scoped refresh + admin standing-grant queue)
 	['personal mix refresh', API.me.personalMixRefresh(), '/api/v1/me/personal-mix/refresh'],

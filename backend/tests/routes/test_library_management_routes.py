@@ -6,7 +6,8 @@ import msgspec
 import pytest
 from fastapi import FastAPI, HTTPException
 
-from api.v1.routes.library import router as legacy_library_router
+# F-NL-03 removed api.v1.routes.library; the direct-writer guard now checks
+# the target router only.
 from api.v1.routes.library_management import router
 from api.v1.routes.library_target import router as target_library_router
 from api.v1.schemas.library_management import (
@@ -762,12 +763,44 @@ def test_management_route_inventory_is_complete() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "library_router", [legacy_library_router, target_library_router]
-)
-def test_direct_track_tag_writer_is_not_exposed(library_router: object) -> None:
-    assert not any(
-        route.path == "/library/tracks/{track_id}"
-        and "POST" in getattr(route, "methods", set())
-        for route in library_router.routes
-    )
+def test_target_library_route_inventory_is_complete() -> None:
+    """The exact (method, path) surface of the target library router: ANY new
+    route here fails this test, so a direct-write endpoint (e.g. a POST tag
+    writer bypassing the staged publisher) cannot ship unnoticed."""
+    inventory = {
+        (method, route.path)
+        for route in target_library_router.routes
+        for method in getattr(route, "methods", set())
+        if method in {"GET", "POST", "PUT", "DELETE", "PATCH"}
+    }
+    assert inventory == {
+        ("DELETE", "/library/album/{album_id}"),
+        ("DELETE", "/library/tracks/{track_id}"),
+        ("GET", "/library/albums"),
+        ("GET", "/library/albums/{album_id}"),
+        ("GET", "/library/albums/{album_id}/artwork/cached"),
+        ("GET", "/library/albums/{album_id}/copies"),
+        ("GET", "/library/albums/{album_id}/reidentification/releases"),
+        ("GET", "/library/albums/{album_id}/status"),
+        ("GET", "/library/albums/{album_id}/tracks"),
+        ("GET", "/library/artists"),
+        ("GET", "/library/artists/{artist_id}"),
+        ("GET", "/library/artists/{artist_id}/albums"),
+        ("GET", "/library/artists/{artist_id}/appearances"),
+        ("GET", "/library/edition-conversions/{job_id}"),
+        ("GET", "/library/mbids"),
+        ("GET", "/library/recently-added"),
+        ("GET", "/library/stats"),
+        ("GET", "/library/tracks"),
+        ("GET", "/library/tracks/{track_id}/tags"),
+        ("POST", "/library/albums/{album_id}/edition-conversions/preflight"),
+        ("POST", "/library/albums/{album_id}/management/re-enable"),
+        ("POST", "/library/albums/{album_id}/rescan"),
+        ("POST", "/library/edition-conversions/{job_id}/cancel"),
+        ("POST", "/library/edition-conversions/{job_id}/preview"),
+        ("POST", "/library/edition-conversions/{job_id}/recheck"),
+        ("POST", "/library/edition-conversions/{job_id}/retry"),
+        ("POST", "/library/edition-conversions/{job_id}/start"),
+        ("POST", "/library/membership"),
+        ("POST", "/library/resolve-tracks"),
+    }

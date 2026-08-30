@@ -13,6 +13,9 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/backend-ci.yml'
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,19 +24,20 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: 'pip'
           cache-dependency-path: backend/requirements-dev.txt
 
       - name: Install Ruff
-        run: pip install ruff==0.6.9
+        run: pip install ruff==0.16.4
 
       - name: Run Ruff
         run: ruff check backend
@@ -41,15 +45,16 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: ./backend
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: 'pip'
@@ -62,20 +67,33 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements-dev.txt
 
-      # The maintenance tests (tests/infrastructure/test_feedback_fixes_maintenance.py,
-      # test_maintenance_manifest.py) assume a deploy-style checkout: a repo-root
-      # docker-compose.yml plus a DIRTY worktree. The compose copy is gitignored, so
-      # it can't dirty the tree itself - add a non-ignored marker file for that.
-      - name: Provide deploy-style checkout state for maintenance tests
-        working-directory: .
-        run: |
-          cp docker-compose.example.yml docker-compose.yml
-          touch .ci-dirty-worktree-marker
-
       - name: Run tests
-        # Native Engine CI owns these focused gates; do not run them three times.
-        run: >-
-          python -m pytest
-          --ignore=tests/e2e
-          --ignore=tests/security
-          --ignore=tests/infrastructure/test_e2e_download.py
+        run: python -m pytest
+
+  security:
+    # Kept as a separate parallel job so a security regression is visible as
+    # its own red check instead of being buried in the 3.5k-test pass.
+    name: Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-dev.txt
+
+      - name: Security tests (no-secrets-in-logs, auth matrix, api-key masking)
+        run: python -m pytest tests/security

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+
 from collections.abc import Awaitable, Callable
 
 import msgspec.json
@@ -12,6 +13,9 @@ import msgspec.json
 from api.v1.schemas.library_operations import (
     IdentityPreparationCreateRequest,
     IdentityPreparationEstimateResponse,
+    AutomaticEditionUndoInfo,
+    AutomaticEditionUndoRequest,
+    AutomaticEditionUndoResponse,
     OperationListResponse,
     OperationResponse,
     RepairCreateRequest,
@@ -20,7 +24,12 @@ from api.v1.schemas.library_operations import (
     RepairFindingResponse,
     SuggestedEditionSummary,
 )
-from core.exceptions import ExternalServiceError, ResourceNotFoundError, ValidationError
+from core.exceptions import (
+    ExternalServiceError,
+    ResourceNotFoundError,
+    StaleRevisionError,
+    ValidationError,
+)
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.persistence.native_library_store import (
@@ -38,6 +47,11 @@ from models.identification import (
     TrackEvidence,
 )
 from models.library_work import OperationJob, RepairFinding
+from repositories.edition_policy import (
+    AUTO_ACCEPT_EVIDENCE_REASONS,
+    auto_accept_decision,
+    edition_date_key,
+)
 from repositories.protocols.identification import IdentificationProviderProtocol
 from repositories.protocols.musicbrainz_management import (
     CanonicalMusicBrainzRepositoryProtocol,
@@ -62,9 +76,15 @@ from services.native.library_operation_service import (
     LEASE_SECONDS,
     LibraryOperationService,
 )
+from infrastructure.persistence.gh293_calibration import (
+    BACKGROUND_TIMESLICE_SECONDS,
+)
+from services.native.wal_checkpoint_service import WalCheckpointService
+
 
 MANAGEMENT_READINESS_PURPOSE = "management_readiness"
 MANAGEMENT_MAPPING_VERSION = "management-edition-readiness-v4"
+
 
 # MusicBrainz breaker timeout is 60 s; this 2x window (matching the artist
 # reconciliation service) gives the breaker a recovery window between attempts.
@@ -72,9 +92,9 @@ _PROVIDER_DEFERRED_RETRY_SECONDS = 120.0
 
 
 class _ProviderUnavailable(Exception):
-    """Control-flow: the identity provider is unavailable, so the audit defers
-    the whole job instead of writing 'unverifiable' findings during the outage."""
-
+    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 class IdentityRepairService:
     def __init__(
@@ -84,12 +104,19 @@ class IdentityRepairService:
         evidence: AlbumEvidenceEngine | None = None,
         canonical_provider: CanonicalMusicBrainzRepositoryProtocol | None = None,
         provider_available: Callable[[], bool] | None = None,
+        wal_checkpoint: WalCheckpointService | None = None,
+        edition_opt_in: Callable[[str], bool] | None = None,
     ) -> None:
         self._store = store
         self._provider = provider
         self._evidence = evidence or AlbumEvidenceEngine()
         self._canonical_provider = canonical_provider
         self._provider_available = provider_available
+        self._wal_checkpoint = wal_checkpoint
+        # D-EDITION-AUTO S-3: resolves the Library Management profile-level
+        # opt-in (with per-root override) for one root id. None keeps the
+        # pre-auto behavior byte-for-byte (opt-in OFF everywhere).
+        self._edition_opt_in = edition_opt_in
         self._operations = LibraryOperationService(store)
 
     async def create(
@@ -242,8 +269,42 @@ class IdentityRepairService:
         availability = (
             self._provider_available if provider_available is None else provider_available
         )
+        started = time.monotonic()
         while True:
             timestamp = time.time() if now is None else now
+            while True:
+                try:
+                    staged = await self._store.materialize_repair_operation_batch(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                except StaleRevisionError:
+                    # A catalog change while the worklist is unsealed rebases the
+                    # SAME static-key job onto the current revision (or fails
+                    # closed when progress exists) and resumes next pass.
+                    rebased = await self._store.rebase_repair_operation(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                    if rebased["rebased"]:
+                        return self._operations._response(
+                            await self._store.yield_operation_job(
+                                str(job["id"]),
+                                worker_id,
+                                now=timestamp,
+                                reason_code="PIN_REBASED",
+                            )
+                        )
+                    return self._operations._response(rebased["job"])
+                if staged["complete"]:
+                    break
+                if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                    return self._operations._response(
+                        await self._store.yield_operation_job(
+                            str(job["id"]),
+                            worker_id,
+                            now=timestamp,
+                            reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                        )
+                    )
             if availability is not None and not availability():
                 return await self._defer_audit(str(job["id"]), worker_id, timestamp)
             controlled = await self._store.checkpoint_operation_control(
@@ -251,54 +312,98 @@ class IdentityRepairService:
             )
             if controlled is not None and controlled["state"] != "running":
                 return self._operations._response(controlled)
-            work = await self._store.claim_operation_work(
-                str(job["id"]), worker_id, now=timestamp
-            )
-            if work is None:
-                await self._store.mark_repair_ready(
+            if (
+                self._wal_checkpoint is not None
+                and self._wal_checkpoint.background_suspended
+            ):
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="WAL_BACKPRESSURE",
+                    )
+                )
+            if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                    )
+                )
+            # One bounded pass of subjects; control is probed read-only between
+            # units and transitioned at pass cadence.
+            control_pending = False
+            while time.monotonic() - started < BACKGROUND_TIMESLICE_SECONDS:
+                if await self._store.probe_operation_control(
+                    str(job["id"]), worker_id
+                ):
+                    control_pending = True
+                    break
+                work = await self._store.claim_operation_work(
                     str(job["id"]), worker_id, now=timestamp
                 )
-                return await self._operations.get(str(job["id"]))
-            context = await self._store.get_album_identification_context(
-                str(work["local_album_id"])
-            )
-            renewed = await self._store.heartbeat_operation_job(
-                str(job["id"]),
-                worker_id,
-                now=timestamp,
-                lease_seconds=LEASE_SECONDS,
-            )
-            if not renewed:
-                raise ResourceNotFoundError("The identity check lease changed.")
-            try:
-                if purpose == MANAGEMENT_READINESS_PURPOSE:
-                    finding, attempt, evidence = await self._classify_management_readiness(
-                        str(job["id"]), work, context, timestamp
+                if work is None:
+                    await self._store.mark_repair_ready(
+                        str(job["id"]), worker_id, now=timestamp
                     )
-                else:
-                    finding, attempt, evidence = await self._classify(
-                        str(job["id"]), work, context
-                    )
-            except _ProviderUnavailable:
-                return await self._defer_audit(
+                    return await self._operations.get(str(job["id"]))
+                timestamp = time.time() if now is None else now
+                context = await self._store.get_album_identification_context(
+                    str(work["local_album_id"])
+                )
+                renewed = await self._store.heartbeat_operation_job(
                     str(job["id"]),
                     worker_id,
-                    timestamp,
-                    ordinal=int(work["ordinal"]),
+                    now=timestamp,
+                    lease_seconds=LEASE_SECONDS,
                 )
-            await self._store.save_repair_finding_for_work(
-                str(job["id"]),
-                int(work["ordinal"]),
-                worker_id=worker_id,
-                expected_work_revision=int(work["row_revision"]),
-                finding=finding,
-                attempt=attempt,
-                evidence=evidence,
-                now=timestamp,
+                if not renewed:
+                    raise ResourceNotFoundError("The identity check lease changed.")
+                try:
+                    if purpose == MANAGEMENT_READINESS_PURPOSE:
+                        finding, attempt, evidence = await self._classify_management_readiness(
+                            str(job["id"]), work, context, timestamp
+                        )
+                    else:
+                        finding, attempt, evidence = await self._classify(
+                            str(job["id"]), work, context
+                        )
+                except _ProviderUnavailable as exc:
+                    return await self._defer_audit(
+                        str(job["id"]),
+                        worker_id,
+                        timestamp,
+                        ordinal=int(work["ordinal"]),
+                        retry_after_seconds=getattr(exc, "retry_after_seconds", None),
+                    )
+                await self._store.save_repair_finding_for_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    expected_work_revision=int(work["row_revision"]),
+                    finding=finding,
+                    attempt=attempt,
+                    evidence=evidence,
+                    auto_accept_edition=finding.auto_apply_edition,
+                    now=timestamp,
+                )
+                if checkpoint is not None:
+                    await checkpoint()
+            if control_pending:
+                continue  # outer loop performs the control transition
+            # Pass budget elapsed with subjects still pending: yield with the
+            # persisted cooldown (no immediate reclaim).
+            return self._operations._response(
+                await self._store.yield_operation_job(
+                    str(job["id"]),
+                    worker_id,
+                    now=timestamp,
+                    reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                )
             )
-            if checkpoint is not None:
-                await checkpoint()
-
     async def _defer_audit(
         self,
         job_id: str,
@@ -306,14 +411,26 @@ class IdentityRepairService:
         timestamp: float,
         *,
         ordinal: int | None = None,
+        retry_after_seconds: float | None = None,
     ) -> OperationResponse:
+        # Use max(existing safe policy, exception deadline) per F-PERF-01
+        delay = _PROVIDER_DEFERRED_RETRY_SECONDS
+        if retry_after_seconds is not None:
+            try:
+                candidate = float(retry_after_seconds)
+                import math
+
+                if math.isfinite(candidate) and candidate > 0:
+                    delay = max(delay, candidate)
+            except (TypeError, ValueError):
+                pass
         deferred = await self._store.defer_repair_audit_work(
             job_id=job_id,
             ordinal=ordinal,
             worker_id=worker_id,
             reason_code="PROVIDER_DEFERRED",
             now=timestamp,
-            retry_not_before=timestamp + _PROVIDER_DEFERRED_RETRY_SECONDS,
+            retry_not_before=timestamp + delay,
         )
         return self._operations._response(deferred)
 
@@ -400,8 +517,10 @@ class IdentityRepairService:
                 priority=RequestPriority.BACKGROUND_SYNC,
             )
         except (ExternalServiceError, CircuitOpenError) as error:
+            retry_after = getattr(error, "retry_after_seconds", None)
             raise _ProviderUnavailable(
-                "MusicBrainz is unavailable; deferring the identity audit."
+                "MusicBrainz is unavailable; deferring the identity audit.",
+                retry_after_seconds=retry_after,
             ) from error
         if release is None:
             return (
@@ -447,8 +566,10 @@ class IdentityRepairService:
                 candidate,
             )
         except (ExternalServiceError, CircuitOpenError) as error:
+            retry_after = getattr(error, "retry_after_seconds", None)
             raise _ProviderUnavailable(
-                "MusicBrainz is unavailable; deferring the identity audit."
+                "MusicBrainz is unavailable; deferring the identity audit.",
+                retry_after_seconds=retry_after,
             ) from error
         evaluated = self._evidence.evaluate_candidate(local_tracks, candidate)
         self._disambiguate_duplicate_recordings(
@@ -646,8 +767,40 @@ class IdentityRepairService:
                 suggestible.append((row, candidate_evidence))
         if not suggestible:
             return bare()
+        # F-EDITION-01: when the album already carries a release-group
+        # identity, only candidates inside that group are suggestible. A
+        # release-group mismatch is an identity conflict, not a metadata
+        # preference; if nothing same-group remains the finding stays
+        # exact_release_required.
+        current_rg = (
+            str(identity["release_group_mbid"]).casefold()
+            if identity is not None and identity["release_group_mbid"]
+            else None
+        )
+        if current_rg is not None:
+            suggestible = [
+                (row, candidate_evidence)
+                for row, candidate_evidence in suggestible
+                if (candidate_evidence.release_group_mbid or "").casefold()
+                == current_rg
+            ]
+            if not suggestible:
+                return bare()
         competing_count = len(suggestible)
-        if competing_count == 1:
+        # D-EDITION-AUTO S-3: root attribution mirrors
+        # automatic_scan_management_service - every indexed track must agree
+        # on one root, otherwise no opt-in is resolved and the manual
+        # suggestion flow is kept.
+        track_root_ids = {str(row["root_id"]) for row in tracks}
+        auto_opt_in = (
+            self._edition_opt_in is not None
+            and len(track_root_ids) == 1
+            and bool(self._edition_opt_in(next(iter(track_root_ids))))
+        )
+        ranked: list[
+            tuple[tuple[float, int, tuple, int, str], dict, CandidateEvidence, dict]
+        ] = []
+        if competing_count == 1 and not auto_opt_in:
             winner_row, winner = suggestible[0]
             summary: dict[str, object] = {
                 "title": winner.album_title,
@@ -659,9 +812,6 @@ class IdentityRepairService:
                 "competing_count": 1,
             }
         else:
-            ranked: list[
-                tuple[tuple[int, str, int, str], dict, CandidateEvidence, dict]
-            ] = []
             for row, candidate_evidence in suggestible:
                 release: MbManagementRelease | None = None
                 if self._canonical_provider is not None:
@@ -672,8 +822,10 @@ class IdentityRepairService:
                             priority=RequestPriority.BACKGROUND_SYNC,
                         )
                     except (ExternalServiceError, CircuitOpenError) as error:
+                        retry_after = getattr(error, "retry_after_seconds", None)
                         raise _ProviderUnavailable(
-                            "MusicBrainz is unavailable; deferring the identity audit."
+                            "MusicBrainz is unavailable; deferring the identity audit.",
+                            retry_after_seconds=retry_after,
                         ) from error
                     if release is None:
                         continue
@@ -695,9 +847,16 @@ class IdentityRepairService:
                     ),
                     "competing_count": competing_count,
                 }
+                # F-EDITION-01: evidence score ranks first; Official, parsed
+                # mixed-precision date (F-EDITION-02 key), XW, and release
+                # MBID follow as deterministic tie-breakers.
+                date_value = summary["date"]
                 key = (
+                    -float(candidate_evidence.score),
                     0 if release is not None and release.status == "Official" else 1,
-                    str(summary["date"] or "9999"),
+                    edition_date_key(
+                        date_value if isinstance(date_value, str) else None
+                    ),
                     0 if release is not None and release.country == "XW" else 1,
                     str(candidate_evidence.release_mbid),
                 )
@@ -705,6 +864,41 @@ class IdentityRepairService:
             if not ranked:
                 return bare()
             _, winner_row, winner, summary = min(ranked, key=lambda item: item[0])
+        # D-EDITION-AUTO: evaluate the signed owner gate on the FULL sort
+        # keys (so key ties and partial-date ties are caught) of every
+        # suggestible candidate. Any non-accept result keeps today's manual
+        # suggestion with the gate reason surfaced in the summary JSON.
+        summary_extra: dict[str, object] = {}
+        if auto_opt_in:
+            gate_ok, gate_reason = auto_accept_decision(
+                [(entry[0], float(entry[2].score)) for entry in ranked]
+            )
+            reasons_qualify = all(
+                entry[2].reason_code in AUTO_ACCEPT_EVIDENCE_REASONS
+                for entry in ranked
+            )
+            if gate_ok and reasons_qualify:
+                summary_extra["auto_gate"] = "AUTO_ACCEPT"
+                summary_extra["auto_ranking"] = [
+                    {
+                        "key": list(entry[0]),
+                        "score": float(entry[2].score),
+                        "release_mbid": str(entry[2].release_mbid),
+                    }
+                    for entry in sorted(ranked, key=lambda item: item[0])
+                ]
+                finding_auto_apply = True
+            else:
+                summary_extra["auto_gate"] = (
+                    gate_reason
+                    if not gate_ok
+                    else "NON_QUALIFYING_REASON"
+                )
+                finding_auto_apply = False
+        else:
+            finding_auto_apply = False
+        if summary_extra:
+            summary = {**summary, **summary_extra}
         finding = self._finding(
             job_id,
             work,
@@ -717,6 +911,7 @@ class IdentityRepairService:
         finding.suggested_release_mbid = str(winner.release_mbid)
         finding.suggested_release_group_mbid = winner.release_group_mbid
         finding.suggested_edition_json = json.dumps(summary, sort_keys=True)
+        finding.auto_apply_edition = finding_auto_apply
         return finding, None, []
 
     async def _normalize_recording_redirects(
@@ -1007,43 +1202,120 @@ class IdentityRepairService:
         now: float | None = None,
         checkpoint: Callable[[], Awaitable[None]] | None = None,
     ) -> OperationResponse:
+        started = time.monotonic()
         while True:
             timestamp = time.time() if now is None else now
+            while True:
+                try:
+                    staged = await self._store.materialize_repair_operation_batch(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                except StaleRevisionError:
+                    # A catalog change while the worklist is unsealed rebases the
+                    # SAME static-key job onto the current revision (or fails
+                    # closed when progress exists) and resumes next pass.
+                    rebased = await self._store.rebase_repair_operation(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                    if rebased["rebased"]:
+                        return self._operations._response(
+                            await self._store.yield_operation_job(
+                                str(job["id"]),
+                                worker_id,
+                                now=timestamp,
+                                reason_code="PIN_REBASED",
+                            )
+                        )
+                    return self._operations._response(rebased["job"])
+                if staged["complete"]:
+                    break
+                if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                    return self._operations._response(
+                        await self._store.yield_operation_job(
+                            str(job["id"]),
+                            worker_id,
+                            now=timestamp,
+                            reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                        )
+                    )
             controlled = await self._store.checkpoint_operation_control(
                 str(job["id"]), worker_id, now=timestamp
             )
             if controlled is not None and controlled["state"] != "running":
                 return self._operations._response(controlled)
-            work = await self._store.claim_operation_work(
-                str(job["id"]), worker_id, now=timestamp
-            )
-            if work is None:
-                done = await self._store.finish_operation_job(
+            if (
+                self._wal_checkpoint is not None
+                and self._wal_checkpoint.background_suspended
+            ):
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="WAL_BACKPRESSURE",
+                    )
+                )
+            if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                    )
+                )
+            # One bounded pass of subjects; control is probed read-only between
+            # units and transitioned at pass cadence.
+            control_pending = False
+            while time.monotonic() - started < BACKGROUND_TIMESLICE_SECONDS:
+                if await self._store.probe_operation_control(
+                    str(job["id"]), worker_id
+                ):
+                    control_pending = True
+                    break
+                work = await self._store.claim_operation_work(
+                    str(job["id"]), worker_id, now=timestamp
+                )
+                if work is None:
+                    done = await self._store.finish_sealed_repair_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        state="succeeded",
+                        terminal_code="APPLY_COMPLETED",
+                        now=timestamp,
+                    )
+                    return self._operations._response(done)
+                timestamp = time.time() if now is None else now
+                renewed = await self._store.heartbeat_operation_job(
                     str(job["id"]),
                     worker_id,
-                    state="succeeded",
-                    terminal_code="APPLY_COMPLETED",
+                    now=timestamp,
+                    lease_seconds=LEASE_SECONDS,
+                )
+                if not renewed:
+                    raise ResourceNotFoundError("The identity check lease changed.")
+                result = await self._store.apply_repair_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    expected_work_revision=int(work["row_revision"]),
+                    actor_user_id=actor_user_id,
                     now=timestamp,
                 )
-                return self._operations._response(done)
-            renewed = await self._store.heartbeat_operation_job(
-                str(job["id"]),
-                worker_id,
-                now=timestamp,
-                lease_seconds=LEASE_SECONDS,
+                if checkpoint is not None:
+                    await checkpoint()
+            if control_pending:
+                continue  # outer loop performs the control transition
+            # Pass budget elapsed with subjects still pending: yield with the
+            # persisted cooldown (no immediate reclaim).
+            return self._operations._response(
+                await self._store.yield_operation_job(
+                    str(job["id"]),
+                    worker_id,
+                    now=timestamp,
+                    reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                )
             )
-            if not renewed:
-                raise ResourceNotFoundError("The identity check lease changed.")
-            await self._store.apply_repair_work(
-                str(job["id"]),
-                int(work["ordinal"]),
-                worker_id=worker_id,
-                expected_work_revision=int(work["row_revision"]),
-                actor_user_id=actor_user_id,
-                now=timestamp,
-            )
-            if checkpoint is not None:
-                await checkpoint()
 
     async def findings(
         self,
@@ -1068,6 +1340,7 @@ class IdentityRepairService:
                     "exact_release_required",
                     "exact_release_suggested",
                 ],
+                "exact_release_auto_accepted": ["exact_release_auto_accepted"],
                 "needs_review": ["needs_review"],
                 "unverifiable": ["unverifiable", "stale"],
             }
@@ -1103,6 +1376,9 @@ class IdentityRepairService:
         next_cursor = None
         if result["has_more"] and rows:
             next_cursor = f"{rows[-1]['updated_at']}:{rows[-1]['id']}"
+        undo_info = await self._store.get_live_automatic_edition_undo(
+            [str(row["local_album_id"]) for row in rows]
+        )
 
         def _suggested_edition(row: dict) -> SuggestedEditionSummary | None:
             if not row["suggested_release_mbid"]:
@@ -1117,6 +1393,16 @@ class IdentityRepairService:
                 date=payload.get("date"),
                 country=payload.get("country"),
                 status=payload.get("status"),
+                auto_gate=payload.get("auto_gate"),
+            )
+
+        def _automatic_undo(row: dict) -> AutomaticEditionUndoInfo | None:
+            values = undo_info.get(str(row["local_album_id"]))
+            if values is None:
+                return None
+            return AutomaticEditionUndoInfo(
+                expected_album_revision=values[0],
+                expected_identity_revision=values[1],
             )
 
         return RepairFindingListResponse(
@@ -1137,6 +1423,7 @@ class IdentityRepairService:
                     state=str(row["state"]),
                     apply_result=row["apply_result"],
                     suggested_edition=_suggested_edition(row),
+                    automatic_undo=_automatic_undo(row),
                     updated_at=float(row["updated_at"]),
                     row_revision=int(row["row_revision"]),
                 )
@@ -1198,8 +1485,10 @@ class IdentityRepairService:
                     RequestPriority.BACKGROUND_SYNC,
                 )
             except (ExternalServiceError, CircuitOpenError) as error:
+                retry_after = getattr(error, "retry_after_seconds", None)
                 raise _ProviderUnavailable(
-                    "MusicBrainz is unavailable; deferring the identity audit."
+                    "MusicBrainz is unavailable; deferring the identity audit.",
+                    retry_after_seconds=retry_after,
                 ) from error
             if candidate is not None:
                 grouping_tracks = [_to_grouping_track(row) for row in tracks]
@@ -1340,4 +1629,24 @@ class IdentityRepairService:
             confidence="complete" if apply_eligible else "bounded",
             apply_eligible=apply_eligible,
             evidence_id=evidence_id,
+        )
+
+    async def undo_automatic_edition(
+        self,
+        album_id: str,
+        request: AutomaticEditionUndoRequest,
+        actor_user_id: str,
+    ) -> AutomaticEditionUndoResponse:
+        """S-2: one revisioned catalog-identity undo of an auto-accept."""
+        result = await self._store.undo_automatic_edition_acceptance(
+            album_id,
+            expected_album_revision=request.expected_album_revision,
+            expected_identity_revision=request.expected_identity_revision,
+            actor_user_id=actor_user_id,
+            now=time.time(),
+        )
+        return AutomaticEditionUndoResponse(
+            local_album_id=album_id,
+            outcome=result["outcome"],
+            review_id=result["review_id"],
         )

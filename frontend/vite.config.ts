@@ -17,12 +17,20 @@ export default defineConfig({
 				},
 				test: {
 					name: 'client',
+					// Browser tests must see real Tailwind/daisyUI styles for
+					// layout-dependent assertions (GH-281 sidebar scrolling); other
+					// CSS stays stubbed to keep unstyled-DOM specs unchanged
+					css: { include: [/src[/\\]app\.css$/] },
 					environment: 'browser',
 					browser: {
 						enabled: true,
 						headless: true,
 						provider: 'playwright',
-						instances: [{ browser: 'chromium' }]
+						instances: [{ browser: 'chromium' }],
+						// GH runners see the default bind as internet-exposed, which disables
+						// CDP/exec + failure screenshots; loopback avoids that, and the
+						// browser/vitest pair must match (@vitest/browser pins vitest exactly)
+						api: { host: '127.0.0.1' }
 					},
 					include: ['src/**/*.svelte.{test,spec}.{js,ts}'],
 					exclude: ['src/lib/server/**'],

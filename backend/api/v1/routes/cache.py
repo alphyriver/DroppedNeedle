@@ -11,6 +11,7 @@ router = APIRouter(route_class=MsgSpecRoute, prefix="/cache", tags=["cache"])
 
 @router.get("/stats", response_model=CacheStats)
 async def get_cache_stats(
+    _: CurrentAdminDep,
     cache_service: CacheService = Depends(get_cache_service),
 ):
     return await cache_service.get_stats()
@@ -33,6 +34,17 @@ async def clear_disk_cache(
     cache_service: CacheService = Depends(get_cache_service),
 ):
     result = await cache_service.clear_disk_cache()
+    if not result.success:
+        raise HTTPException(status_code=500, detail=result.message)
+    return result
+
+
+@router.post("/clear/metadata", response_model=CacheClearResponse)
+async def clear_metadata_cache(
+    _: CurrentAdminDep,
+    cache_service: CacheService = Depends(get_cache_service),
+):
+    result = await cache_service.clear_metadata_cache()
     if not result.success:
         raise HTTPException(status_code=500, detail=result.message)
     return result

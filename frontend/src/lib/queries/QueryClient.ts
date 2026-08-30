@@ -48,23 +48,28 @@ export const setQueryDataWithPersister = async <
 
 export const invalidateQueriesWithPersister = async <TTaggedQueryKey extends QueryKey = QueryKey>(
 	filters?: InvalidateQueryFilters<TTaggedQueryKey>,
-	options?: InvalidateOptions
+	options?: InvalidateOptions,
+	opts?: { removePersisted?: boolean }
 ) => {
-	await queryPersister.removeQueries(filters);
+	// Default keeps IndexedDB rows: queries are marked stale (active ones
+	// refetch immediately, inactive ones paint the persisted payload instantly
+	// and settle in the background on next mount). Pass `removePersisted: true`
+	// only when a stale paint would be actively wrong - it destroys the 7-day
+	// persisted-cache benefit for the swept prefix.
+	if (opts?.removePersisted) {
+		await queryPersister.removeQueries(filters);
+	}
 	// eslint-disable-next-line no-restricted-syntax
 	await queryClient.invalidateQueries<TTaggedQueryKey>(filters, options);
 };
 
-/**
- * Global query client, used to manage all queries in the application.
- */
 export const queryClient = new QueryClient({
 	defaultOptions: {
 		queries: {
 			enabled: browser,
 			retry: false,
 			refetchOnWindowFocus: true,
-			staleTime: 1000 * 60 * 1, // 1 minute,
+			staleTime: 1000 * 60 * 1, // 1 minute
 			gcTime: 1000 * 60 * 5, // 5 min: keep results in memory so back-nav is instant (30s evicted before staleTime, forcing a skeleton + IDB rehydrate each return)
 			persister: queryPersister.persisterFn
 		}
@@ -72,11 +77,9 @@ export const queryClient = new QueryClient({
 });
 
 /**
- * Drop ALL cached query data on login / logout / user-switch (AMU-5). The
- * QueryClient + IndexedDB persister form one browser-wide cache with no user
- * dimension, so personalized data (home/discover/profile/...) would otherwise
- * leak across users sharing a browser. Clears both the in-memory client and the
- * persisted IndexedDB store.
+ * Drop ALL cached query data on login / logout / user-switch (AMU-5): QueryClient +
+ * IndexedDB persister form one browser-wide cache with no user dimension, so
+ * personalized data would otherwise leak across users sharing a browser.
  */
 export const resetQueryCacheForUserSwitch = async (): Promise<void> => {
 	queryClient.clear();

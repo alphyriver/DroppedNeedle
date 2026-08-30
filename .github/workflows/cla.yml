@@ -46,6 +46,7 @@ jobs:
     # signature store, so the check can only fail there.
     if: github.repository == 'DroppedNeedle/DroppedNeedle'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check or record CLA signature
         if: >-

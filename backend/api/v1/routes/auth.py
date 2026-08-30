@@ -10,6 +10,8 @@ from api.v1.schemas.auth import (
     AuthProvidersResponse,
     AuthResponse,
     CreateUserRequest,
+    DeviceSessionRequest,
+    DeviceSessionResponse,
     ImportCandidateListResponse,
     ImportUsersRequest,
     ImportUsersResponse,
@@ -33,6 +35,8 @@ from api.v1.schemas.auth import (
     session_to_response,
     user_to_response,
 )
+from core.base_path import scope_base_path
+from core.config import get_settings
 from core.dependencies import get_quota_service
 from core.dependencies.auth_providers import get_auth_service, get_plex_user_auth_service, get_jellyfin_user_auth_service, get_oidc_user_auth_service, get_user_import_service
 from core.exceptions import AuthenticationError, ConfigurationError, ExternalServiceError, RegistrationError
@@ -52,6 +56,11 @@ _COOKIE_NAME = "droppedneedle_session"
 _COOKIE_MAX_AGE = 30 * 24 * 60 * 60  # 30 days
 
 
+def _deployment_base(request: Request) -> str:
+    """Canonical externally visible base path, or empty at the domain root."""
+    return scope_base_path(request.scope, get_settings().base_path)
+
+
 def _set_session_cookie(response: Response, request: Request, token: str) -> None:
     """Attach an httpOnly session cookie. Marks Secure automatically when the
     request arrived over HTTPS (direct or via X-Forwarded-Proto)."""
@@ -66,12 +75,12 @@ def _set_session_cookie(response: Response, request: Request, token: str) -> Non
         samesite = "lax",
         secure = secure,
         max_age = _COOKIE_MAX_AGE,
-        path = "/api",
+        path = f"{_deployment_base(request)}/api",
     )
 
 
-def _clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(key = _COOKIE_NAME, path = "/api")
+def _clear_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(key = _COOKIE_NAME, path = f"{_deployment_base(request)}/api")
 
 
 def _bearer_token(request: Request) -> str | None:
@@ -83,7 +92,31 @@ def _bearer_token(request: Request) -> str | None:
 
 @router.get("/setup/status", response_model = SetupStatusResponse)
 async def setup_status(auth: AuthService = Depends(get_auth_service)) -> SetupStatusResponse:
-    required = await auth.is_setup_required()
+    # (GH-293) one process-wide coalesced bootstrap demand signal plus
+    # bounded latency/error telemetry; the signal is released in every path,
+    # including client cancellation.
+    import asyncio
+
+    from core.dependencies.service_providers import get_bootstrap_demand_signal
+
+    import time as _time
+
+    signal = get_bootstrap_demand_signal()
+    signal.begin()
+    started = _time.perf_counter()
+    try:
+        required = await auth.is_setup_required()
+    except asyncio.CancelledError:
+        # Client disconnects cancel the handler; record the cancellation and
+        # release the demand signal before propagating.
+        signal.observe_latency(_time.perf_counter() - started, error = True)
+        raise
+    except Exception:
+        signal.observe_latency(_time.perf_counter() - started, error = True)
+        raise
+    finally:
+        signal.end()
+    signal.observe_latency(_time.perf_counter() - started, error = False)
     return SetupStatusResponse(required = required)
 
 
@@ -91,7 +124,6 @@ async def setup_status(auth: AuthService = Depends(get_auth_service)) -> SetupSt
 async def list_auth_providers(
     oidc_auth: OIDCUserAuthService = Depends(get_oidc_user_auth_service),
 ) -> AuthProvidersResponse:
-    """Return which login methods are currently configured."""
     return oidc_auth.get_enabled_providers()
 
 
@@ -179,7 +211,7 @@ async def logout(
     token = _bearer_token(request) or request.cookies.get(_COOKIE_NAME)
     if token:
         await auth.logout(token)
-    _clear_session_cookie(response)
+    _clear_session_cookie(response, request)
 
 
 @router.post("/logout-all", status_code = status.HTTP_204_NO_CONTENT)
@@ -208,6 +240,37 @@ async def list_sessions(
 ) -> SessionListResponse:
     tokens = await auth.list_sessions(current_user.id)
     return SessionListResponse(sessions = [session_to_response(token) for token in tokens])
+
+
+
+@router.post("/device-sessions", response_model = DeviceSessionResponse)
+async def create_device_session(
+    current_user: CurrentUserDep,
+    current_token: CurrentTokenDep,
+    response: Response,
+    body: DeviceSessionRequest = MsgSpecBody(DeviceSessionRequest),
+    auth: AuthService = Depends(get_auth_service),
+) -> DeviceSessionResponse:
+    """Mint a separately revocable bearer for one trusted companion."""
+    response.headers["Cache-Control"] = "no-store"
+    if current_token.session_kind != "standard":
+        raise HTTPException(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail = "Companion sessions cannot mint device sessions",
+        )
+    try:
+        auth.validate_device_session_name(body.device_name)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code = status.HTTP_400_BAD_REQUEST, detail = str(exc))
+    providers = await auth.get_provider_names_for_users([current_user.id])
+    try:
+        token = await auth.issue_device_session(current_user.id, body.device_name)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code = status.HTTP_400_BAD_REQUEST, detail = str(exc))
+    return DeviceSessionResponse(
+        token = token,
+        user = user_to_response(current_user, providers.get(current_user.id)),
+    )
 
 
 @router.delete("/sessions/{session_id}", status_code = status.HTTP_204_NO_CONTENT)
@@ -490,7 +553,12 @@ async def oidc_callback(
         raise HTTPException(status_code = status.HTTP_401_UNAUTHORIZED, detail = "OIDC authentication failed")
     except ExternalServiceError:
         raise HTTPException(status_code = status.HTTP_503_SERVICE_UNAVAILABLE, detail = "OIDC provider unavailable")
-    return responses.RedirectResponse(url = f"/auth/callback?code={exchange_code}")
+    # Same-site hand-off: a RELATIVE Location keeps Host/X-Forwarded-* out of
+    # a URL carrying the one-time exchange code; base is prefixed exactly once.
+    return responses.RedirectResponse(
+        url = f"{_deployment_base(request)}/auth/callback?code={exchange_code}",
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @router.post("/oidc/exchange", response_model = AuthResponse)

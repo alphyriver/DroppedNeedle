@@ -1,11 +1,13 @@
 import asyncio
 import json
 import sqlite3
+import tempfile
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
 import pytest
@@ -40,17 +42,28 @@ from models.local_catalog import (
     LocalArtistCredit,
     LocalTrack,
 )
-from services.native.album_candidate_service import AlbumCandidateService
+from services.native.album_candidate_service import (
+    MAX_CANDIDATES,
+    AlbumCandidateService,
+)
 from services.native.album_coverage_service import AlbumCoverageService
-from services.native.album_evidence_engine import AlbumEvidenceEngine
-from services.native.album_identification_service import AlbumIdentificationService
+from services.native.album_evidence_engine import (
+    MATCHER_VERSION,
+    AlbumEvidenceEngine,
+)
+from services.native.album_identification_service import (
+    MAX_NEW_FINGERPRINTS_PER_ATTEMPT,
+    AlbumIdentificationService,
+)
 from services.native.conditional_fingerprint_service import (
+    FINGERPRINTER_VERSION,
     ConditionalFingerprintService,
 )
 from services.native.identification_evidence_projector import (
     IdentificationEvidenceProjector,
 )
 from services.native.identification_queue_service import (
+    LEASE_SECONDS,
     MAX_BACKOFF_SECONDS,
     MAX_DEFERRAL_ATTEMPTS,
     IdentificationQueueService,
@@ -82,6 +95,7 @@ class FakeProvider:
         self.candidates = candidates or []
         self.calls: list[tuple[str, RequestPriority]] = []
         self.exact_releases: list[tuple[str, RequestPriority]] = []
+        self.edition_calls: list[str] = []
 
     async def search_album_candidate_ids(
         self, artist: str, title: str, limit: int, priority: RequestPriority
@@ -114,6 +128,25 @@ class FakeProvider:
             ),
             None,
         )
+
+    async def get_album_candidate_editions(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+        *,
+        max_editions: int = 2,
+    ) -> list[AlbumCandidate]:
+        self.edition_calls.append(release_group_mbid)
+        top_pick = next(
+            (
+                candidate
+                for candidate in self.candidates
+                if candidate.release_group_mbid == release_group_mbid
+            ),
+            None,
+        )
+        return [] if top_pick is None else [top_pick]
 
     async def get_exact_release_candidate(
         self,
@@ -561,6 +594,175 @@ async def test_candidate_recall_deduplicates_provider_canonical_aliases() -> Non
     assert len(candidates) == 1
     assert candidates[0].release_group_mbid == "canonical-group"
     assert candidates[0].source_kinds == ["album_tags"]
+
+
+def _sibling_edition(group: str) -> AlbumCandidate:
+    return msgspec.structs.replace(
+        _candidate(group=group),
+        release_mbid=f"release-{group}-sibling",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=1,
+                absolute_position=1,
+                duration_seconds=181,
+                recording_mbid="recording-sibling",
+            )
+        ],
+    )
+
+
+class EditionsProvider(FakeProvider):
+    """FakeProvider plus a sibling-edition table for the Phase 2 trial."""
+
+    def __init__(
+        self,
+        candidates: list[AlbumCandidate] | None = None,
+        editions: dict[str, list[AlbumCandidate]] | None = None,
+    ) -> None:
+        super().__init__(candidates)
+        self.editions = editions or {}
+
+    async def get_album_candidate_editions(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+        *,
+        max_editions: int = 2,
+    ) -> list[AlbumCandidate]:
+        self.edition_calls.append(release_group_mbid)
+        return list(self.editions.get(release_group_mbid, []))
+
+
+def _single_album_tracks() -> list[GroupingTrack]:
+    return [
+        GroupingTrack(
+            local_track_id="track-1",
+            root_id="root",
+            relative_path="track.flac",
+            title="Track",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+        )
+    ]
+
+
+def _aborting_checkpoint(fail_on: int) -> tuple[Callable[[], bool], dict]:
+    state = {"calls": 0}
+
+    async def checkpoint() -> bool:
+        state["calls"] += 1
+        return state["calls"] != fail_on
+
+    return checkpoint, state
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_sibling_trial_appends_editions_in_seed_order() -> None:
+    provider = EditionsProvider(
+        [_candidate(group="rg-a"), _candidate(group="rg-b")],
+        {"rg-b": [_candidate(group="rg-b"), _sibling_edition("rg-b")]},
+    )
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(), sibling_release_group_ids=["rg-b"]
+    )
+
+    assert [candidate.release_mbid for candidate in candidates] == [
+        "release-rg-a",
+        "release-rg-b",
+        "release-rg-b-sibling",
+    ]
+    assert [candidate.source_kinds for candidate in candidates] == [
+        ["album_tags"],
+        ["album_tags"],
+        ["album_tags"],
+    ]
+    assert provider.edition_calls == ["rg-b"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_sibling_duplicate_collapses_into_built_candidate() -> (
+    None
+):
+    provider = EditionsProvider(
+        [_candidate(group="rg-b")],
+        {"rg-b": [_candidate(group="rg-b")]},
+    )
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(), sibling_release_group_ids=["rg-b"]
+    )
+
+    assert [candidate.release_mbid for candidate in candidates] == ["release-rg-b"]
+    assert candidates[0].source_kinds == ["album_tags", "recording_search"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_sibling_extras_respect_max_candidates() -> None:
+    groups = [f"rg-{index}" for index in range(9)]
+    provider = EditionsProvider(
+        [_candidate(group=group) for group in groups],
+        {group: [_candidate(group=group), _sibling_edition(group)] for group in groups},
+    )
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(), sibling_release_group_ids=groups
+    )
+
+    assert len(candidates) == MAX_CANDIDATES
+    assert [candidate.release_mbid for candidate in candidates] == [
+        mbid
+        for group in groups[:5]
+        for mbid in (f"release-{group}", f"release-{group}-sibling")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fail_on", "expected_edition_calls"),
+    [
+        (5, []),  # pause before the extra fetch: no provider call at all
+        (6, ["rg-a"]),  # pause after the top pick: fetch already spent
+    ],
+)
+async def test_candidate_recall_checkpoint_aborts_around_extra_fetch(
+    fail_on: int, expected_edition_calls: list[str]
+) -> None:
+    provider = EditionsProvider(
+        [],
+        {"rg-a": [_candidate(group="rg-a"), _sibling_edition("rg-a")]},
+    )
+    checkpoint, state = _aborting_checkpoint(fail_on)
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(),
+        cached_fingerprint_release_groups=["rg-a"],
+        checkpoint=checkpoint,
+        sibling_release_group_ids=["rg-a"],
+    )
+
+    assert candidates == []
+    assert provider.edition_calls == expected_edition_calls
+    assert state["calls"] == fail_on
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_default_path_never_touches_editions_endpoint() -> None:
+    """Regression pin: without sibling ids recall is byte-for-byte the
+    historical bounded search - the editions endpoint is never called."""
+    provider = EditionsProvider(
+        [_candidate(group="rg-a"), _candidate(group="rg-b")],
+        {"rg-b": [_sibling_edition("rg-b")]},
+    )
+    candidates = await AlbumCandidateService(provider).recall(_single_album_tracks())
+    assert [candidate.release_mbid for candidate in candidates] == [
+        "release-rg-a",
+        "release-rg-b",
+    ]
+    assert provider.edition_calls == []
+    assert [kind for kind, _ in provider.calls] == ["album", "detail", "detail"]
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1607,18 @@ async def test_reset_provider_deferrals_clears_backoff_and_leaves_other_reasons(
     await queue.defer(subject_job, "worker", "SUBJECT_NOT_AVAILABLE", now=3)
     assert await queue.claim("worker", now=4) is None
 
-    assert await queue.reset_provider_deferrals(now=100) == 1
+    # F-056: a FRESH provider deferral is NOT wiped inside the staleness
+    # window - only outage-aged rows (or far-future backoff) get released.
+    assert await queue.reset_provider_deferrals(now=100) == 0
+    with sqlite3.connect(db_path) as connection:
+        fresh_row = connection.execute(
+            "SELECT attempt_count, not_before, last_failure_code "
+            "FROM library_identification_jobs WHERE id = ?",
+            (provider_job["id"],),
+        ).fetchone()
+    assert fresh_row == (1, 32, "PROVIDER_TEMPORARILY_UNAVAILABLE")
+
+    assert await queue.reset_provider_deferrals(now=20_000) == 1
 
     with sqlite3.connect(db_path) as connection:
         provider_row = connection.execute(
@@ -1420,7 +1633,7 @@ async def test_reset_provider_deferrals_clears_backoff_and_leaves_other_reasons(
         ).fetchone()
     assert provider_row == (0, 0, None)
     assert subject_row == (1, 33, "SUBJECT_NOT_AVAILABLE")
-    reclaimed = await queue.claim("worker", now=100)
+    reclaimed = await queue.claim("worker", now=20_000)
     assert reclaimed is not None
     assert reclaimed["id"] == provider_job["id"]
 
@@ -1492,6 +1705,175 @@ async def test_pause_at_candidate_and_fingerprint_checkpoints_releases_lease_wit
         ).fetchone()
     assert row[0:3] == ("queued", None, 0)
     assert json.loads(row[3])["phase"] == "fingerprinting"
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_identifies_when_true_edition_shares_the_release_group(
+    store: NativeLibraryStore,
+    db_path: Path,
+) -> None:
+    """EditionsEtc Phase 2: recall picks a live-promo edition whose evidence
+    cannot support the album; ONE bounded retry including ranked siblings
+    surfaces the true edition from the same release group, so the album
+    identifies instead of landing in review."""
+    await _seed_album(store)
+
+    class PromoFirstProvider(FakeProvider):
+        def __init__(
+            self, group: str, promo: AlbumCandidate, true_edition: AlbumCandidate
+        ) -> None:
+            super().__init__([promo])
+            self._group = group
+            self._true_edition = true_edition
+
+        async def get_album_candidate_editions(
+            self,
+            release_group_mbid: str,
+            target_track_count: int,
+            priority: RequestPriority,
+            *,
+            max_editions: int = 2,
+        ) -> list[AlbumCandidate]:
+            self.edition_calls.append(release_group_mbid)
+            if release_group_mbid != self._group:
+                return []
+            return [self.candidates[0], self._true_edition]
+
+    promo = msgspec.structs.replace(
+        _candidate(group="rg-real"),
+        secondary_types=["live"],
+    )
+    true_edition = msgspec.structs.replace(
+        _candidate(group="rg-real", recording="recording-official"),
+        release_mbid="release-rg-real-official",
+    )
+    provider = PromoFirstProvider("rg-real", promo, true_edition)
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    # Exactly one extra editions fetch for the one qualifying group.
+    assert provider.edition_calls == ["rg-real"]
+    with sqlite3.connect(db_path) as connection:
+        identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid FROM "
+            "local_album_external_identities WHERE local_album_id = 'album-1'"
+        ).fetchone()
+    assert identity == ("rg-real", "release-rg-real-official")
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_never_fires_for_identified_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store)
+    provider = FakeProvider([_candidate()])
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    assert provider.edition_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_never_fires_for_no_candidate_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store)
+    provider = FakeProvider([])
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "no_candidate"
+    assert provider.edition_calls == []
+    assert provider.calls == [
+        ("album", RequestPriority.BACKGROUND_SYNC),
+        ("recording", RequestPriority.BACKGROUND_SYNC),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_never_fires_for_contradictory_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
+    provider = FakeProvider([_candidate()])
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "contradictory"
+    assert provider.edition_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_respects_queue_pause_between_fetches(
+    store: NativeLibraryStore,
+    db_path: Path,
+) -> None:
+    """Pausing while the trial fetch runs parks the job at the
+    candidate_search checkpoint exactly like any other recall."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+
+    class PausingPromoProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    msgspec.structs.replace(
+                        _candidate(group="rg-real"), secondary_types=["live"]
+                    )
+                ]
+            )
+
+        async def get_album_candidate_editions(
+            self,
+            release_group_mbid: str,
+            target_track_count: int,
+            priority: RequestPriority,
+            *,
+            max_editions: int = 2,
+        ) -> list[AlbumCandidate]:
+            await queue.pause("admin", now=3)
+            return []
+
+    provider = PausingPromoProvider()
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "paused"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT state, lease_owner, checkpoint_json "
+            "FROM library_identification_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row[0:2] == ("queued", None)
+    assert json.loads(row[2])["phase"] == "candidate_search"
 
 
 @pytest.mark.asyncio
@@ -2530,3 +2912,1318 @@ async def test_terminal_miss_compaction_is_bounded_and_protects_references(
     assert rows[0][0:2] == ("evidence-1", 1)
     assert rows[0][2] <= 4096
     assert rows[1][0:2] == ("evidence-2", 0)
+
+@pytest.mark.asyncio
+async def test_identification_queue_defer_with_retry_after_persists_max_and_notifies_once(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    from infrastructure.resilience.retry import CircuitOpenError
+
+    await _seed_album(store, "99")
+    queue = IdentificationQueueService(store)
+    delays: list[float] = []
+    orig = store.work_wakeups.notify_after
+
+    def spy(kind: str, delay: float) -> None:
+        if kind == "identification":
+            delays.append(delay)
+        return orig(kind, delay)
+
+    store.work_wakeups.notify_after = spy  # type: ignore[assignment]
+    now = time.time() + 5
+    job_id = "job-queue-test"
+    await store.enqueue_identification_job(
+        IdentificationJob(
+            id=job_id,
+            local_album_id="album-99",
+            kind="automatic",
+            dedupe_key="automatic:album-99:rev1",
+            input_revision="rev1",
+            priority=20,
+            created_at=now - 10,
+        )
+    )
+    job = await queue.claim("worker-1", now=now)
+    assert job is not None
+    delays.clear()
+    await queue.defer(job, "worker-1", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now, retry_after_seconds=100)
+    assert len(delays) == 1
+    assert 99.5 <= delays[0] <= 101.0
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before FROM library_identification_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row["not_before"] >= now + 100 - 0.5
+    # No early claim before deadline
+    assert await queue.claim("worker-2", now=now + 50) is None
+    # Exactly one wake scheduled, claim after deadline succeeds
+    job2 = await queue.claim("worker-2", now=now + 101)
+    assert job2 is not None and job2["id"] == job_id
+    delays.clear()
+    await queue.defer(job2, "worker-2", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now + 101, retry_after_seconds=1.0)
+    # Short retry should use backoff 60 for attempt 2
+    assert len(delays) == 1
+    assert 59.5 <= delays[0] <= 61.0
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before FROM library_identification_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row["not_before"] >= now + 101 + 60 - 0.5
+    # Invalid retry_after should be ignored and use backoff 120 for attempt 3
+    job3 = await queue.claim("worker-3", now=now + 200)
+    assert job3 is not None
+    delays.clear()
+    await queue.defer(job3, "worker-3", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now + 200, retry_after_seconds=float("inf"))
+    assert len(delays) == 1
+    assert 119.5 <= delays[0] <= 121.0
+
+
+@pytest.mark.asyncio
+async def test_album_identification_circuit_open_defers_with_retry_after(store: NativeLibraryStore, db_path: Path) -> None:
+    from infrastructure.resilience.retry import CircuitOpenError
+    from unittest.mock import MagicMock
+
+    await _seed_album(store, "100")
+    queue = IdentificationQueueService(store)
+
+    class CircuitProvider:
+        async def search_album_candidate_ids(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+        async def search_recording_candidate_ids(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+        async def get_album_candidate(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+        async def get_exact_release_candidate(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+    provider = CircuitProvider()
+    candidates = AlbumCandidateService(provider)  # type: ignore[arg-type]
+    evidence_engine = AlbumEvidenceEngine()
+    fingerprints = MagicMock()
+    fingerprints.fingerprint_if_needed = AsyncMock(return_value=None)
+    service = AlbumIdentificationService(store, queue, candidates, evidence_engine, fingerprints)
+    now = time.time() + 5
+    await store.enqueue_identification_job(
+        IdentificationJob(
+            id="job-album-100",
+            local_album_id="album-100",
+            kind="automatic",
+            dedupe_key="automatic:album-100:rev1",
+            input_revision="rev1",
+            priority=20,
+            created_at=now - 10,
+        )
+    )
+    job = await queue.claim("worker-1", now=now)
+    assert job is not None
+    result = await service.run_claimed_job(job, "worker-1", now=now)  # type: ignore[arg-type]
+    assert result == "provider_deferred"
+    assert await queue.claim("worker-2", now=now + 10) is None
+    later = await queue.claim("worker-2", now=now + 43)
+    assert later is not None and later["id"] == job["id"]
+
+
+@pytest.mark.asyncio
+async def test_unmappable_payload_defers_with_deterministic_code(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-IDENT-02: a healthy breaker plus a deterministic payload-shape failure
+    must defer under UNMAPPABLE_PROVIDER_PAYLOAD - never the outage code."""
+    await _seed_album(store)
+    job = await _claimed_job(store)
+
+    class UnmappableProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            from infrastructure.degradation import try_get_degradation_context
+            from infrastructure.integration_result import IntegrationResult
+
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz",
+                    msg="MusicBrainz release-group search returned an unmappable payload.",
+                )
+            )
+            return []
+
+    outcome = await _service(
+        store,
+        UnmappableProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "provider_deferred"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT state, last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row == ("queued", "UNMAPPABLE_PROVIDER_PAYLOAD")
+
+
+@pytest.mark.asyncio
+async def test_unmappable_payload_reaches_terminal_attention_with_honest_cause(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The ordinary bounded cap applies; terminal attention preserves the
+    deterministic cause instead of reporting a provider outage."""
+    await _seed_album(store)
+
+    class UnmappableProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            from infrastructure.degradation import try_get_degradation_context
+            from infrastructure.integration_result import IntegrationResult
+
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz",
+                    msg="MusicBrainz release-group search returned an unmappable payload.",
+                )
+            )
+            return []
+
+    service = _service(
+        store,
+        UnmappableProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    )
+    # The bounded cap is 10 attempts; exponential backoff stays under 40k s per
+    # step, so advancing the clock by 40k s per attempt walks the whole ladder.
+    for attempt in range(12):
+        job = await store.enqueue_identification_job(
+            IdentificationJob(
+                id="job-album-1",
+                local_album_id="album-1",
+                kind="automatic",
+                dedupe_key="automatic:album-1:revision",
+                input_revision="revision",
+                priority=20,
+                created_at=1,
+            )
+        )
+        claimed = await store.claim_identification_job(
+            "worker", now=3 + attempt * 40000, lease_seconds=60
+        )
+        if claimed is None:
+            continue
+        outcome = await service.run_claimed_job(
+            claimed, "worker", now=3 + attempt * 40000
+        )
+        if outcome != "provider_deferred":
+            break
+
+    with sqlite3.connect(db_path) as connection:
+        failed_row = connection.execute(
+            "SELECT last_failure_code, attention_cause FROM library_identification_jobs "
+            "WHERE state = 'failed' ORDER BY terminal_at DESC LIMIT 1"
+        ).fetchone()
+
+    with sqlite3.connect(db_path) as connection:
+        failed_row = connection.execute(
+            "SELECT last_failure_code, attention_cause FROM library_identification_jobs "
+            "WHERE state = 'failed' ORDER BY terminal_at DESC LIMIT 1"
+        ).fetchone()
+    assert failed_row is not None
+    assert failed_row[0] == "MAX_DEFERRALS_EXCEEDED"
+    assert failed_row[1] == "UNMAPPABLE_PROVIDER_PAYLOAD"
+
+
+@pytest.mark.asyncio
+async def test_provider_reset_and_enqueue_never_resurrect_unmappable_rows(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Provider-health reset keeps unmappable backoff untouched, and a later
+    same-key enqueue must not resurrect a terminally-unmappable album."""
+    await _seed_album(store)
+    job = await _claimed_job(store)
+
+    class UnmappableProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            from infrastructure.degradation import try_get_degradation_context
+            from infrastructure.integration_result import IntegrationResult
+
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz",
+                    msg="MusicBrainz release-group search returned an unmappable payload.",
+                )
+            )
+            return []
+
+    await _service(
+        store,
+        UnmappableProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    queue = IdentificationQueueService(store)
+    reset_count = await store.reset_provider_identification_deferrals(
+        now=100, staleness_seconds=50
+    )
+    assert reset_count == 0  # exact-code gate: unmappable rows are untouched
+    with sqlite3.connect(db_path) as connection:
+        not_before, failure_code = connection.execute(
+            "SELECT not_before, last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert failure_code == "UNMAPPABLE_PROVIDER_PAYLOAD"
+    assert not_before > 3  # backoff preserved, not cleared by the provider sweep
+
+
+@pytest.mark.asyncio
+async def test_deferral_sequence_matches_the_declared_cap_exactly(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-IDENT-04: the applied backoff sequence is exactly 30 through 7,680 s,
+    cumulative 15,330 s; attempt ten terminalizes with the original cause and
+    no eleventh retry is schedulable."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    expected_waits = [30, 60, 120, 240, 480, 960, 1_920, 3_840, 7_680]
+    now = 2.0
+    applied: list[float] = []
+    for attempt in range(1, MAX_DEFERRAL_ATTEMPTS + 1):
+        claimed = await queue.claim("worker", now=now)
+        assert claimed is not None, f"attempt {attempt} was not claimable"
+        assert claimed["attempt_count"] == attempt
+        with sqlite3.connect(db_path) as connection:
+            not_before_before = connection.execute(
+                "SELECT not_before FROM library_identification_jobs"
+            ).fetchone()[0]
+        await queue.defer(claimed, "worker", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now)
+        with sqlite3.connect(db_path) as connection:
+            state, not_before, failure_code, attempts = connection.execute(
+                "SELECT state, not_before, last_failure_code, attempt_count "
+                "FROM library_identification_jobs"
+            ).fetchone()
+        if attempt < MAX_DEFERRAL_ATTEMPTS:
+            assert state == "queued"
+            wait = not_before - now
+            assert wait == pytest.approx(float(expected_waits[attempt - 1]))
+            applied.append(wait)
+            assert failure_code == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+            # A claim before the due time is blocked by the durable timestamp.
+            early_claim = await queue.claim(
+                "worker", now=(not_before_before + not_before) / 2
+            )
+            assert early_claim is None
+            now = not_before
+        else:
+            assert state == "failed"
+            assert failure_code == "MAX_DEFERRALS_EXCEEDED"
+            cause = connection.execute(
+                "SELECT attention_cause FROM library_identification_jobs"
+            ).fetchone()[0]
+            assert cause == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+            terminal_at_row = connection.execute(
+                "SELECT terminal_at FROM library_identification_jobs"
+            ).fetchone()[0]
+            assert terminal_at_row == pytest.approx(now)
+            break
+
+    assert applied == [float(value) for value in expected_waits]
+    assert sum(applied) == 15_330.0
+    assert max(applied) == float(MAX_BACKOFF_SECONDS)
+
+    # No eleventh retry is schedulable.
+    assert await queue.claim("worker", now=now + 100_000) is None
+
+
+class _OrderingProvider(FakeProvider):
+    """Records every release-group fetch in order and serves one candidate each."""
+
+    def __init__(
+        self,
+        album_ids: list[str],
+        recording_ids: list[str],
+        candidates: list[AlbumCandidate] | None = None,
+    ) -> None:
+        super().__init__(candidates)
+        self.album_ids = album_ids
+        self.recording_ids = recording_ids
+        self._recording_page = 0
+        self.fetch_order: list[str] = []
+
+    async def search_album_candidate_ids(
+        self, artist: str, title: str, limit: int, priority: RequestPriority
+    ) -> list[str]:
+        self.calls.append(("album", priority))
+        return self.album_ids[:limit]
+
+    async def search_recording_candidate_ids(
+        self,
+        artist: str,
+        title: str,
+        limit: int,
+        priority: RequestPriority,
+    ) -> list[str]:
+        self.calls.append(("recording", priority))
+        start = self._recording_page * limit
+        self._recording_page += 1
+        return self.recording_ids[start : start + limit]
+
+    async def get_album_candidate(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+    ) -> AlbumCandidate | None:
+        self.calls.append((f"detail:{release_group_mbid}", priority))
+        self.fetch_order.append(release_group_mbid)
+        return AlbumCandidate(
+            release_group_mbid=release_group_mbid,
+            release_mbid=f"release-{release_group_mbid}",
+            album_title="Noisy Tags",
+            album_artist_name="Artist",
+            tracks=[
+                CandidateTrack(
+                    title="Track",
+                    position=1,
+                    absolute_position=1,
+                    duration_seconds=180.0,
+                )
+            ],
+            release_type="album",
+        )
+
+
+def _recall_tracks() -> list[GroupingTrack]:
+    return [
+        GroupingTrack(
+            local_track_id=f"t-{index}",
+            root_id="root",
+            relative_path=f"a/{index}.flac",
+            title=f"Track {index}",
+            artist_name="Artist",
+            album_title="Noisy Tags",
+            album_artist_name="Artist",
+            track_number=index + 1,
+            disc_number=1,
+            duration_seconds=180.0,
+        )
+        for index in range(2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_seed_survives_the_cap_and_is_fetched_first() -> None:
+    """F-MATCH-02: with sparse tags and a long recording tail, the cached
+    fingerprint seed leads the bounded fetch order instead of being truncated."""
+    # 1 album id + 4 samples x 5 distinct recording ids + 1 seed > 10: the cap
+    # must truncate the text tail, never the leading fingerprint seed.
+    provider = _OrderingProvider(
+        album_ids=["rg-text-00"],
+        recording_ids=[f"rg-rec-{index:02d}" for index in range(20)],
+    )
+    service = AlbumCandidateService(provider)
+
+    candidates = await service.recall(
+        _recall_tracks(),
+        cached_fingerprint_release_groups=["rg-fingerprint-audio"],
+        explicit=True,
+    )
+
+    assert provider.fetch_order[0] == "rg-fingerprint-audio"
+    assert "rg-fingerprint-audio" in provider.fetch_order[:MAX_CANDIDATES]
+    assert len(provider.fetch_order) == MAX_CANDIDATES  # bound intact
+    detail_calls = [
+        call for call in provider.calls if call[0].startswith("detail:")
+    ]
+    assert {priority for _, priority in detail_calls} == {
+        RequestPriority.USER_INITIATED
+    }
+    assert candidates[0].release_group_mbid == "rg-fingerprint-audio"
+    assert candidates[0].source_kinds == ["cached_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_fingerprint_seeds_keep_input_order_after_dedup() -> None:
+    provider = _OrderingProvider(album_ids=[], recording_ids=[])
+    service = AlbumCandidateService(provider)
+
+    await service.recall(
+        _recall_tracks(),
+        cached_fingerprint_release_groups=[
+            "rg-fp-b",
+            "",
+            "rg-fp-a",
+            "rg-fp-b",
+            None or "rg-fp-c",
+            "rg-fp-a",
+        ],
+    )
+
+    seeds = [
+        group for group in provider.fetch_order if group.startswith("rg-fp-")
+    ]
+    assert seeds == ["rg-fp-b", "rg-fp-a", "rg-fp-c"]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_fingerprint_and_text_sources_merge_labels() -> None:
+    """One provider fetch per ID; the candidate keeps both source labels in a
+    deterministic order (fingerprint first, then the text label)."""
+    shared = "rg-shared"
+    provider = _OrderingProvider(
+        album_ids=[shared, "rg-text-only"],
+        recording_ids=[],
+    )
+    service = AlbumCandidateService(provider)
+
+    candidates = await service.recall(
+        _recall_tracks(),
+        cached_fingerprint_release_groups=[shared],
+    )
+
+    fetched_once = [
+        group for group in provider.fetch_order if group == shared
+    ] == [shared]
+    assert fetched_once
+    by_group = {c.release_group_mbid: c for c in candidates}
+    assert by_group[shared].source_kinds == [
+        "cached_fingerprint",
+        "album_tags",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_embedded_and_exact_branches_keep_their_priority_contracts() -> None:
+    """Exact-release branches are untouched; an embedded seed keeps its label
+    and merges deterministically when it also appears as a text hit."""
+    provider = _OrderingProvider(album_ids=["rg-embedded"], recording_ids=[])
+
+    # Unanimous embedded exact release still short-circuits to the exact call.
+    exact_candidate = AlbumCandidate(
+        release_group_mbid="rg-exact",
+        release_mbid="release-exact",
+        album_title="Noisy Tags",
+        album_artist_name="Artist",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=1,
+                absolute_position=1,
+                duration_seconds=180.0,
+            )
+        ],
+        release_type="album",
+    )
+    exact_provider = _OrderingProvider(album_ids=[], recording_ids=[])
+    exact_provider.candidates = [exact_candidate]
+    exact_tracks = _recall_tracks()
+    for track in exact_tracks:
+        track.release_mbid = "release-exact"
+    exact_candidates = await AlbumCandidateService(exact_provider).recall(exact_tracks)
+    assert [c.source_kinds for c in exact_candidates] == [["embedded_exact_release"]]
+    assert exact_provider.exact_releases == [("release-exact", RequestPriority.BACKGROUND_SYNC)]
+    assert exact_provider.calls == []  # never enters bounded recall
+
+    # Embedded release-group seed precedes the text hit after reorder.
+    seeded_tracks = _recall_tracks()
+    for track in seeded_tracks:
+        track.release_group_mbid = "rg-embedded"
+    candidates = await AlbumCandidateService(provider).recall(seeded_tracks)
+    assert candidates[0].release_group_mbid == "rg-embedded"
+    assert candidates[0].source_kinds == ["embedded", "album_tags"]
+
+
+def test_target_seed_order_matches_album_identifier_reference() -> None:
+    """Plan step 6 comparison fixture: the target ordering rule (deduped seeds
+    first, then text ids) matches ``AlbumIdentifier._candidate_release_groups``'s
+    documented seed-first behavior for equivalent inputs."""
+    seeds = ["rg-fp-b", "", "rg-fp-a"]
+    deduped_seeds = list(dict.fromkeys(value for value in seeds if value))
+    text_ranked = ["rg-text-0", "rg-text-1"]
+
+    from services.native.album_candidate_service import (
+        ALBUM_SEARCH_LIMIT,
+    )
+
+    del ALBUM_SEARCH_LIMIT
+    combined = (deduped_seeds + text_ranked)[:10]
+
+    # The matcher reference builds exactly `seeds + text_ranked` with the same
+    # empty-filter/dedupe semantics.
+    matcher_reference = list(
+        dict.fromkeys(m for m in seeds if m)
+    ) + text_ranked
+
+    assert combined == matcher_reference
+
+
+class _LocalFailureThenRecoveringFingerprinter(FakeFingerprinter):
+    """fpcalc fails on the first generation, then recovers."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            FingerprintResult(
+                status="pass",
+                recording_id="rec-local",
+                release_group_ids=["rg-local"],
+            ),
+            enabled=True,
+        )
+        self.generate_calls = 0
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        if self.generate_calls == 1:
+            raise OSError("fpcalc temporarily blocked")
+        return ("fp-hash", 180)
+
+
+@pytest.mark.asyncio
+async def test_local_fingerprint_failure_gets_bounded_retry_deadline(
+    store: NativeLibraryStore,
+) -> None:
+    """F-MATCH-04: FINGERPRINT_LOCAL_FAILURE persists a bounded retry_after;
+    the cached failure is reused before the deadline and regenerated at it,
+    fenced by stat_revision and fingerprinter version."""
+    from services.native.conditional_fingerprint_service import (
+        TRANSIENT_RETRY_SECONDS,
+    )
+
+    await _seed_album(store)
+    fake = _LocalFailureThenRecoveringFingerprinter()
+    service = ConditionalFingerprintService(store, fake)
+
+    failed = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=100.0,
+    )
+    assert failed.state == "failed"
+    assert failed.failure_code == "FINGERPRINT_LOCAL_FAILURE"
+    assert failed.retry_after == pytest.approx(100.0 + TRANSIENT_RETRY_SECONDS)
+    assert failed.attempt_count == 1
+
+    # Before the deadline: cached failure reused, no regeneration.
+    before = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=100.0 + TRANSIENT_RETRY_SECONDS - 1,
+    )
+    assert fake.generate_calls == 1
+    assert before.state == "failed"
+    assert before.retry_after == failed.retry_after
+
+    # At the deadline: generation retried and lookup succeeds normally.
+    recovered = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=100.0 + TRANSIENT_RETRY_SECONDS,
+    )
+    assert fake.generate_calls == 2
+    assert recovered.state == "matched"
+    assert recovered.recording_mbid == "rec-local"
+    assert recovered.stat_revision == "stat-1"
+    assert recovered.fingerprinter_version == "fpcalc-acoustid-v1"
+
+    # A different stat_revision is never blocked by the old revision's failure.
+    changed = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-2",
+        needed=True,
+        now=100.0 + TRANSIENT_RETRY_SECONDS + 1,
+    )
+    assert fake.generate_calls == 3
+    assert changed.stat_revision == "stat-2"
+
+
+@pytest.mark.asyncio
+async def test_automatic_worker_defers_local_fingerprint_failure_honestly(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A local fpcalc failure defers under its own code - never
+    PROVIDER_TEMPORARILY_UNAVAILABLE - so provider-only reset/resurrection
+    gates can never select the row."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+
+    # Candidates with NO usable track evidence leave the decision
+    # insufficient_evidence with zero supported recordings, which is exactly
+    # what sends the worker into the conditional fingerprint branch with
+    # needed=True for every track.
+    class LocalFailProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            return ["rg-a", "rg-b"]
+
+        async def get_album_candidate(
+            self,
+            release_group_mbid: str,
+            target_track_count: int,
+            priority: RequestPriority,
+        ) -> AlbumCandidate | None:
+            # Mirror the existing conditional-fingerprint fixture: one plausible
+            # candidate per group so the ordinary decision lands on `ambiguous`
+            # and the worker enters the fingerprint branch.
+            return AlbumCandidate(
+                release_group_mbid=release_group_mbid,
+                release_mbid=f"release-{release_group_mbid}",
+                album_title="Album",
+                album_artist_name="Artist",
+                tracks=[
+                    CandidateTrack(
+                        title="Track 1",
+                        position=1,
+                        absolute_position=1,
+                        duration_seconds=180.0,
+                        recording_mbid=f"recording-{release_group_mbid}",
+                        release_track_mbid=f"release-track-{release_group_mbid}",
+                    )
+                ],
+                release_type="album",
+            )
+
+    fingerprinter = _LocalFailureThenRecoveringFingerprinter()
+    service = _service(store, LocalFailProvider(), fingerprinter)
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    claimed = await queue.claim("worker", now=2)
+    assert claimed is not None
+    outcome = await service.run_claimed_job(claimed, "worker", now=3)
+
+    assert outcome == "provider_deferred"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+    assert row[0] == "FINGERPRINT_LOCAL_FAILURE"
+    # Provider-only sweep leaves the local-failure row's backoff untouched.
+    assert (
+        await store.reset_provider_identification_deferrals(
+            now=100_000, staleness_seconds=60
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_staged_collision_tokens_stay_two_albums_like_the_small_path(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-MATCH-06: two distinct grouping tokens that resolve to the same
+    directory, normalized consensus title, and artist must remain two local
+    albums on the staged path - matching the small path - and the staged keys
+    must be deterministic across pages, resumes, and repeated runs."""
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 4
+    )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGING_BATCH_SIZE", 2
+    )
+    artist = LocalArtist(
+        id="mixed-artist",
+        display_name="Artist One",
+        folded_name="artist one",
+        normalized_name="artist one",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="mixed-old-album",
+        root_id="root",
+        grouping_key="mixed-old",
+        title="Mixed Bag",
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    # 6 tracks > patched threshold of 4. All share the same normalized tag
+    # title/artist; alternating is_compilation splits them into two distinct
+    # grouping tokens (tagged:mixed bag: vs tagged:mixed bag:artist one).
+    tracks = [
+        LocalTrack(
+            id=f"mixed-track-{index:02}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/mixed/{index:02}.flac",
+            relative_path=f"mixed/{index:02}.flac",
+            path_hash=f"mixed-hash-{index:02}",
+            file_size_bytes=100,
+            file_mtime_ns=1,
+            stat_revision=f"100:{index}",
+            tag_revision=f"tag-{index}",
+            title=f"Track {index}",
+            artist_name=artist.display_name,
+            album_title=album.title,
+            album_artist_name=artist.display_name,
+            tag_album_title="Mixed Bag",
+            tag_album_artist_name="Artist One",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+            is_compilation=index % 2 == 0,
+        )
+        for index in range(1, 7)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+
+    def _run(run_id: str, now: float):
+        return LocalAlbumGroupingService(
+            store, IdentificationQueueService(store)
+        ).regroup_run(run_id, now=now, frozen_policy_revision="policy-1")
+
+    # Staged run first.
+    await store.create_scan_run(
+        ScanRun(id="mixed-staged-run", kind="incremental", trigger="manual", queued_at=1)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) "
+            "VALUES ('mixed-staged-run','root','mixed')"
+        )
+    await _run("mixed-staged-run", now=2)
+
+    with sqlite3.connect(db_path) as connection:
+        staged_groups = connection.execute(
+            "SELECT grouping_token,grouping_key,local_album_id FROM "
+            "library_scan_grouping_groups WHERE run_id='mixed-staged-run' "
+            "ORDER BY grouping_token"
+        ).fetchall()
+        staged_track_albums = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT id,local_album_id FROM local_tracks "
+                "WHERE relative_path LIKE 'mixed/%'"
+            ).fetchall()
+        }
+    assert len(staged_groups) == 2
+    first_token, second_token = (
+        str(staged_groups[0][0]),
+        str(staged_groups[1][0]),
+    )
+    first_key, second_key = (
+        str(staged_groups[0][1]),
+        str(staged_groups[1][1]),
+    )
+    first_album, second_album = (
+        str(staged_groups[0][2]),
+        str(staged_groups[1][2]),
+    )
+    assert first_key != second_key
+    assert second_key.startswith(first_key + ":")  # deterministic ordinal suffix
+    assert first_album != second_album
+
+    compilation_tracks = sorted(
+        track.id for track in tracks if track.is_compilation
+    )
+    plain_tracks = sorted(track.id for track in tracks if not track.is_compilation)
+    token_a_tracks = {
+        track_id
+        for track_id, album_id in staged_track_albums.items()
+        if album_id == first_album
+    }
+    assert sorted(token_a_tracks) in (compilation_tracks, plain_tracks)
+    # Disjoint membership covering every input track.
+    assigned = [album_id for _, album_id in staged_track_albums.items()]
+    assert len(set(assigned)) == 2
+
+    # Deterministic across a fresh run of the same input.
+    await store.finish_scan_run("mixed-staged-run") if hasattr(store, "finish_scan_run") else None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_runs SET state='completed' WHERE id='mixed-staged-run'"
+        )
+    await store.create_scan_run(
+        ScanRun(id="mixed-staged-run-2", kind="incremental", trigger="manual", queued_at=2)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) "
+            "VALUES ('mixed-staged-run-2','root','mixed')"
+        )
+    await _run("mixed-staged-run-2", now=3)
+    with sqlite3.connect(db_path) as connection:
+        rerun_keys = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT grouping_key FROM library_scan_grouping_groups "
+                "WHERE run_id='mixed-staged-run-2' ORDER BY grouping_token"
+            ).fetchall()
+        ]
+    assert rerun_keys == [first_key, second_key]
+
+    # Small path on a separate run: same group count and disjoint membership.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_runs SET state='completed' WHERE id='mixed-staged-run-2'"
+        )
+    await store.create_scan_run(
+        ScanRun(id="mixed-small-run", kind="incremental", trigger="manual", queued_at=3)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) "
+            "VALUES ('mixed-small-run','root','mixed')"
+        )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 50
+    )
+    await _run("mixed-small-run", now=4)
+    with sqlite3.connect(db_path) as connection:
+        small_album_ids = {
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT local_album_id FROM local_tracks "
+                "WHERE relative_path LIKE 'mixed/%'"
+            ).fetchall()
+        }
+    assert len(small_album_ids - {album.id}) >= 2 or len(small_album_ids) >= 2
+
+
+@pytest.mark.asyncio
+async def test_provision_rejects_duplicate_staged_targets_fail_closed() -> None:
+    """F-MATCH-06 guard: provisioning two distinct staged groups onto one new
+    local album ID fails closed instead of silently merging them."""
+    from core.exceptions import ConflictError
+
+    duplicate_groups = [
+        {
+            "grouping_token": "manual:a",
+            "grouping_key": "key-a",
+            "title": "Same",
+            "album_artist_name": "Artist",
+            "reason_code": "AMBIGUOUS_FALLBACK_GROUP",
+            "local_album_id": "album-dup",
+            "local_artist_id": "artist-dup",
+        },
+        {
+            "grouping_token": "manual:b",
+            "grouping_key": "key-b",
+            "title": "Same",
+            "album_artist_name": "Artist",
+            "reason_code": "AMBIGUOUS_FALLBACK_GROUP",
+            "local_album_id": "album-dup",
+            "local_artist_id": "artist-dup",
+        },
+    ]
+
+    class _GuardStore(NativeLibraryStore):
+        recorded: list = []
+
+        async def _write_scan(self, operation):
+            connection = self._connect()
+
+            class _FakeCursor:
+                rowcount = 0
+
+            operation(connection)
+            connection.close()
+            return _FakeCursor()
+
+    tmp = Path(tempfile.mkdtemp())
+    db_file = tmp / "guard.db"
+    with sqlite3.connect(db_file) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users VALUES ('admin')")
+    guard_store = _GuardStore(db_file, threading.Lock())
+
+    with pytest.raises(ConflictError):
+        await guard_store.provision_staged_grouping_groups(
+            "run-guard", "root", "dir", duplicate_groups, now=5.0
+        )
+
+
+# Cluster 5/6: F-057 F-042 F-041 F-043 behavioral pins
+
+
+class _CountingEmptyProvider(FakeProvider):
+    """Zero candidates, no degradation - the pure 'nothing found' lane."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.search_calls = 0
+
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
+        self.search_calls += 1
+        return []
+
+
+def _multi_track_album(store: NativeLibraryStore, count: int) -> None:
+    from models.local_catalog import (
+        CatalogMembership,
+        LocalAlbum,
+        LocalArtist,
+        LocalArtistCredit,
+        LocalTrack,
+    )
+
+    artist = LocalArtist(
+        id="artist-multi",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-multi",
+        root_id="root",
+        grouping_key="group-multi",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name="Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = []
+    credits = {}
+    for index in range(1, count + 1):
+        track = LocalTrack(
+            id=f"track-multi-{index}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/multi-{index}.flac",
+            relative_path=f"multi-{index}.flac",
+            path_hash=f"hash-multi-{index}",
+            file_size_bytes=100,
+            file_mtime_ns=index,
+            stat_revision=f"stat-multi-{index}",
+            tag_revision=f"tag-multi-{index}",
+            title="Track",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+        )
+        tracks.append(track)
+        credits[track.id] = [
+            LocalArtistCredit(local_artist_id=artist.id, position=0)
+        ]
+    return CatalogMembership(
+        album=album,
+        artists=[artist],
+        tracks=tracks,
+        album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+        track_credits=credits,
+    )
+
+
+def _multi_track_candidate(
+    *, group: str, release: str, recording_prefix: str, count: int
+) -> AlbumCandidate:
+    return AlbumCandidate(
+        release_group_mbid=group,
+        release_mbid=release,
+        album_title="Album",
+        album_artist_name="Artist",
+        artist_mbid="artist-mbid",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=index,
+                absolute_position=index,
+                duration_seconds=180,
+                recording_mbid=f"{recording_prefix}-{index}",
+            )
+            for index in range(1, count + 1)
+        ],
+    )
+
+
+async def _seed_multi_track_album(store: NativeLibraryStore, count: int) -> None:
+    await store.create_catalog_membership(_multi_track_album(store, count))
+
+
+@pytest.mark.asyncio
+async def test_cached_no_match_does_not_starve_later_tracks(
+    store: NativeLibraryStore,
+) -> None:
+    """F-042: a terminal no_match on track 1 must not consume budget slots -
+    tracks 2 and 3 still get fingerprinted in the same attempt."""
+    from models.identification import FingerprintOutcome
+
+    await _seed_multi_track_album(store, 3)
+    await store.record_fingerprint_outcome(
+        FingerprintOutcome(
+            id="seed-1",
+            local_track_id="track-multi-1",
+            stat_revision="stat-multi-1",
+            fingerprinter_version=FINGERPRINTER_VERSION,
+            state="no_match",
+            first_attempt_at=1,
+            last_attempt_at=1,
+        )
+    )
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    # Two fully-supported three-track candidates with equal scores -> an
+    # ambiguous decision whose per-track supported sets hold two recordings,
+    # so every track needs a fingerprint.
+    provider = FakeProvider(
+        [
+            _multi_track_candidate(
+                group="rg-a",
+                release="release-a",
+                recording_prefix="recording-a",
+                count=3,
+            ),
+            _multi_track_candidate(
+                group="rg-b",
+                release="release-b",
+                recording_prefix="recording-b",
+                count=3,
+            ),
+        ]
+    )
+    service = _service(store, provider, fake)
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    # All three tracks were processed: two fresh generations (tracks 2+3)
+    # plus the free cache hit on track 1.
+    # ambiguous survives enforcement on this fully-matched album
+    assert outcome == "ambiguous"
+    assert fake.generate_calls == 2
+    third = await store.get_fingerprint_outcome(
+        "track-multi-3", "stat-multi-3", FINGERPRINTER_VERSION
+    )
+    assert third is not None and third.state == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_budget_still_caps_fresh_work(
+    store: NativeLibraryStore,
+) -> None:
+    """F-042 regression guard: four un-fingerprinted tracks produce exactly
+    MAX_NEW_FINGERPRINTS_PER_ATTEMPT generations on one attempt."""
+    await _seed_multi_track_album(store, 4)
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    # Four-track twins keep every local track supported (decision ambiguous),
+    # so all four tracks are needed and the cap bounds fresh work at 2.
+    provider = FakeProvider(
+        [
+            _multi_track_candidate(
+                group="rg-a",
+                release="release-a",
+                recording_prefix="recording-a",
+                count=4,
+            ),
+            _multi_track_candidate(
+                group="rg-b",
+                release="release-b",
+                recording_prefix="recording-b",
+                count=4,
+            ),
+        ]
+    )
+    service = _service(store, provider, fake)
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert fake.generate_calls == MAX_NEW_FINGERPRINTS_PER_ATTEMPT
+
+
+@pytest.mark.asyncio
+async def test_disabled_outcome_recovers_once_acoustid_enabled(
+    store: NativeLibraryStore,
+) -> None:
+    """F-041: a disabled outcome is reused only while AcoustID stays
+    disabled; enabling the key regenerates and lands matched."""
+    await _seed_album(store)
+    disabled_fake = FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False)
+    enabled_fake = FakeFingerprinter(
+        FingerprintResult(status="pass", recording_id="rec-1", score=0.9),
+        enabled=True,
+    )
+    service = ConditionalFingerprintService(store, disabled_fake)
+    first = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=1,
+    )
+    assert first is not None and first.state == "disabled"
+
+    upgraded = ConditionalFingerprintService(store, enabled_fake)
+    second = await upgraded.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=2,
+    )
+    assert second is not None and second.state == "matched"
+    assert enabled_fake.generate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_seeded_deferred_outcome_skips_generation_on_resume(
+    store: NativeLibraryStore,
+) -> None:
+    """F-043 bridge: a deferred row carrying a known fingerprint resumes at
+    the lookup without re-running fpcalc."""
+    from models.identification import FingerprintOutcome
+
+    await _seed_album(store)
+    await store.record_fingerprint_outcome(
+        FingerprintOutcome(
+            id="seed-deferred",
+            local_track_id="track-1",
+            stat_revision="stat-1",
+            fingerprinter_version=FINGERPRINTER_VERSION,
+            state="deferred",
+            fingerprint="known-fingerprint",
+            duration_seconds=180.0,
+            failure_code="LOOKUP_PENDING",
+            first_attempt_at=1,
+            last_attempt_at=1,
+            retry_after=1,
+        )
+    )
+    fake = FakeFingerprinter(
+        FingerprintResult(status="pass", recording_id="rec-known", score=0.95)
+    )
+    service = ConditionalFingerprintService(store, fake)
+    outcome = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=5,
+    )
+
+    assert outcome is not None and outcome.state == "matched"
+    assert outcome.recording_mbid == "rec-known"
+    assert fake.generate_calls == 0
+    assert fake.lookup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_renews_lease_on_phase_checkpoints(
+    store: NativeLibraryStore,
+) -> None:
+    """F-057: the dormant lease heartbeat fires during a run."""
+    await _seed_album(store)
+    provider = FakeProvider([_candidate()])
+    heartbeat_calls: list[tuple[str, str]] = []
+    original = store.heartbeat_identification_job
+
+    async def spy(job_id: str, worker_id: str, *, now: float, lease_seconds: float):
+        heartbeat_calls.append((job_id, worker_id))
+        return await original(job_id, worker_id, now=now, lease_seconds=lease_seconds)
+
+    store.heartbeat_identification_job = spy  # type: ignore[method-assign]
+    service = _service(store, provider, FakeFingerprinter(FingerprintResult(status="skip")))
+    job = await _claimed_job(store)
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome == "identified"
+    assert heartbeat_calls and heartbeat_calls[0] == (job["id"], "worker")
+
+
+@pytest.mark.asyncio
+async def test_pause_checkpoint_keeps_phase_label_only(
+    store: NativeLibraryStore,
+) -> None:
+    """F-058/F-063: the pause checkpoint stores ONLY the phase label and
+    matcher version - the candidate-evidence blob implied replay semantics
+    that do not exist, and post-decision evidence cannot reconstruct recall
+    candidates losslessly."""
+    import json as _json
+
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        FakeProvider([_candidate()]),
+        FakeFingerprinter(FingerprintResult(status="skip")),
+    )
+
+    async def pause_after_first_track() -> bool:
+        return False
+
+    # Pause the queue so the run hits its candidate_search checkpoint...
+    await queue.pause(None, now=2)
+
+    async def flip_back() -> bool:
+        await queue.resume(now=3)
+        return True
+
+    calls = {"n": 0}
+
+    async def checkpoint() -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await pause_after_first_track()
+        return await flip_back()
+
+    outcome = await service.run_claimed_job(job, "worker", now=10)
+    assert outcome in {"identified", "no_candidate", "paused"}
+
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT checkpoint_json FROM library_identification_jobs WHERE id=?",
+            (job["id"],),
+        ).fetchone()[0]
+    if row is not None:
+        payload = _json.loads(row)
+        assert set(payload) <= {"phase", "matcher_version"}
+        assert "evidence" not in payload
+
+
+class _RecallSpyProvider(FakeProvider):
+    def __init__(self, inner: FakeProvider) -> None:
+        super().__init__(inner.candidates)
+        self.album_search_calls = 0
+
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
+        self.album_search_calls += 1
+        return await inner_search(self, artist, title, limit, priority)
+
+

@@ -477,9 +477,6 @@ def test_get_files_returns_file_list():
     assert body["files"][0]["size"] == 123
 
 
-# -- held-track audio preview --
-
-
 def _held(held_path: str):
     from models.held_import import HeldImport
 
@@ -589,7 +586,7 @@ def test_held_audio_not_owned_is_404():
     assert resp.status_code == 404
 
 
-# --- Quality upgrades (CollectionManagement Feature B, admin/trusted D18) ------
+# collection-management feature B quality-upgrade routes: admin/trusted curator gate (D18)
 
 
 def _curator_app(service, *, role: str = "admin") -> FastAPI:
@@ -669,6 +666,39 @@ def test_cutoff_unmet_returns_worklist_for_curator():
     assert body["upgrade_allowed"] is True
     assert body["items"][0]["release_group_mbid"] == "rg-1"
     assert body["items"][0]["current_tier"] == "mp3_192"
+
+
+def test_cutoff_unmet_serializes_normalized_artist_fields_for_target_rows():
+    """NEW-TARGET-01: target-shaped store rows reach the wire with the shared
+    artist_name/artist_mbid keys populated from the normalized repository
+    contract."""
+    service = AsyncMock()
+    service.list_cutoff_unmet.return_value = [
+        {
+            "release_group_mbid": "target-rg",
+            "current_tier": "mp3_320",
+            "track_count": 7,
+            # Target-shaped row: legacy keys absent; normalized keys present.
+            "album_artist_name": "Target Artist",
+            "artist_name": "Target Artist",
+            "provider_artist_mbid": "provider-artist-1",
+            "artist_mbid": "provider-artist-1",
+            "album_title": "Target Album",
+            "year": 2024,
+        }
+    ]
+    service.quality_cutoff = "lossless"
+    service.upgrade_allowed = True
+
+    resp = build_test_client(_curator_app(service, role="trusted")).get(
+        "/downloads/cutoff-unmet"
+    )
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["artist_name"] == "Target Artist"
+    assert item["artist_mbid"] == "provider-artist-1"
+    assert item["current_tier"] == "mp3_320"
 
 
 def test_upgrade_album_route_queues_and_maps_sentinel():

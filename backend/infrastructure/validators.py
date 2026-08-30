@@ -78,6 +78,34 @@ def validate_audiodb_image_url(url: str) -> bool:
     return True
 
 
+SPOTIFY_CDN_SUFFIX = ".scdn.co"
+
+
+def validate_spotify_cover_url(url: str) -> bool:
+    """Validate that a URL points at a Spotify CDN image host over HTTPS.
+
+    Accepts any ``*.scdn.co`` host (i.scdn.co, mosaic.scdn.co, thisis-images.scdn.co,
+    ...). Rejects non-HTTPS schemes, empty hosts, and anything outside the Spotify
+    CDN suffix - including lookalikes such as ``i.scdn.co.evil.com`` (suffix match
+    is on the hostname, not the path).
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return False
+
+    if parsed.scheme != "https":
+        return False
+
+    hostname = (parsed.hostname or "").lower().strip()
+    if not hostname:
+        return False
+
+    return hostname == "scdn.co" or hostname.endswith(SPOTIFY_CDN_SUFFIX)
+
+
 def is_valid_mbid(mbid: Optional[str]) -> bool:
     if not mbid or not isinstance(mbid, str):
         return False
@@ -123,7 +151,7 @@ def sanitize_optional_string(value: Optional[str]) -> Optional[str]:
 def strip_html_tags(text: str | None) -> str:
     """Strip HTML tags from text, converting <br> to newlines.
 
-    Uses stdlib html.parser — no external dependencies needed.
+    Uses stdlib html.parser - no external dependencies needed.
     Returns plain text suitable for display.
     """
     if not text:

@@ -1,11 +1,16 @@
 import asyncio
+import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
-from pathlib import Path
-from collections.abc import Callable
+import unicodedata
+import stat
+from pathlib import Path, PurePosixPath
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import msgspec
@@ -1919,7 +1924,7 @@ async def test_import_preparation_failure_rolls_back_the_in_progress_journal(
     original = publisher._stage_audio
     calls = 0
 
-    def fail_second_stage(*args) -> None:
+    def fail_second_stage(*args, **kwargs) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -2364,6 +2369,83 @@ async def test_publisher_moves_validated_real_audio_and_is_idempotent(
     assert not list(root.rglob(".droppedneedle-management-*"))
 
 
+def _nfd_source_directory(root: Path, _preferences, store) -> None:
+    """Move the source into an NFD-composed parent directory so staging reads
+    FROM a decomposed-unicode path (the NFD-parent hazard of F-207)."""
+    name = unicodedata.normalize("NFD", "ゴールド")
+    assert not unicodedata.is_normalized("NFC", name)  # guard: truly decomposed
+    nested = root / name
+    nested.mkdir()
+    source = root / "source.flac"
+    source.replace(nested / "source.flac")
+    relative = f"{name}/source.flac"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_path=?,relative_path=?,path_hash=? "
+            "WHERE id='track-1'",
+            (str(nested / "source.flac"), relative, hashlib.sha256(relative.encode()).hexdigest()),
+        )
+
+
+def _unicode_release_configuration(planner) -> None:
+    """Canonical release whose album/artist/track names mix NFD-decomposable
+    katakana with invariant CJK; the naming engine must publish NFC."""
+    payload = json.loads(
+        (FIXTURES / "musicbrainz" / "management_release.json").read_bytes()
+    )
+    payload["title"] = unicodedata.normalize("NFD", "ゴールド") + "変奏曲"
+    payload["artist-credit"] = [
+        {
+            "name": "作曲者",
+            "joinphrase": "",
+            "artist": {
+                "id": "24e1b53c-3085-33e9-8f3c-52404792e9a8",
+                "name": "作曲者",
+                "sort-name": "作曲者",
+            },
+        }
+    ]
+    track = payload["media"][0]["tracks"][0]
+    track["title"] = unicodedata.normalize("NFD", "ダリア")
+    track["recording"]["title"] = track["title"]
+    planner._canonical._musicbrainz.get_canonical_release.return_value = (
+        msgspec.json.decode(json.dumps(payload).encode(), type=MbManagementRelease)
+    )
+
+
+@pytest.mark.asyncio
+async def test_publisher_publishes_nfd_sources_to_nfc_cjk_destinations(
+    tmp_path: Path,
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=_nfd_source_directory,
+        customize_planner=_unicode_release_configuration,
+    )
+
+    result = await publisher.publish_bundle(job_id, 0, "apply-worker")
+    repeated = await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    album = unicodedata.normalize("NFC", unicodedata.normalize("NFD", "ゴールド")) + "変奏曲"
+    title = unicodedata.normalize("NFC", unicodedata.normalize("NFD", "ダリア"))
+    destination = root / "作曲者" / f"{album} (1982)" / f"01 - {title}.flac"
+    assert destination.is_file()
+    # every published component is NFC, not the NFD the metadata arrived in
+    for part in destination.relative_to(root).parts:
+        assert unicodedata.is_normalized("NFC", part)
+    assert source.exists() is False
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert [journal.state for journal in journals] == ["completed"]
+    assert (
+        journals[0].staged_fingerprint
+        == hashlib.sha256(destination.read_bytes()).hexdigest()
+    )
+    row = await store.get_target_track("track-1")
+    assert row is not None
+    assert row["relative_path"] == destination.relative_to(root).as_posix()
+    assert result.catalog_revision == repeated.catalog_revision == 1
+
+
 @pytest.mark.asyncio
 async def test_publisher_breaks_hardlinks_without_mutating_the_other_name(
     tmp_path: Path,
@@ -2529,6 +2611,49 @@ async def test_publisher_prepares_and_commits_multi_file_album_as_one_bundle(
     )
     assert len(journals) == 2
     assert all(journal.state == "completed" for journal in journals)
+
+
+@pytest.mark.asyncio
+async def test_manual_bundle_staging_failure_mid_album_rolls_back_every_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual-lane mirror of the import lane's preparation-failure drill: an
+    OSError while staging the SECOND file of a two-file album must compensate
+    the whole bundle - no published destination, both journals rolled back,
+    catalog untouched."""
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        prepare_store=_add_second_album_track,
+        customize_planner=_add_second_canonical_track,
+        selection=LibraryManagementSelection(kind="albums", ids=("album-1",)),
+    )
+    before_first = await store.get_target_track("track-1")
+    before_second = await store.get_target_track("track-2")
+    original = publisher._stage_audio
+    calls = 0
+
+    def fail_second_stage(*args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated staging failure")
+        original(*args)
+
+    monkeypatch.setattr(publisher, "_stage_audio", fail_second_stage)
+
+    with pytest.raises(OSError, match="simulated staging failure"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert [journal.state for journal in journals] == ["rolled_back", "rolled_back"]
+    assert source.is_file()
+    assert (root / "source2.flac").is_file()
+    organized = root / "Johann Sebastian Bach; Glenn Gould"
+    assert not organized.exists() or not any(organized.rglob("*.flac"))
+    assert await store.get_target_track("track-1") == before_first
+    assert await store.get_target_track("track-2") == before_second
+    assert not list(root.rglob(".droppedneedle-management-*"))
 
 
 @pytest.mark.asyncio
@@ -2877,3 +3002,490 @@ async def test_import_publisher_defers_repeated_cancellation_through_catalog_com
     assert row is not None
     assert record is not None and record.state == "completed"
     assert [journal.state for journal in journals] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_import_publications_serialize_per_bundle(
+    tmp_path: Path,
+) -> None:
+    """F-175: a second caller with the same idempotency key awaits the per-bundle
+    lock and replays the state machine instead of interleaving staging under the
+    winner's critical section."""
+    root, catalog_source, store, audio, publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "duplicate-import.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Duplicate.flac",
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:duplicate-lane:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original = publisher._publish_import_file
+    publish_calls: list[int] = []
+
+    async def slow_first_publish(value, roots):
+        publish_calls.append(value.journal.ordinal)
+        if not release.is_set():
+            started.set()
+            await release.wait()
+        return await original(value, roots)
+
+    publisher._publish_import_file = slow_first_publish
+
+    async def release_after_queue():
+        await started.wait()
+        # give the duplicate caller a chance to queue on the bundle lock
+        await asyncio.sleep(0.05)
+        release.set()
+
+    results = await asyncio.gather(
+        service.publish_import_bundle(bundle),
+        service.publish_import_bundle(bundle),
+        release_after_queue(),
+    )
+    publisher._publish_import_file = original
+
+    first, second = results[0], results[1]
+    assert sorted(publish_calls) == [0]
+    assert first.local_track_ids == second.local_track_ids
+    assert first.paths == second.paths
+    assert second.repeated is True
+    journals = await store.list_library_management_import_journals(first.bundle_id)
+    assert [journal.state for journal in journals] == ["completed"]
+    assert incoming.exists() is False
+    assert (root / request.destination_relative_path).is_file()
+
+
+def _cjk_canonical_track(planner) -> None:
+    """Override the mocked canonical release so rendering yields CJK + accent."""
+    payload = json.loads(
+        (FIXTURES / "musicbrainz" / "management_release.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    payload["title"] = "宇宙のアルバム Café"
+    payload["artist-credit"][0]["artist"]["name"] = "宇宙の詩人"
+    payload["media"][0]["tracks"][0]["title"] = "星の詩 Café"
+    planner._canonical._musicbrainz.get_canonical_release.return_value = (
+        msgspec.json.decode(json.dumps(payload).encode(), type=MbManagementRelease)
+    )
+
+
+def _cross_root_configuration(destination_root: Path):
+    def configure(_root, preferences, _store) -> None:
+        settings = preferences.get_typed_library_settings_raw()
+        settings.library_roots.append(
+            LibraryRootSettings(
+                id="root-2",
+                path=str(destination_root),
+                label="Organized",
+                policy="automatic",
+                rules=[],
+            )
+        )
+        preferences.save_typed_library_settings(settings)
+
+    return configure
+
+
+@pytest.mark.asyncio
+async def test_publisher_publishes_cjk_album_with_destination_side_temps(
+    tmp_path: Path,
+) -> None:
+    """F-152a/F-152c: CJK+accent names publish end to end and every journal
+    stages its temporary under the destination root (EXDEV-safe by construction)."""
+    destination_root = tmp_path / "organized"
+    destination_root.mkdir()
+    root, source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=_cross_root_configuration(destination_root),
+        customize_planner=_cjk_canonical_track,
+        target_root_id="root-2",
+    )
+    items = await store.get_library_management_bundle_plan_items(job_id, 0)
+    planned_relative = str(items[0].destination_relative_path)
+    assert "宇宙のアルバム" in planned_relative
+    assert "星の詩" in planned_relative
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    row = await store.get_target_track("track-1")
+    assert row is not None and row["root_id"] == "root-2"
+    assert str(row["relative_path"]) == planned_relative
+    published = destination_root / planned_relative
+    assert published.is_file()
+    assert unicodedata.is_normalized("NFC", str(published.relative_to(destination_root)))
+    assert audio.read(published).metadata.value_for("title") == "星の詩 Café"
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert journals
+    assert all(journal.temporary_root_id == "root-2" for journal in journals)
+    assert source.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_publisher_fails_closed_on_nfd_normalized_sibling_directory(
+    tmp_path: Path,
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path, customize_planner=_cjk_canonical_track
+    )
+    items = await store.get_library_management_bundle_plan_items(job_id, 0)
+    planned_relative = PurePosixPath(str(items[0].destination_relative_path))
+    destination_parent = root / planned_relative.parent
+    destination_parent.mkdir(parents=True)
+    # The recheck scans the destination FILE's siblings for NFC-equivalent
+    # names; a byte-level NFD twin of the file name must fail closed.
+    nfd_name = unicodedata.normalize("NFD", planned_relative.name)
+    assert nfd_name != planned_relative.name
+    (destination_parent / nfd_name).write_bytes(b"nfd twin")
+
+    with pytest.raises(Exception, match="normalized") as caught:
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    del caught
+    assert source.is_file()
+    assert not (root / str(planned_relative)).exists()
+
+
+@pytest.mark.asyncio
+async def test_publish_logs_directory_fsync_failures_but_still_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F-146: a directory-fsync failure must be observable while availability
+    is preserved - the commit still lands and the warning names the directory."""
+    real_fsync = os.fsync
+    music_root = os.path.normpath(str(tmp_path / "music"))
+
+    def failing_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            try:
+                directory = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                directory = ""
+            if os.path.normpath(directory).startswith(music_root):
+                raise OSError(errno.EINVAL, "Invalid argument")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", failing_directory_fsync)
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+
+    with caplog.at_level(logging.WARNING, logger="services.native."
+                                                     "library_management_publisher"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    row = await store.get_target_track("track-1")
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert row is not None
+    assert (root / str(row["relative_path"])).is_file()
+    assert [journal.state for journal in journals] == ["completed"]
+    warnings = [
+        record for record in caplog.records if "directory fsync failed" in record.getMessage()
+    ]
+    assert warnings, "expected a directory fsync failure warning"
+    assert any("EINVAL" in record.getMessage() or "(errno=22)" in record.getMessage() for record in warnings)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fsyncs_source_parent_after_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-147: the hot-path cleanup must persist the removed source's directory
+    entry AFTER the unlink, matching the recovery protocol."""
+    events: list[tuple[str, str]] = []
+    real_unlink = os.unlink
+    real_fsync = os.fsync
+
+    def recording_unlink(name, *args, **kwargs):
+        dir_fd = kwargs.get("dir_fd")
+        if dir_fd is not None:
+            target = os.path.join(
+                os.readlink(f"/proc/self/fd/{dir_fd}"), os.fspath(name)
+            )
+        else:
+            target = os.fspath(name)
+        events.append(("unlink", os.path.normpath(target)))
+        return real_unlink(name, *args, **kwargs)
+
+    def recording_fsync(fd):
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            path = "<unknown>"
+        events.append(("fsync", os.path.normpath(path)))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "unlink", recording_unlink)
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    row = await store.get_target_track("track-1")
+    assert row is not None and source.exists() is False
+    unlink_indexes = [
+        index
+        for index, (kind, path) in enumerate(events)
+        if kind == "unlink" and path == os.path.normpath(str(source))
+    ]
+    assert unlink_indexes, "expected the managed source unlink to be recorded"
+    fsync_source_indexes = [
+        index
+        for index, (kind, path) in enumerate(events)
+        if kind == "fsync" and path == os.path.normpath(str(source.parent))
+    ]
+    assert fsync_source_indexes, "expected the source parent directory fsync"
+    assert max(fsync_source_indexes) > min(unlink_indexes), (
+        "the source parent fsync must follow the source unlink"
+    )
+
+
+@pytest.mark.asyncio
+async def test_publisher_replays_post_commit_hook_on_committed_replay(
+    tmp_path: Path,
+) -> None:
+    """F-145 window 1: an all-terminal bundle replay re-runs the guarded
+    post-commit hook so a lost enqueue is recovered on any later retry."""
+    _root, _source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    hook = AsyncMock()
+    replay_publisher = LibraryManagementPublisher(
+        store,
+        publisher._preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "blobs", store),
+        LibraryFilesystemCoordinator(),
+        clock=lambda: 110.0,
+        on_commit=hook,
+    )
+
+    result = await replay_publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert result.committed_journal_ids
+    hook.assert_awaited_once()
+    track_ids, album_ids = hook.await_args.args
+    assert track_ids == {"track-1"}
+    assert album_ids >= {"album-1"}
+
+
+@pytest.mark.asyncio
+async def test_post_commit_hook_failure_is_swallowed_with_exc_info(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F-145: a throwing hook never fails a committed bundle; the warning keeps
+    its traceback, and a later replay of the terminal bundle retries the hook."""
+    hook = AsyncMock(side_effect=RuntimeError("refresh backend down"))
+    _root, _source, store, audio, publisher, job_id = (
+        await _ready_apply_operation_with_hook(tmp_path, hook)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="services.native."
+                                                     "library_management_publisher"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert hook.await_count == 2
+    failures = [
+        record
+        for record in caplog.records
+        if "post-commit invalidation failed" in record.getMessage()
+    ]
+    assert len(failures) == 2
+    assert all(record.exc_info for record in failures)
+
+
+async def _ready_apply_operation_with_hook(tmp_path: Path, hook):
+    root, source, store, audio, preferences, job_id = await _bare_ready_operation(
+        tmp_path
+    )
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "blobs", store),
+        LibraryFilesystemCoordinator(),
+        clock=lambda: 110.0,
+        on_commit=hook,
+    )
+    return root, source, store, audio, publisher, job_id
+
+
+async def _bare_ready_operation(tmp_path: Path):
+    root, source, preferences, store, _settings_revision, _policy_revision = (
+        _configured(tmp_path)
+    )
+    audio = AudioMetadataEngine()
+    settings_revision = preferences.get_library_management_settings().settings_revision
+    policy_revision = LibraryPolicyResolver(
+        preferences.get_typed_library_settings_raw()
+    ).policy_revision
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key="post-commit-preview",
+    )
+    claimed = await store.claim_operation_job(
+        "preview-worker", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    await planner.run_claimed_preview(claimed, "preview-worker")
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "UPDATE library_operation_jobs SET state='running',lease_owner='apply-worker',"
+            "lease_expires_at=200,heartbeat_at=110,expected_work_count=1 WHERE id=?",
+            (handle.job_id,),
+        )
+        connection.execute(
+            "UPDATE library_management_job_snapshots SET mode='apply',phase='applying' "
+            "WHERE job_id=?",
+            (handle.job_id,),
+        )
+        connection.execute(
+            "INSERT INTO library_operation_work "
+            "(job_id,ordinal,local_album_id,expected_subject_revision,"
+            "expected_input_revision,action,idempotency_key,state,updated_at) "
+            "VALUES (?,0,'album-1',1,?,'library_management',?,'running',110)",
+            (handle.job_id, settings_revision, f"{handle.job_id}:bundle:0"),
+        )
+    return root, source, store, audio, preferences, handle.job_id
+
+
+class _RecordingCoordinator(LibraryFilesystemCoordinator):
+    """Coordinator wrapper that records lease acquisition/release ordering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[tuple[str, tuple[str, ...]]] = []
+
+    @asynccontextmanager
+    async def write_many(self, root_ids):
+        roots = tuple(sorted(set(root_ids)))
+        self.events.append(("acquire", roots))
+        try:
+            async with super().write_many(root_ids):
+                self.events.append(("held", roots))
+                yield
+        finally:
+            self.events.append(("release", roots))
+
+
+@pytest.mark.asyncio
+async def test_outer_compensation_mutates_roots_only_under_the_writer_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-106: when a failure bypasses the inner critical-section handler, the
+    outer compensation must restore/unlink while a fresh write lease is held."""
+    import services.native.library_management_publisher as publisher_module
+
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    recording = _RecordingCoordinator()
+    publisher._filesystem = recording
+
+    real_unlink = publisher_module.unlink_rooted
+
+    def recording_unlink(roots, root_id, relative_path, **kwargs):
+        recording.events.append(("unlink_rooted", (str(relative_path),)))
+        return real_unlink(roots, root_id, relative_path, **kwargs)
+
+    monkeypatch.setattr(publisher_module, "unlink_rooted", recording_unlink)
+
+    # A destination created after preview fails the recheck inside the critical
+    # section; its handler re-raises so the OUTER compensation path runs too.
+    items = await store.get_library_management_bundle_plan_items(job_id, 0)
+    planned_relative = str(items[0].destination_relative_path)
+    planned = root / planned_relative
+    planned.parent.mkdir(parents=True)
+    planned.write_bytes(b"sneaky")
+
+    with pytest.raises(Exception):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    acquires = [
+        index
+        for index, (kind, _roots) in enumerate(recording.events)
+        if kind == "held"
+    ]
+    releases = [
+        index
+        for index, (kind, _roots) in enumerate(recording.events)
+        if kind == "release"
+    ]
+    assert acquires and releases
+    unlinks = [
+        index
+        for index, (kind, _paths) in enumerate(recording.events)
+        if kind == "unlink_rooted"
+    ]
+    assert unlinks, "expected compensation unlink work to be recorded"
+    for index in unlinks:
+        assert any(a < index < r for a, r in zip(acquires, releases)), (
+            "every compensation mutation must happen while a write lease is held"
+        )
+    # the fence covered every touched root of the bundle's journals
+    first_acquire_roots = next(
+        roots for kind, roots in recording.events if kind == "acquire"
+    )
+    assert "root-1" in first_acquire_roots
+
+
+@pytest.mark.asyncio
+async def test_publish_refuses_destination_created_in_replace_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-112: an out-of-model writer creating the destination inside the
+    recheck-to-replace window must hit the NOREPLACE backstop instead of being
+    silently overwritten."""
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    items = await store.get_library_management_bundle_plan_items(job_id, 0)
+    planned = root / str(items[0].destination_relative_path)
+    planned.parent.mkdir(parents=True)
+    planned.write_bytes(b"external writer bytes")
+
+    # silence the earlier recheck so the failure lands exactly on the
+    # replace-time backstop rather than the recheck-time collision check
+    async def no_recheck(_prepared, _roots):
+        return None
+
+    monkeypatch.setattr(publisher, "_recheck_prepared", no_recheck)
+
+    with pytest.raises(
+        LibraryManagementDestinationConflictError,
+        match="created after preview",
+    ):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    # the external file survived untouched and nothing half-published remains
+    assert planned.read_bytes() == b"external writer bytes"
+    assert source.is_file()

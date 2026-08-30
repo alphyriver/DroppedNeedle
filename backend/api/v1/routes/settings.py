@@ -86,8 +86,12 @@ async def update_preferences(
     settings_service: SettingsService = Depends(get_settings_service),
 ):
     try:
+        previous = preferences_service.get_preferences()
         preferences_service.save_preferences(preferences)
-        await settings_service.clear_caches_for_preference_change()
+        # ST1 phase 1: identical payload -> no sweep at all; changed types ->
+        # no prefix sweeps either (search results embed sorted types in their
+        # cache key now; raw MB caches filter per request).
+        await settings_service.apply_preference_change(previous, preferences)
         return preferences
     except ConfigurationError as e:
         logger.warning(f"Configuration error updating preferences: {e}")
@@ -254,13 +258,27 @@ async def update_advanced_settings(
 ):
     try:
         backend_settings = settings.to_backend()
+        previous = preferences_service.get_advanced_settings()
         if _is_masked_api_key(backend_settings.audiodb_api_key):
-            current = preferences_service.get_advanced_settings()
             backend_settings = msgspec.structs.replace(
-                backend_settings, audiodb_api_key=current.audiodb_api_key
+                backend_settings, audiodb_api_key=previous.audiodb_api_key
             )
         preferences_service.save_advanced_settings(backend_settings)
-        await settings_service.on_coverart_settings_changed()
+        # F-PERF-08: only HTTP-affecting saves retire client generations.
+        # http_max_keepalive is not exposed on AdvancedSettings (it stays at
+        # its Settings-level default), so it cannot change through this route.
+        http_changed = any(
+            getattr(previous, field) != getattr(backend_settings, field)
+            for field in (
+                "http_timeout",
+                "http_connect_timeout",
+                "http_max_connections",
+            )
+        )
+        if http_changed:
+            await settings_service.on_http_settings_changed()
+        else:
+            await settings_service.on_coverart_settings_changed()
         saved = preferences_service.get_advanced_settings()
         return AdvancedSettingsFrontend.from_backend(saved)
     except ConfigurationError as e:
@@ -652,12 +670,13 @@ class SpotifyRedirectUriResponse(AppStruct):
     response_model=SpotifyRedirectUriResponse,
     dependencies=[Depends(_admin_guard)],
 )
-async def get_spotify_redirect_uri(request: Request) -> SpotifyRedirectUriResponse:
-    redirect_uri = (
-        str(request.base_url).rstrip("/")
-        + "/api/v1/me/connections/spotify/auth/callback"
+async def get_spotify_redirect_uri(
+    request: Request,
+    preferences_service: PreferencesService = Depends(get_preferences_service),
+) -> SpotifyRedirectUriResponse:
+    return SpotifyRedirectUriResponse(
+        redirect_uri=preferences_service.spotify_redirect_uri(str(request.base_url))
     )
-    return SpotifyRedirectUriResponse(redirect_uri=redirect_uri)
 
 
 @router.get("/home", response_model=HomeSettings, dependencies=[Depends(_admin_guard)])
