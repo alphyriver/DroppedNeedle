@@ -140,6 +140,32 @@ async def test_cached_album_membership_is_overlaid_from_active_files():
 _MBID = "8e1e9e51-38dc-4df3-8027-a0ada37d4674"
 
 
+@pytest.mark.asyncio
+async def test_warm_full_album_cache_uses_cached_album_and_fetches_on_miss():
+    service, _library_repo, _library_db = _make_service()
+    cached = AlbumInfo(
+        title="Cached",
+        musicbrainz_id=_MBID,
+        artist_name="Artist",
+        artist_id="artist-1",
+    )
+    service._get_cached_album_info = AsyncMock(return_value=cached)
+    service.get_album_info = AsyncMock()
+
+    await service.warm_full_album_cache(_MBID)
+
+    service._get_cached_album_info.assert_awaited_once()
+    service.get_album_info.assert_not_awaited()
+
+    service._get_cached_album_info.reset_mock()
+    service._get_cached_album_info.return_value = None
+    await service.warm_full_album_cache(_MBID)
+
+    service.get_album_info.assert_awaited_once_with(
+        _MBID, priority=RequestPriority.BACKGROUND_SYNC
+    )
+
+
 def _rg_with_ranked_release() -> dict:
     # find_primary_release picks the XW "worldwide" release regardless of size.
     return {
@@ -540,7 +566,91 @@ async def test_concurrent_remote_track_requests_share_one_selected_lookup():
     service._mb_repo.get_release_by_id.assert_awaited_once()
 
 
-# -- P5: annotate_album_coverage (shared matcher on the album page) --
+@pytest.mark.asyncio
+async def test_source_switch_separates_track_leaders_and_followers():
+    import repositories.musicbrainz_base as mb_base
+
+    service, _library_repo, _library_db = _make_service()
+    old_gate = asyncio.Event()
+    new_gate = asyncio.Event()
+    old_started = asyncio.Event()
+    new_started = asyncio.Event()
+    calls: list[int] = []
+    original_source = mb_base.capture_mb_source_context()
+    original_runtime = mb_base.brainzmash_runtime_enabled()
+    old_source = "https://old.example/ws/2"
+    mb_base.set_mb_api_base(
+        old_source,
+        source_mode="mirror",
+        source_id="album-tracks-old",
+        generation=original_source.generation + 1,
+    )
+    old_generation = mb_base.get_mb_source_generation()
+
+    async def build(*_args, **_kwargs):
+        generation = mb_base.get_mb_source_generation()
+        calls.append(generation)
+        if generation == old_generation:
+            old_started.set()
+            await old_gate.wait()
+            tracks = ["old"]
+        else:
+            new_started.set()
+            await new_gate.wait()
+            tracks = ["new"]
+        return SimpleNamespace(tracks=tracks, total_tracks=1), False
+
+    service._build_album_tracks_info = build
+    try:
+        old_leader = asyncio.create_task(service.get_album_tracks_info(_MBID))
+        await old_started.wait()
+        old_follower = asyncio.create_task(service.get_album_tracks_info(_MBID))
+        await asyncio.sleep(0)
+
+        mb_base.set_mb_api_base(
+            "https://new.example/ws/2",
+            source_mode="mirror",
+            source_id="album-tracks-new",
+            generation=old_generation + 1,
+        )
+        new_generation = mb_base.get_mb_source_generation()
+        new_leader = asyncio.create_task(service.get_album_tracks_info(_MBID))
+        await new_started.wait()
+        new_follower = asyncio.create_task(service.get_album_tracks_info(_MBID))
+        await asyncio.sleep(0)
+
+        assert len(service._tracks_in_flight) == 2
+        assert (_MBID.casefold(), old_generation) in service._tracks_in_flight
+        assert (_MBID.casefold(), new_generation) in service._tracks_in_flight
+
+        new_gate.set()
+        new_leader_result, new_follower_result = await asyncio.gather(
+            new_leader, new_follower
+        )
+        old_gate.set()
+        old_leader_result, old_follower_result = await asyncio.gather(
+            old_leader, old_follower
+        )
+    finally:
+        old_gate.set()
+        new_gate.set()
+        mb_base.set_mb_api_base(
+            original_source.source_url,
+            source_mode=original_source.source_mode,
+            source_id=original_source.source_id,
+            generation=original_source.generation,
+            brainzmash_binding_valid=original_runtime,
+        )
+
+    assert calls == [old_generation, new_generation]
+    assert old_leader_result.tracks == ["old"]
+    assert old_follower_result.tracks == ["old"]
+    assert new_leader_result.tracks == ["new"]
+    assert new_follower_result.tracks == ["new"]
+    assert service._tracks_in_flight == {}
+
+
+# P5: annotate_album_coverage (shared matcher on the album page)
 
 
 def _lib_track(id, *, disc=1, track=0, title="", recording=None, duration=None):
