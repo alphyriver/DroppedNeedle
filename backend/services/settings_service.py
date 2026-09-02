@@ -22,7 +22,7 @@ from api.v1.schemas.settings import (
     BRAINZMASH_DISCLOSURE_VERSION,
 )
 from core.config import get_settings
-from core.exceptions import ConfigurationError, ValidationError
+from core.exceptions import ConfigurationError, RateLimitedError, ValidationError
 from models.common import ServiceStatus
 from infrastructure.cache.cache_keys import (
     JELLYFIN_PREFIX,
@@ -36,6 +36,7 @@ from infrastructure.cache.cache_keys import (
 from infrastructure.cache.memory_cache import InMemoryCache, CacheInterface
 from infrastructure.http.client import get_http_client
 from repositories.jellyfin_models import JellyfinUser
+from models.release_type_policy import normalize_release_type_filters
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,8 @@ class SettingsService:
                 valid, message = await temp_repo.validate_username(settings.username)
 
             return ListenBrainzVerifyResult(valid=valid, message=message)
+        except RateLimitedError:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Failed to verify ListenBrainz connection: {e}")
             return ListenBrainzVerifyResult(
@@ -163,10 +166,10 @@ class SettingsService:
             )
 
     @staticmethod
-    def _type_filters(prefs) -> tuple[list[str], list[str]]:
-        return (
-            sorted(t.casefold() for t in prefs.primary_types),
-            sorted(t.casefold() for t in prefs.secondary_types),
+    def _type_filters(prefs) -> tuple[frozenset[str], frozenset[str]]:
+        return normalize_release_type_filters(
+            prefs.primary_types,
+            prefs.secondary_types,
         )
 
     async def apply_preference_change(self, previous, incoming) -> int:

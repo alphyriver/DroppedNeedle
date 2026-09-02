@@ -1399,6 +1399,7 @@ class DownloadStore(PersistenceBase):
     async def acquisition_policy_impact(self) -> dict:
         """Persisted-state bucket counts for the admin impact preview (spec).
         All derived from existing rows - never a new status."""
+
         def operation(conn: sqlite3.Connection) -> dict:
             one = lambda q, p=(): conn.execute(q, p).fetchone()[0]  # noqa: E731
             return {
@@ -2065,6 +2066,7 @@ class DownloadStore(PersistenceBase):
                    VALUES (?, ?, ?, ?, ?)""",
                 (source, identity, release_group_mbid, reason, now),
             )
+
         await self._write(operation)
 
     async def load_quarantine_set(self) -> set[tuple[str, str]]:
@@ -2355,7 +2357,8 @@ class DownloadStore(PersistenceBase):
     ) -> HeldImport | None:
         def operation(conn: sqlite3.Connection) -> HeldImport | None:
             row = conn.execute(
-                "SELECT * FROM held_imports WHERE id = ?", (held_id,)
+                "SELECT * FROM held_imports WHERE id = ? AND status = 'held'",
+                (held_id,),
             ).fetchone()
             if row is None:
                 return None
@@ -2402,7 +2405,8 @@ class DownloadStore(PersistenceBase):
 
         def operation(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "UPDATE held_imports SET status = ?, resolved_at = ? WHERE id = ?",
+                "UPDATE held_imports SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status = 'held'",
                 (status, now, held_id),
             )
 
